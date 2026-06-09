@@ -1,0 +1,15 @@
+# NOTE: after creating venv, manually add "import importlib.metadata"
+# to .venv/Lib/site-packages/pandas_ta/maps.py line 3
+fastapi==0.111.0
+uvicorn==0.30.0
+py_vollib==1.0.1
+py_vollib_vectorized==0.1.1
+pandas-ta-openbb==0.4.24
+scipy>=1.15.3
+numpy==1.26.4
+duckdb==0.10.3
+redis==5.0.4
+plotly==5.22.0
+pandas==2.2.2
+requests==2.32.3
+python-multipart==0.0.9

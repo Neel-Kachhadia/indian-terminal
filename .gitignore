@@ -1,0 +1,49 @@
+# Dependencies
+node_modules/
+compute/.venv/
+.venv/
+
+# Build outputs
+dist/
+src-tauri/target/
+target/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Rust and Tauri generated artifacts
+src-tauri/gen/schemas/
+
+# Logs and local process output
+*.log
+.codex-*.log
+compute/*.out.log
+compute/*.err.log
+
+# Local data and caches
+.uv-cache/
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# Archives and temporary files
+*.zip
+tmp*/
+*.tmp
