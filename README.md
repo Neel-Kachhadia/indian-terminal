@@ -14,8 +14,8 @@ one local desktop application.
 
 - Runs as a native desktop app through Tauri v2.
 - Uses React 18 and TypeScript for the terminal UI.
-- Uses Rust for app startup, Tauri IPC, Redis-backed live data reads, WebSocket
-  ingestion, option-chain polling, and alert evaluation.
+- Uses Rust for app startup, Tauri IPC, Redis-backed live data reads, token-free
+  WebSocket ingestion, option-chain polling, and alert evaluation.
 - Uses Python FastAPI for analytical compute, NSE data proxying, historical
   OHLCV loading, indicators, screeners, payoff, IV surface, and futures basis.
 - Stores short-lived live data in Redis.
@@ -34,8 +34,9 @@ Implemented or partially implemented:
   surface, screener, alerts, and strategy lab.
 - Rust startup path that launches background ingester, poller, alert engine, and
   Python subprocess.
-- Angel One SmartAPI authentication helper using environment variables and TOTP.
-- NIFTY WebSocket ingestion path for token `26000`.
+- Angel One SmartAPI authentication uses only Windows secure credential storage;
+  raw credentials and session tokens never cross into the frontend or Tauri IPC.
+- NIFTY WebSocket ingestion resolves the current NSE index token from the canonical instrument master before authentication/subscription.
 - Redis cache for `tick:NIFTY`, option chain, and PCR.
 - NSE option-chain polling through the local Python `/chain/NIFTY` endpoint.
 - Greeks enrichment through Python `/greeks`.
@@ -67,7 +68,7 @@ External data
 Rust / Tauri core
   |-- app startup
   |-- shared state
-  |-- WebSocket ingester
+  |-- token-free WebSocket ingester
   |-- option-chain poller
   |-- alert engine
   |-- Tauri IPC commands
@@ -77,7 +78,7 @@ Local services and storage
   |-- Redis live cache
   |-- DuckDB market history
   |-- SQLite alerts/config
-  |-- FastAPI compute service
+  |-- FastAPI compute service + secure Angel authentication/feed bridge
   v
 React UI
   |-- chart panel
@@ -173,13 +174,11 @@ Install frontend dependencies:
 pnpm install
 ```
 
-Create the Python environment:
+Create the canonical Python environment from the frozen lock:
 
 ```powershell
 cd compute
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+uv sync --frozen --all-groups
 cd ..
 ```
 
@@ -193,11 +192,21 @@ cd ..
 
 ## Running Locally
 
-Start Redis:
+Start a loopback-only Redis configured with ACL/password authentication, then
+provide its authenticated URL through the protected process environment as
+`BHARATTERMINAL_REDIS_URL`:
 
 ```powershell
-redis-server
+redis-server C:\path\to\loopback-authenticated-redis.conf
 ```
+
+Secret-free deployment examples live in
+`deploy/redis/redis.conf.template` and `deploy/redis/users.acl.template`.
+Provision private runtime copies, replace every `__...__` placeholder with an
+absolute private path or generated credential, and set the protected process
+environment to `redis://bharatterminal:<credential>@127.0.0.1:6379/0`. Redis
+startup must fail if an unresolved placeholder remains. Generated ACL files and
+credentials are operator-owned runtime state and must never enter Git.
 
 Run the full desktop app:
 
@@ -214,20 +223,20 @@ pnpm dev
 The Rust app then attempts to launch:
 
 ```powershell
-compute\.venv\Scripts\python.exe -m uvicorn main:app --host 127.0.0.1 --port 8765
+uv run --project compute --frozen python -m uvicorn main:app --host 127.0.0.1 --port 8765
 ```
 
 Run the Python service manually during backend development:
 
 ```powershell
 cd compute
-.\.venv\Scripts\python.exe -m uvicorn main:app --host 127.0.0.1 --port 8765 --reload
+uv run --project . --frozen python -m uvicorn main:app --host 127.0.0.1 --port 8765 --reload
 ```
 
 Health check:
 
 ```powershell
-Invoke-RestMethod http://127.0.0.1:8765/health
+Invoke-RestMethod http://127.0.0.1:8765/health/live
 ```
 
 Frontend-only mode:
@@ -242,28 +251,31 @@ The Vite server listens on:
 http://127.0.0.1:5173
 ```
 
-## Environment Variables
+## Secure Credential Provisioning
 
-The current SmartAPI auth path reads Angel One credentials from environment
-variables:
+BharatTerminal has no application Login or Demo workflow. It opens directly to
+the local dashboard. Angel-dependent features fail closed until credentials are
+available in Windows Credential Manager.
 
-| Variable | Purpose |
-|---|---|
-| `ANGEL_CLIENT_ID` | Angel One client code |
-| `ANGEL_PASSWORD` | Angel One password/API password |
-| `ANGEL_TOTP_SECRET` | Base32 TOTP secret |
-| `ANGEL_API_KEY` | Angel One API key |
-
-PowerShell example:
+Provision once through the canonical interactive operator CLI. Values are read
+without terminal echo and never accepted as command-line arguments:
 
 ```powershell
-$env:ANGEL_CLIENT_ID="YOUR_CLIENT_ID"
-$env:ANGEL_PASSWORD="YOUR_PASSWORD"
-$env:ANGEL_TOTP_SECRET="YOUR_TOTP_SECRET"
-$env:ANGEL_API_KEY="YOUR_API_KEY"
+cd compute
+uv run --frozen python main.py credentials provision
 ```
 
-Never commit real credentials.
+For an installed release, run the installed sidecar from the application
+installation directory:
+
+```powershell
+.\bharatterminal-compute.exe credentials provision
+```
+
+Existing secure values are preserved. Replacing them requires deliberate use of
+`credentials provision --replace`. Check bounded availability without revealing
+values using `credentials status`. Normal startup never reads plaintext TXT or
+environment credential files. Never commit real credentials.
 
 ## Runtime Storage
 
@@ -439,7 +451,7 @@ Compile Python files:
 
 ```powershell
 cd compute
-.\.venv\Scripts\python.exe -m py_compile main.py options\greeks.py options\payoff.py
+uv run --project . --frozen python -m py_compile main.py options\greeks.py options\payoff.py
 ```
 
 ## Troubleshooting
@@ -449,8 +461,8 @@ cd compute
 Check Redis and `tick:NIFTY`:
 
 ```powershell
-redis-cli ping
-redis-cli get tick:NIFTY
+redis-cli --askpass ping
+redis-cli --askpass get tick:NIFTY
 ```
 
 Also verify Angel One environment variables are present if relying on WebSocket
@@ -462,7 +474,7 @@ Run it manually:
 
 ```powershell
 cd compute
-.\.venv\Scripts\python.exe -m uvicorn main:app --host 127.0.0.1 --port 8765
+uv run --project . --frozen python -m uvicorn main:app --host 127.0.0.1 --port 8765
 ```
 
 ### Chart has no data
@@ -489,7 +501,7 @@ Verify Python packages:
 
 ```powershell
 cd compute
-.\.venv\Scripts\python.exe -c "import py_vollib; print('py_vollib ok')"
+uv run --project . --frozen python -c "import py_vollib; print('py_vollib ok')"
 ```
 
 Greeks may also be blank for illiquid legs or values rejected by validation.

@@ -2,22 +2,10 @@ import datetime
 import math
 from typing import Any
 
-import numpy as np
 from py_vollib.black_scholes.greeks.analytical import delta, gamma, theta, vega
 from py_vollib.black_scholes.implied_volatility import implied_volatility
 
-try:
-    from py_vollib_vectorized import get_all_greeks, vectorized_implied_volatility
-
-    _VECTOR_IMPORT_ERROR: str | None = None
-except ImportError as error:
-    get_all_greeks = None
-    vectorized_implied_volatility = None
-    _VECTOR_IMPORT_ERROR = str(error)
-except Exception as error:
-    get_all_greeks = None
-    vectorized_implied_volatility = None
-    _VECTOR_IMPORT_ERROR = str(error)
+from data.exchange_calendar import today_ist
 
 
 RISK_FREE_RATE = 0.065
@@ -25,7 +13,6 @@ TRADING_DAYS_PER_YEAR = 252
 MIN_LIQUID_LTP = 0.5
 MIN_IV = 0.01
 MAX_IV = 5.0
-_FALLBACK_NOTICE_PRINTED = False
 
 
 def compute_chain_greeks(
@@ -49,71 +36,10 @@ def compute_chain_greeks(
     if not candidates:
         return output
 
-    if vectorized_implied_volatility is not None and get_all_greeks is not None:
-        _compute_vectorized(output, candidates, spot, t)
-    else:
-        global _FALLBACK_NOTICE_PRINTED
-        if _VECTOR_IMPORT_ERROR and not _FALLBACK_NOTICE_PRINTED:
-            print(
-                "greeks: vectorized import failed, using py_vollib: "
-                f"{_first_error_line(_VECTOR_IMPORT_ERROR)}"
-            )
-            _FALLBACK_NOTICE_PRINTED = True
-        _compute_fallback(output, candidates, spot, t)
+    _compute_fallback(output, candidates, spot, t)
 
     _validate_atm_call(output, spot)
     return output
-
-
-def _compute_vectorized(
-    legs: list[dict[str, Any]],
-    indices: list[int],
-    spot: float,
-    t: float,
-) -> None:
-    prices = np.array([float(legs[index]["ltp"]) for index in indices], dtype=np.float64)
-    strikes = np.array([float(legs[index]["strike"]) for index in indices], dtype=np.float64)
-    flags = np.array([_flag(legs[index]["option_type"]) for index in indices])
-    spots = np.full(len(indices), spot, dtype=np.float64)
-    times = np.full(len(indices), t, dtype=np.float64)
-    rates = np.full(len(indices), RISK_FREE_RATE, dtype=np.float64)
-
-    try:
-        ivs = vectorized_implied_volatility(
-            price=prices,
-            S=spots,
-            K=strikes,
-            t=times,
-            r=rates,
-            flag=flags,
-            model="black_scholes",
-            on_error="ignore",
-            return_as="numpy",
-        )
-        greeks = get_all_greeks(
-            flags,
-            spots,
-            strikes,
-            times,
-            rates,
-            ivs,
-            model="black_scholes",
-            return_as="dict",
-        )
-    except Exception as error:
-        print(f"greeks: vectorized compute failed, using py_vollib: {error}")
-        _compute_fallback(legs, indices, spot, t)
-        return
-
-    for offset, index in enumerate(indices):
-        values = {
-            "iv": _finite_float(ivs[offset]),
-            "delta": _finite_float(greeks["delta"][offset]),
-            "gamma": _finite_float(greeks["gamma"][offset]),
-            "theta": _finite_float(greeks["theta"][offset]),
-            "vega": _finite_float(greeks["vega"][offset]),
-        }
-        _apply_if_valid(legs[index], values)
 
 
 def _compute_fallback(
@@ -168,7 +94,7 @@ def _candidate_indices(legs: list[dict[str, Any]]) -> list[int]:
 
 def _time_to_expiry(expiry_str: str) -> float:
     expiry_date = datetime.datetime.strptime(expiry_str, "%d-%b-%Y").date()
-    today = datetime.date.today()
+    today = today_ist()
     dte = max((expiry_date - today).days, 1)
     return dte / 365.0
 
@@ -190,10 +116,6 @@ def _finite_float(value: Any) -> float | None:
     if not math.isfinite(number):
         return None
     return number
-
-
-def _first_error_line(message: str) -> str:
-    return next((line for line in message.splitlines() if line.strip()), message)
 
 
 def _apply_if_valid(leg: dict[str, Any], values: dict[str, float | None]) -> None:

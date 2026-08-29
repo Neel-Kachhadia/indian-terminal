@@ -5,7 +5,7 @@ from typing import Any
 import pandas as pd
 import pandas_ta as ta
 
-from db.duckdb_client import get_connection
+from db.write_service import ReadOperation, resolve_read
 
 
 NIFTY50_SYMBOLS = [
@@ -156,34 +156,11 @@ def _load_universe_history(symbols: list[str]) -> dict[str, pd.DataFrame]:
             lookup_symbols.append(alias)
             reverse_alias[alias] = symbol
 
-    placeholders = ", ".join("?" for _ in lookup_symbols)
-    con = get_connection()
-    try:
-        rows = con.execute(
-            f"""
-            SELECT symbol, CAST(date AS VARCHAR), open, high, low, close, volume
-            FROM (
-                SELECT
-                    symbol,
-                    date,
-                    open,
-                    high,
-                    low,
-                    close,
-                    volume,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY symbol ORDER BY date DESC
-                    ) AS row_number
-                FROM ohlcv
-                WHERE symbol IN ({placeholders})
-            )
-            WHERE row_number <= 260
-            ORDER BY symbol ASC, date ASC
-            """,
-            lookup_symbols,
-        ).fetchall()
-    finally:
-        con.close()
+    result = resolve_read(
+        ReadOperation.LOAD_SCREENER_UNIVERSE_HISTORY,
+        {"symbols": lookup_symbols},
+    )
+    rows = result["rows"]
 
     records_by_symbol: dict[str, list[dict[str, Any]]] = {
         symbol: [] for symbol in symbols

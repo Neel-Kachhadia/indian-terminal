@@ -1,9 +1,7 @@
 import { create } from "zustand";
+import type { Tick } from "../market/quote";
 
-export type Quote = {
-  symbol: string;
-  ltp: number;
-};
+export type Quote = Tick;
 
 export type QuotesState = {
   quotes: Record<string, Quote>;

@@ -9,6 +9,8 @@ from py_vollib.black_scholes import black_scholes
 from py_vollib.black_scholes.greeks.analytical import delta, gamma, theta, vega
 from py_vollib.black_scholes.implied_volatility import implied_volatility
 
+from data.exchange_calendar import today_ist
+
 
 RISK_FREE_RATE = 0.065
 FALLBACK_IV = 0.15
@@ -43,11 +45,14 @@ def compute_payoff(
         "theta": 0.0,
         "vega": 0.0,
     }
+    iv_degraded = False
 
     for leg in normalised_legs:
         pnl_at_expiry += _expiry_leg_pnl(leg, spot_range)
-        pnl_today += _today_leg_pnl(leg, spot_range, spot)
-        _add_leg_greeks(net_greeks, leg, spot)
+        leg_pnl_today, leg_degraded = _today_leg_pnl(leg, spot_range, spot)
+        pnl_today += leg_pnl_today
+        iv_degraded = iv_degraded or leg_degraded
+        iv_degraded = _add_leg_greeks(net_greeks, leg, spot) or iv_degraded
 
     breakevens = _breakevens(spot_range, pnl_at_expiry)
     max_profit, max_loss = _max_profit_loss(normalised_legs, pnl_at_expiry)
@@ -56,6 +61,13 @@ def compute_payoff(
         "spot_range": _round_list(spot_range, 2),
         "pnl_at_expiry": _round_list(pnl_at_expiry, 2),
         "pnl_today": _round_list(pnl_today, 2),
+        # True when any leg's implied volatility could not be solved from its
+        # own entry_price and a generic FALLBACK_IV was substituted instead --
+        # pnl_at_expiry/breakevens/max_profit/max_loss are unaffected (they
+        # are pure intrinsic-value math, no IV involved), but pnl_today and
+        # net_greeks are approximations when this is true, not values solved
+        # from the position the caller described.
+        "pnl_today_degraded": iv_degraded,
         "breakevens": breakevens,
         "max_profit": None if max_profit is None else round(max_profit, 2),
         "max_loss": None if max_loss is None else round(max_loss, 2),
@@ -76,7 +88,9 @@ def _normalise_leg(raw_leg: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"unsupported action: {action}")
 
     quantity = int(raw_leg.get("quantity", 1))
-    lot_size = int(raw_leg.get("lot_size", 75))
+    if "lot_size" not in raw_leg:
+        raise ValueError("lot_size is required")
+    lot_size = int(raw_leg["lot_size"])
     if quantity <= 0:
         raise ValueError("quantity must be positive")
     if lot_size <= 0:
@@ -116,12 +130,12 @@ def _today_leg_pnl(
     leg: dict[str, Any],
     spot_range: np.ndarray,
     current_spot: float,
-) -> np.ndarray:
+) -> tuple[np.ndarray, bool]:
     if leg["option_type"] == "FUT":
-        return _expiry_leg_pnl(leg, spot_range)
+        return _expiry_leg_pnl(leg, spot_range), False
 
     multiplier = _signed_multiplier(leg)
-    sigma = _leg_iv(leg, current_spot)
+    sigma, degraded = _leg_iv(leg, current_spot)
     t = _time_to_expiry(leg["expiry"])
     flag = _flag(leg["option_type"])
 
@@ -132,22 +146,22 @@ def _today_leg_pnl(
         ],
         dtype=np.float64,
     )
-    return (values - leg["entry_price"]) * multiplier
+    return (values - leg["entry_price"]) * multiplier, degraded
 
 
 def _add_leg_greeks(
     net_greeks: dict[str, float],
     leg: dict[str, Any],
     spot: float,
-) -> None:
+) -> bool:
     multiplier = _signed_multiplier(leg)
     option_type = leg["option_type"]
 
     if option_type == "FUT":
         net_greeks["delta"] += multiplier
-        return
+        return False
 
-    sigma = _leg_iv(leg, spot)
+    sigma, degraded = _leg_iv(leg, spot)
     t = _time_to_expiry(leg["expiry"])
     flag = _flag(option_type)
     strike = leg["strike"]
@@ -158,12 +172,19 @@ def _add_leg_greeks(
         net_greeks["theta"] += theta(flag, spot, strike, t, RISK_FREE_RATE, sigma) * multiplier
         net_greeks["vega"] += vega(flag, spot, strike, t, RISK_FREE_RATE, sigma) * multiplier
     except Exception:
-        return
+        return degraded
+    return degraded
 
 
-def _leg_iv(leg: dict[str, Any], spot: float) -> float:
+def _leg_iv(leg: dict[str, Any], spot: float) -> tuple[float, bool]:
+    """Returns (sigma, degraded). `degraded=True` means the implied-vol
+    solver could not invert the leg's own entry_price (numerical failure or
+    an out-of-sane-bounds result), so a generic FALLBACK_IV was substituted
+    -- the resulting "today" P&L curve and Greeks are an approximation, not
+    derived from the position the caller actually described. Callers must
+    propagate this so it isn't silently presented as a solved value."""
     if leg["option_type"] == "FUT":
-        return 0.0
+        return 0.0, False
 
     flag = _flag(leg["option_type"])
     t = _time_to_expiry(leg["expiry"])
@@ -177,11 +198,11 @@ def _leg_iv(leg: dict[str, Any], spot: float) -> float:
             flag,
         )
         if math.isfinite(iv) and 0.01 <= iv <= 5.0:
-            return float(iv)
+            return float(iv), False
     except Exception:
         pass
 
-    return FALLBACK_IV
+    return FALLBACK_IV, True
 
 
 def _bs_price(flag: str, spot: float, strike: float, t: float, sigma: float) -> float:
@@ -258,7 +279,7 @@ def _time_to_expiry(expiry: str) -> float:
     parsed = _parse_expiry(expiry)
     if parsed is None:
         return 1.0 / 365.0
-    dte = max((parsed - _dt.date.today()).days, 1)
+    dte = max((parsed - today_ist()).days, 1)
     return dte / 365.0
 
 

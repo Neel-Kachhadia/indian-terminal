@@ -4,19 +4,111 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tick {
+    pub schema_version: u16,
     pub symbol: String,
     pub token: String,
     pub ltp: f64,
-    pub open: f64,
-    pub high: f64,
-    pub low: f64,
-    pub close: f64,
-    pub volume: u64,
-    pub oi: u64,
-    pub bid: f64,
-    pub ask: f64,
-    pub timestamp: i64,
+    pub open: Option<f64>,
+    pub high: Option<f64>,
+    pub low: Option<f64>,
+    pub close: Option<f64>,
+    pub volume: Option<u64>,
+    pub oi: Option<u64>,
+    pub bid: Option<f64>,
+    pub ask: Option<f64>,
     pub exchange: Exchange,
+    pub source_type: QuoteSource,
+    pub observed_at_ms: i64,
+    pub received_at_ms: i64,
+    pub sequence: Option<u64>,
+    pub field_completeness: Vec<String>,
+    pub freshness: QuoteFreshness,
+    pub quality: QuoteQuality,
+    pub fallback: bool,
+    pub fallback_reason: Option<String>,
+    pub market_state: MarketDataState,
+}
+
+impl Tick {
+    pub const SCHEMA_VERSION: u16 = 1;
+    pub const STREAM_FRESH_MS: i64 = 5_000;
+
+    pub fn evaluate_market_state(
+        &mut self,
+        now_ms: i64,
+        expected_feed_live: bool,
+        expected_feed_starting: bool,
+    ) {
+        let age_ms = now_ms.saturating_sub(self.observed_at_ms);
+        self.freshness = if self.observed_at_ms <= 0 {
+            QuoteFreshness::Unknown
+        } else if age_ms <= Self::STREAM_FRESH_MS {
+            QuoteFreshness::Fresh
+        } else {
+            QuoteFreshness::Stale
+        };
+        self.market_state = if self.freshness == QuoteFreshness::Stale {
+            MarketDataState::Stale
+        } else if expected_feed_starting {
+            MarketDataState::Starting
+        } else if self.fallback
+            || self.source_type != QuoteSource::AngelStream
+            || self.quality != QuoteQuality::ExecutableStream
+        {
+            MarketDataState::Degraded
+        } else if expected_feed_live && self.freshness == QuoteFreshness::Fresh {
+            MarketDataState::Live
+        } else {
+            MarketDataState::Disconnected
+        };
+    }
+
+    pub fn is_newer_than(&self, existing: &Tick) -> bool {
+        match (self.sequence, existing.sequence) {
+            (Some(incoming), Some(current)) if incoming != current => incoming > current,
+            _ if self.observed_at_ms != existing.observed_at_ms => {
+                self.observed_at_ms > existing.observed_at_ms
+            }
+            _ => self.received_at_ms > existing.received_at_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum QuoteSource {
+    AngelStream,
+    NseChain,
+    Cache,
+    Historical,
+    Derived,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum QuoteFreshness {
+    Fresh,
+    Stale,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum QuoteQuality {
+    ExecutableStream,
+    ReferenceOnly,
+    Incomplete,
+    Invalid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MarketDataState {
+    Live,
+    Degraded,
+    Stale,
+    Disconnected,
+    Starting,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,21 +121,31 @@ pub enum Exchange {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OptionLeg {
+    pub schema_version: u16,
     pub symbol: String,
     pub expiry: String,
     pub strike: f64,
     pub option_type: OptionType,
     pub ltp: f64,
-    pub bid: f64,
-    pub ask: f64,
-    pub volume: u64,
-    pub oi: u64,
-    pub oi_change: i64,
+    pub bid: Option<f64>,
+    pub ask: Option<f64>,
+    pub volume: Option<u64>,
+    pub oi: Option<u64>,
+    pub oi_change: Option<i64>,
     pub iv: Option<f64>,
     pub delta: Option<f64>,
     pub gamma: Option<f64>,
     pub theta: Option<f64>,
     pub vega: Option<f64>,
+    pub source_type: QuoteSource,
+    pub observed_at_ms: i64,
+    pub received_at_ms: i64,
+    pub sequence: Option<u64>,
+    pub field_completeness: Vec<String>,
+    pub freshness: QuoteFreshness,
+    pub quality: QuoteQuality,
+    pub fallback: bool,
+    pub fallback_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -216,4 +318,67 @@ pub struct DownloadStatus {
     pub symbol: String,
     pub status: String,
     pub started_at: i64,
+}
+
+#[cfg(test)]
+mod quote_tests {
+    use super::{Exchange, MarketDataState, QuoteFreshness, QuoteQuality, QuoteSource, Tick};
+
+    fn tick(observed_at_ms: i64, sequence: Option<u64>, fallback: bool) -> Tick {
+        Tick {
+            schema_version: Tick::SCHEMA_VERSION,
+            symbol: "NIFTY".into(),
+            token: "99123456".into(),
+            ltp: 24_000.0,
+            open: Some(23_900.0),
+            high: Some(24_100.0),
+            low: Some(23_850.0),
+            close: Some(23_950.0),
+            volume: Some(10),
+            oi: None,
+            bid: None,
+            ask: None,
+            exchange: Exchange::NSE,
+            source_type: if fallback {
+                QuoteSource::NseChain
+            } else {
+                QuoteSource::AngelStream
+            },
+            observed_at_ms,
+            received_at_ms: observed_at_ms + 1,
+            sequence,
+            field_completeness: vec!["ltp".into(), "ohlc".into(), "volume".into()],
+            freshness: QuoteFreshness::Fresh,
+            quality: if fallback {
+                QuoteQuality::ReferenceOnly
+            } else {
+                QuoteQuality::ExecutableStream
+            },
+            fallback,
+            fallback_reason: fallback.then(|| "NSE chain underlying reference".into()),
+            market_state: MarketDataState::Starting,
+        }
+    }
+
+    #[test]
+    fn stale_stream_cannot_be_live() {
+        let mut quote = tick(1_000, None, false);
+        quote.evaluate_market_state(7_001, true, false);
+        assert_eq!(quote.freshness, QuoteFreshness::Stale);
+        assert_eq!(quote.market_state, MarketDataState::Stale);
+    }
+
+    #[test]
+    fn fresh_fallback_is_degraded_not_live() {
+        let mut quote = tick(10_000, None, true);
+        quote.evaluate_market_state(10_100, true, false);
+        assert_eq!(quote.market_state, MarketDataState::Degraded);
+    }
+
+    #[test]
+    fn out_of_order_sequence_is_rejected() {
+        let current = tick(10_000, Some(8), false);
+        let incoming = tick(11_000, Some(7), false);
+        assert!(!incoming.is_newer_than(&current));
+    }
 }

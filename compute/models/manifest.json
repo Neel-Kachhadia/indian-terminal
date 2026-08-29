@@ -1,0 +1,5 @@
+{
+  "manifest_version": "1",
+  "artifacts": [],
+  "policy": "No serialized model is trusted unless listed with a SHA-256 digest. Runtime-trained models are user data, not release artifacts."
+}

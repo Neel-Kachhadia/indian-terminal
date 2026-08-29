@@ -78,6 +78,11 @@ const DEFAULT_ACTIVE: IndicatorState = {
   RSI: true,
 };
 
+type ChartPanelProps = {
+  compact?: boolean;
+  symbol?: string;
+};
+
 const INDICATOR_REQUEST = [
   { name: "EMA", params: { period: 9 } },
   { name: "EMA", params: { period: 21 } },
@@ -88,14 +93,25 @@ const INDICATOR_REQUEST = [
   { name: "BBANDS", params: { period: 20, std: 2.0 } },
 ];
 
-export function ChartPanel() {
+export function ChartPanel({ compact = false, symbol = "NIFTY" }: ChartPanelProps) {
+  const mainHeight = compact ? 300 : 500;
+  const rsiHeight = compact ? 72 : 120;
+  const macdHeight = compact ? 68 : 100;
   const mainContainerRef = useRef<HTMLDivElement | null>(null);
   const rsiContainerRef = useRef<HTMLDivElement | null>(null);
   const macdContainerRef = useRef<HTMLDivElement | null>(null);
   const chartRefs = useRef<IChartApi[]>([]);
   const seriesRefs = useRef<IndicatorSeriesRefs | null>(null);
-  const [activeIndicators, setActiveIndicators] =
-    useState<IndicatorState>(DEFAULT_ACTIVE);
+  const [activeIndicators, setActiveIndicators] = useState<IndicatorState>(() =>
+    compact
+      ? {
+          ...DEFAULT_ACTIVE,
+          EMA200: true,
+          MACD: false,
+          RSI: false,
+        }
+      : DEFAULT_ACTIVE,
+  );
   const [message, setMessage] = useState("Loading chart...");
 
   useEffect(() => {
@@ -107,9 +123,9 @@ export function ChartPanel() {
     }
 
     let active = true;
-    const mainChart = createPanelChart(mainContainer, 500, "#0a0a0a");
-    const rsiChart = createPanelChart(rsiContainer, 120, "#0d0d0d");
-    const macdChart = createPanelChart(macdContainer, 100, "#0d0d0d");
+    const mainChart = createPanelChart(mainContainer, mainHeight, "#0a0a0f");
+    const rsiChart = createPanelChart(rsiContainer, rsiHeight, "#0f0f1a");
+    const macdChart = createPanelChart(macdContainer, macdHeight, "#0f0f1a");
     chartRefs.current = [mainChart, rsiChart, macdChart];
 
     const candleSeries = mainChart.addSeries(CandlestickSeries, {
@@ -213,9 +229,9 @@ export function ChartPanel() {
 
     const resizeObserver = new ResizeObserver(([entry]) => {
       const width = Math.max(320, Math.floor(entry.contentRect.width));
-      mainChart.applyOptions({ height: 500, width });
-      rsiChart.applyOptions({ height: 120, width });
-      macdChart.applyOptions({ height: 100, width });
+      mainChart.applyOptions({ height: mainHeight, width });
+      rsiChart.applyOptions({ height: rsiHeight, width });
+      macdChart.applyOptions({ height: macdHeight, width });
     });
 
     resizeObserver.observe(mainContainer);
@@ -223,10 +239,10 @@ export function ChartPanel() {
     const loadData = async () => {
       try {
         const [rows, indicatorResponse] = await Promise.all([
-          invoke<OHLCV[]>("get_ohlcv", { symbol: "NIFTY" }),
+          invoke<OHLCV[]>("get_ohlcv", { symbol }),
           invoke<IndicatorResponse>("get_indicators", {
             indicators: INDICATOR_REQUEST,
-            symbol: "NIFTY",
+            symbol,
             timeframe: "1d",
           }),
         ]);
@@ -271,7 +287,7 @@ export function ChartPanel() {
       chartRefs.current = [];
       seriesRefs.current = null;
     };
-  }, []);
+  }, [compact, macdHeight, mainHeight, rsiHeight, symbol]);
 
   useEffect(() => {
     const series = seriesRefs.current;
@@ -329,7 +345,7 @@ export function ChartPanel() {
                 cursor: "pointer",
                 fontFamily: "monospace",
                 fontSize: 12,
-                height: 30,
+          height: 30,
                 padding: "0 10px",
               }}
               type="button"
@@ -342,7 +358,7 @@ export function ChartPanel() {
       <div
         ref={mainContainerRef}
         style={{
-          height: 500,
+          height: mainHeight,
           position: "relative",
           width: "100%",
         }}
@@ -350,7 +366,7 @@ export function ChartPanel() {
       <div
         ref={rsiContainerRef}
         style={{
-          height: activeIndicators.RSI ? 120 : 0,
+          height: activeIndicators.RSI ? rsiHeight : 0,
           marginTop: activeIndicators.RSI ? 8 : 0,
           overflow: "hidden",
           position: "relative",
@@ -361,7 +377,7 @@ export function ChartPanel() {
       <div
         ref={macdContainerRef}
         style={{
-          height: activeIndicators.MACD ? 100 : 0,
+          height: activeIndicators.MACD ? macdHeight : 0,
           marginTop: activeIndicators.MACD ? 8 : 0,
           overflow: "hidden",
           position: "relative",

@@ -1,0 +1,4 @@
+# Secret-free template. Deployment must replace __GENERATED_PASSWORD__ in a
+# private runtime copy. Never place the resulting credential in this repository.
+user default off
+user bharatterminal on >__GENERATED_PASSWORD__ ~* &* +@all -@admin -@dangerous

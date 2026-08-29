@@ -1,5 +1,12 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import {
+  displayQuotePrice,
+  quoteDisplayStatus,
+  type QuoteDisplayStatus,
+  type Tick,
+} from "../../market/quote";
+import { useMarketSession } from "../../market/session";
 
 type ScreenerField = "close" | "rsi_14" | "ema_20" | "volume_spike";
 type ScreenerOperator = ">" | "<" | ">=" | "<=";
@@ -35,6 +42,12 @@ const FIELD_OPTIONS: { label: string; value: ScreenerField }[] = [
 ];
 
 const OPERATOR_OPTIONS: ScreenerOperator[] = [">", "<", ">=", "<="];
+const liveDotKeyframes = `
+@keyframes live-dot-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(0, 212, 170, 0.78); }
+  72% { box-shadow: 0 0 0 7px rgba(0, 212, 170, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(0, 212, 170, 0); }
+}`;
 
 export function Screener() {
   const [field, setField] = useState<ScreenerField>("close");
@@ -45,6 +58,42 @@ export function Screener() {
   const [results, setResults] = useState<ScreenerResult[]>([]);
   const [message, setMessage] = useState("No screener run yet");
   const [isLoading, setIsLoading] = useState(false);
+  const [liveQuotes, setLiveQuotes] = useState<Record<string, Tick>>({});
+  const [nowMs, setNowMs] = useState(Date.now());
+  const marketSession = useMarketSession();
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNowMs(Date.now()), 3_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    const symbols = Array.from(new Set(results.map((result) => result.symbol))).slice(0, 500);
+
+    const loadLiveQuotes = async () => {
+      setNowMs(Date.now());
+      if (marketSession?.current_state !== "OPEN" || symbols.length === 0) {
+        return;
+      }
+      let updates: Record<string, Tick> = {};
+      try {
+        updates = await invoke<Record<string, Tick>>("get_quotes", { symbols });
+      } catch {
+        return;
+      }
+      if (active && Object.keys(updates).length > 0) {
+        setLiveQuotes((current) => ({ ...current, ...updates }));
+      }
+    };
+
+    loadLiveQuotes();
+    const timer = window.setInterval(loadLiveQuotes, 3_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [marketSession?.current_state, results]);
 
   const addCondition = () => {
     if (conditions.length >= 5) {
@@ -100,6 +149,7 @@ export function Screener() {
         paddingTop: 20,
       }}
     >
+      <style>{liveDotKeyframes}</style>
       <div
         style={{
           alignItems: "center",
@@ -275,7 +325,15 @@ export function Screener() {
               results.map((result) => (
                 <tr key={result.symbol}>
                   <td style={cellStyle}>{result.symbol}</td>
-                  <td style={cellStyle}>{result.ltp.toFixed(2)}</td>
+                  <td style={cellStyle}>
+                    <span style={priceCellStyle}>
+                      <span
+                        aria-hidden="true"
+                        style={liveDotStyle(quoteDisplayStatus(liveQuotes[result.symbol], nowMs))}
+                      />
+                      {formatPrice(displayQuotePrice(result.ltp, liveQuotes[result.symbol], nowMs) ?? result.ltp)}
+                    </span>
+                  </td>
                   <td style={cellStyle}>
                     {result.matched_conditions.join(", ")}
                   </td>
@@ -293,6 +351,10 @@ export function Screener() {
       </div>
     </section>
   );
+}
+
+function formatPrice(value: number) {
+  return value.toFixed(2);
 }
 
 const controlStyle = {
@@ -313,6 +375,25 @@ const cellStyle = {
   padding: "9px 8px",
   verticalAlign: "top",
 } satisfies React.CSSProperties;
+
+const priceCellStyle = {
+  alignItems: "center",
+  display: "inline-flex",
+  gap: 6,
+} satisfies React.CSSProperties;
+
+function liveDotStyle(status: QuoteDisplayStatus): React.CSSProperties {
+  const color =
+    status === "live" ? "#00d4aa" : status === "degraded" ? "#a78bfa" : status === "stale" ? "#f59e0b" : "#4b5563";
+  return {
+    animation: status === "live" ? "live-dot-pulse 1.2s ease-out infinite" : undefined,
+    background: color,
+    borderRadius: "50%",
+    flex: "0 0 auto",
+    height: 7,
+    width: 7,
+  };
+}
 
 function buttonStyle(enabled: boolean): React.CSSProperties {
   return {

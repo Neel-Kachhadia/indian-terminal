@@ -1,0 +1,14 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Desktop permissions for in-window equity content and PDF saving.",
+  "windows": ["main"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "shell:default",
+    "dialog:allow-save",
+    "fs:allow-write-file",
+    "fs:allow-download-write"
+  ]
+}

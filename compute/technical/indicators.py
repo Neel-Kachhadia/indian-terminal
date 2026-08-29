@@ -5,7 +5,8 @@ from typing import Any
 import pandas as pd
 import pandas_ta as ta
 
-from db.duckdb_client import get_connection
+from data.exchange_calendar import today_ist
+from db.write_service import ReadOperation, resolve_read
 
 
 def compute_indicators(
@@ -74,21 +75,11 @@ def _load_ohlcv(
     to_day: datetime.date,
 ) -> pd.DataFrame:
     symbols = _query_symbols(symbol)
-    placeholders = ", ".join("?" for _ in symbols)
-    con = get_connection()
-    try:
-        rows = con.execute(
-            f"""
-            SELECT symbol, CAST(date AS VARCHAR), open, high, low, close, volume
-            FROM ohlcv
-            WHERE symbol IN ({placeholders})
-              AND date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
-            ORDER BY date ASC
-            """,
-            [*symbols, from_day.isoformat(), to_day.isoformat()],
-        ).fetchall()
-    finally:
-        con.close()
+    result = resolve_read(
+        ReadOperation.LOAD_TECHNICAL_OHLCV_RANGE,
+        {"symbols": symbols, "from_date": from_day.isoformat(), "to_date": to_day.isoformat()},
+    )
+    rows = result["rows"]
 
     by_date: dict[str, tuple[Any, ...]] = {}
     for row in rows:
@@ -209,7 +200,7 @@ def _date_range(
     from_date: str | None,
     to_date: str | None,
 ) -> tuple[datetime.date, datetime.date]:
-    today = datetime.date.today()
+    today = today_ist()
     to_day = _parse_date(to_date) if to_date else today
     from_day = (
         _parse_date(from_date)

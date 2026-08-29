@@ -1,0 +1,25 @@
+# BharatTerminal Redis/Valkey example. Copy outside the repository, replace every
+# __...__ value during deployment, and restrict both files to the service account.
+bind 127.0.0.1 ::1
+protected-mode yes
+port 6379
+daemonize no
+
+aclfile __ABSOLUTE_PRIVATE_RUNTIME_PATH__\users.acl
+dir __ABSOLUTE_PRIVATE_RUNTIME_PATH__\data
+
+appendonly yes
+appendfsync everysec
+save 900 1
+save 300 10
+
+# Disable administrative/destructive commands not needed by BharatTerminal.
+rename-command CONFIG ""
+rename-command FLUSHALL ""
+rename-command FLUSHDB ""
+rename-command SHUTDOWN ""
+rename-command MODULE ""
+rename-command DEBUG ""
+
+loglevel notice
+logfile __ABSOLUTE_PRIVATE_RUNTIME_PATH__\redis.log

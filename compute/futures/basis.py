@@ -8,7 +8,8 @@ from typing import Any
 
 import redis
 
-from db.duckdb_client import get_connection
+from data.exchange_calendar import today_ist
+from db.write_service import ReadOperation, resolve_read
 
 
 def compute_futures_basis(symbol: str = "NIFTY") -> dict[str, Any]:
@@ -57,34 +58,11 @@ def compute_futures_basis(symbol: str = "NIFTY") -> dict[str, Any]:
 def _read_historical_rows(
     symbol: str,
 ) -> tuple[list[tuple[str, str, float]], list[tuple[str, str, float]]]:
-    con = get_connection()
-    try:
-        futures_rows = con.execute(
-            """
-            SELECT CAST(date AS VARCHAR), CAST(expiry AS VARCHAR), close
-            FROM fo_eod
-            WHERE UPPER(symbol) IN (?, ?)
-              AND UPPER(option_type) = 'FUT'
-              AND close IS NOT NULL
-            ORDER BY date ASC, expiry ASC
-            """,
-            [symbol, _spot_symbol(symbol)],
-        ).fetchall()
-        spot_rows = con.execute(
-            """
-            SELECT CAST(date AS VARCHAR), UPPER(symbol), close
-            FROM ohlcv
-            WHERE UPPER(symbol) IN (?, ?)
-              AND close IS NOT NULL
-            ORDER BY date ASC,
-              CASE WHEN UPPER(symbol) = ? THEN 0 ELSE 1 END
-            """,
-            [_spot_symbol(symbol), symbol, _spot_symbol(symbol)],
-        ).fetchall()
-    finally:
-        con.close()
-
-    return futures_rows, spot_rows
+    result = resolve_read(
+        ReadOperation.LOAD_FUTURES_BASIS_HISTORY,
+        {"symbol": symbol, "spot_symbol": _spot_symbol(symbol)},
+    )
+    return result["futures_rows"], result["spot_rows"]
 
 
 def _basis_rows(
@@ -157,7 +135,7 @@ def _spot_by_date(spot_rows: list[tuple[str, str, float]]) -> dict[str, float]:
 
 
 def _current_near_expiry(futures_rows: list[tuple[str, str, float]]) -> str:
-    today = _dt.date.today()
+    today = today_ist()
     expiries = sorted({
         expiry_text
         for _date_text, expiry_text, _close in futures_rows
@@ -183,7 +161,9 @@ def _current_basis_from_redis(
         return None, None
 
     try:
-        client = redis.Redis(host="127.0.0.1", port=6379, db=0)
+        from security.redis_config import authenticated_redis_client
+
+        client = authenticated_redis_client()
         spot = _read_spot(client, symbol) or fallback_spot
         futures_ltp = _read_futures_ltp(client, symbol, near_expiry)
     except redis.RedisError:
@@ -197,7 +177,7 @@ def _current_basis_from_redis(
     if expiry is None:
         return round(basis, 2), None
 
-    dte = max((expiry - _dt.date.today()).days, 1)
+    dte = max((expiry - today_ist()).days, 1)
     carry = (basis / spot) * (365.0 / dte) * 100.0
     return round(basis, 2), round(carry, 4)
 

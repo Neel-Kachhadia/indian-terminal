@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import Plotly from "plotly.js-dist-min";
 import type { Config, Data, Layout } from "plotly.js";
+
+import { loadPlotly } from "../../lib/plotly";
 
 type NullableNumber = number | null;
 
@@ -42,7 +43,11 @@ const baseLayout: Partial<Layout> = {
   plot_bgcolor: "#0d0d0d",
 };
 
-export function IVSurface() {
+type IVSurfaceProps = {
+  symbol?: string;
+};
+
+export function IVSurface({ symbol = "NIFTY" }: IVSurfaceProps) {
   const [surfaceData, setSurfaceData] = useState<IVSurfaceData | null>(null);
   const [message, setMessage] = useState("Building IV surface...");
   const [loading, setLoading] = useState(true);
@@ -53,7 +58,7 @@ export function IVSurface() {
     const loadSurface = async () => {
       try {
         const result = await invoke<IVSurfaceData>("get_iv_surface", {
-          symbol: "NIFTY",
+          symbol,
         });
         if (!active) {
           return;
@@ -86,7 +91,7 @@ export function IVSurface() {
       active = false;
       window.clearInterval(timer);
     };
-  }, []);
+  }, [symbol]);
 
   const hasSkew = (surfaceData?.skew.strikes.length ?? 0) > 0;
   const hasSurface =
@@ -286,17 +291,23 @@ function PlotlyChart({
     if (!container) {
       return;
     }
-
-    Plotly.react(container, data, layout, plotConfig);
-
-    const resizeObserver = new ResizeObserver(() => {
-      Plotly.Plots.resize(container);
+    let active = true;
+    let resizeObserver: ResizeObserver | null = null;
+    let plotly: Awaited<ReturnType<typeof loadPlotly>> | null = null;
+    void loadPlotly().then((loaded) => {
+      if (!active) {
+        return;
+      }
+      plotly = loaded;
+      loaded.react(container, data, layout, plotConfig);
+      resizeObserver = new ResizeObserver(() => loaded.Plots.resize(container));
+      resizeObserver.observe(container);
     });
-    resizeObserver.observe(container);
 
     return () => {
-      resizeObserver.disconnect();
-      Plotly.purge(container);
+      active = false;
+      resizeObserver?.disconnect();
+      plotly?.purge(container);
     };
   }, [data, layout]);
 

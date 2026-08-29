@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Indian Market Terminal",
+  "productName": "BharatTerminal",
   "version": "0.1.0",
   "identifier": "com.indian-market-terminal.app",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Indian Market Terminal",
+        "title": "BharatTerminal",
         "width": 1440,
         "height": 900,
         "minWidth": 1280,
@@ -20,11 +20,32 @@
         "decorations": true,
         "theme": "Dark"
       }
-    ]
+    ],
+    "security": {
+      "csp": "default-src 'self'; base-uri 'self'; connect-src 'self' ipc: http://ipc.localhost; script-src 'self'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; frame-src 'none'; object-src 'none'"
+    }
   },
   "bundle": {
     "active": true,
-    "targets": "all",
-    "icon": []
+    "targets": ["nsis"],
+    "icon": ["icons/icon.ico"],
+    "resources": [
+      "../bundle-data/terminal.db.gz*",
+      "../compute/models/**/*",
+      "../compute/dist/bharatterminal-compute.exe",
+      "../release/release-identity.json",
+      "../release/resource-manifest.json",
+      "../release/resource-manifest.sig",
+      "../release/packaged-openapi.json"
+      ,"../dist/**/*"
+    ],
+    "externalBin": ["../compute/dist/bharatterminal-compute"],
+    "windows": {
+      "nsis": {
+        "displayLanguageSelector": false,
+        "installMode": "currentUser",
+        "installerHooks": "installer-hooks.nsh"
+      }
+    }
   }
 }

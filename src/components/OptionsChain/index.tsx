@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 import { useQuotesStore } from "../../store/quotes";
+import { executableQuotePrice } from "../../market/quote";
 
 type OptionType = "CE" | "PE";
 
@@ -11,11 +12,11 @@ type OptionLeg = {
   strike: number;
   option_type: OptionType;
   ltp: number;
-  bid: number;
-  ask: number;
-  volume: number;
-  oi: number;
-  oi_change: number;
+  bid: number | null;
+  ask: number | null;
+  volume: number | null;
+  oi: number | null;
+  oi_change: number | null;
   iv: number | null;
   delta: number | null;
   gamma: number | null;
@@ -38,12 +39,18 @@ const priceFormatter = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 2,
 });
 
-export function OptionsChain() {
-  const spot = useQuotesStore((state) => state.quotes.NIFTY?.ltp ?? 0);
+type OptionsChainProps = {
+  spot?: number;
+  symbol?: string;
+};
+
+export function OptionsChain({ spot: spotOverride, symbol = "NIFTY" }: OptionsChainProps) {
+  const quoteSpot = useQuotesStore((state) => executableQuotePrice(state.quotes[symbol]));
+  const spot = spotOverride ?? quoteSpot;
   const [expiries, setExpiries] = useState<string[]>([]);
   const [selectedExpiry, setSelectedExpiry] = useState("");
   const [chain, setChain] = useState<OptionLeg[]>([]);
-  const [pcr, setPcr] = useState(0);
+  const [pcr, setPcr] = useState<number | null>(null);
   const [message, setMessage] = useState("Loading expiries...");
 
   useEffect(() => {
@@ -52,14 +59,14 @@ export function OptionsChain() {
     const loadExpiries = async () => {
       try {
         const nextExpiries = await invoke<string[]>("get_expiries", {
-          symbol: "NIFTY",
+          symbol,
         });
         if (!active) {
           return;
         }
 
         setExpiries(nextExpiries);
-        setSelectedExpiry((current) => current || nextExpiries[0] || "");
+        setSelectedExpiry(nextExpiries[0] || "");
         setMessage(nextExpiries.length > 0 ? "" : "No expiries available");
       } catch (error) {
         if (active) {
@@ -73,7 +80,7 @@ export function OptionsChain() {
     return () => {
       active = false;
     };
-  }, []);
+  }, [symbol]);
 
   useEffect(() => {
     if (!selectedExpiry) {
@@ -87,11 +94,11 @@ export function OptionsChain() {
         const [nextChain, nextPcr] = await Promise.all([
           invoke<OptionLeg[]>("get_chain", {
             expiry: selectedExpiry,
-            symbol: "NIFTY",
+            symbol,
           }),
-          invoke<number>("get_pcr", {
+          invoke<number | null>("get_pcr", {
             expiry: selectedExpiry,
-            symbol: "NIFTY",
+            symbol,
           }),
         ]);
 
@@ -116,7 +123,7 @@ export function OptionsChain() {
       active = false;
       window.clearInterval(timer);
     };
-  }, [selectedExpiry]);
+  }, [selectedExpiry, symbol]);
 
   const rows = useMemo(() => {
     const byStrike = new Map<number, ChainRow>();
@@ -195,7 +202,7 @@ export function OptionsChain() {
             fontWeight: 700,
           }}
         >
-          PCR: {priceFormatter.format(pcr)}
+          PCR: {pcr === null ? "—" : priceFormatter.format(pcr)}
         </div>
       </div>
 
@@ -336,8 +343,8 @@ function cellBackground(isAtm: boolean, isItm: boolean, side: "call" | "put") {
   return side === "call" ? "#0a1a0a" : "#1a0a0a";
 }
 
-function formatInteger(value: number | undefined) {
-  if (value === undefined) {
+function formatInteger(value: number | null | undefined) {
+  if (value === null || value === undefined) {
     return "—";
   }
 

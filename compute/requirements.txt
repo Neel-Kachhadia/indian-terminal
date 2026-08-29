@@ -1,15 +1,315 @@
-# NOTE: after creating venv, manually add "import importlib.metadata"
-# to .venv/Lib/site-packages/pandas_ta/maps.py line 3
-fastapi==0.111.0
-uvicorn==0.30.0
-py_vollib==1.0.1
-py_vollib_vectorized==0.1.1
-pandas-ta-openbb==0.4.24
-scipy>=1.15.3
+# GENERATED FILE - DO NOT EDIT
+# source: pyproject.toml + uv.lock
+# generation command: python scripts/dependency_exports.py --write
+altgraph==0.17.5
+    # via
+    #   macholib
+    #   pyinstaller
+annotated-doc==0.0.5
+    # via fastapi
+annotated-types==0.8.0
+    # via pydantic
+anyio==4.14.2
+    # via
+    #   groq
+    #   httpx
+    #   starlette
+appdirs==1.4.4
+    # via jugaad-data
+apscheduler==3.11.2
+    # via bharatterminal-compute
+beautifulsoup4==4.15.0
+    # via
+    #   jugaad-data
+    #   yfinance
+brotli==1.2.0
+    # via jugaad-data
+catboost==1.2.10
+    # via bharatterminal-compute
+certifi==2026.7.22
+    # via
+    #   curl-cffi
+    #   httpcore
+    #   httpx
+    #   requests
+cffi==2.1.1
+    # via
+    #   cryptography
+    #   curl-cffi
+charset-normalizer==3.5.1
+    # via requests
+click==8.4.2
+    # via
+    #   jugaad-data
+    #   uvicorn
+cody-special==1.0.0
+    # via py-lets-be-rational
+colorama==0.4.6 ; sys_platform == 'win32'
+    # via
+    #   click
+    #   logzero
+contourpy==1.3.3
+    # via matplotlib
+cryptography==50.0.0
+    # via
+    #   bharatterminal-compute
+    #   secretstorage
+curl-cffi==0.16.1
+    # via yfinance
+cycler==0.12.1
+    # via matplotlib
+defusedxml==0.7.1
+    # via bharatterminal-compute
+distro==1.9.0
+    # via groq
+duckdb==1.5.5
+    # via bharatterminal-compute
+fastapi==0.141.1
+    # via bharatterminal-compute
+feedparser==6.0.12
+    # via bharatterminal-compute
+fonttools==4.63.0
+    # via matplotlib
+frozendict==2.4.7
+    # via yfinance
+graphviz==0.21
+    # via catboost
+groq==1.4.0
+    # via bharatterminal-compute
+h11==0.16.0
+    # via
+    #   httpcore
+    #   uvicorn
+httpcore==1.0.9
+    # via httpx
+httpx==0.28.1
+    # via groq
+idna==3.19
+    # via
+    #   anyio
+    #   httpx
+    #   requests
+jaraco-classes==3.4.0
+    # via keyring
+jaraco-context==6.1.2
+    # via keyring
+jaraco-functools==4.6.0
+    # via keyring
+jeepney==0.9.0 ; sys_platform == 'linux'
+    # via
+    #   keyring
+    #   secretstorage
+joblib==1.5.3
+    # via scikit-learn
+jugaad-data==0.33.1
+    # via bharatterminal-compute
+keyring==25.7.0
+    # via bharatterminal-compute
+kiwisolver==1.5.0
+    # via matplotlib
+lightgbm==4.6.0
+    # via bharatterminal-compute
+llvmlite==0.44.0
+    # via
+    #   bharatterminal-compute
+    #   numba
+logzero==1.7.0
+    # via bharatterminal-compute
+lxml==6.1.2
+    # via jugaad-data
+macholib==1.16.4 ; sys_platform == 'darwin'
+    # via pyinstaller
+matplotlib==3.11.1
+    # via catboost
+more-itertools==11.1.0
+    # via
+    #   jaraco-classes
+    #   jaraco-functools
+multitasking==0.0.13
+    # via yfinance
+narwhals==2.25.0
+    # via plotly
+numba==0.61.2
+    # via bharatterminal-compute
 numpy==1.26.4
-duckdb==0.10.3
-redis==5.0.4
-plotly==5.22.0
+    # via
+    #   bharatterminal-compute
+    #   catboost
+    #   contourpy
+    #   lightgbm
+    #   matplotlib
+    #   numba
+    #   pandas
+    #   pandas-ta-openbb
+    #   patsy
+    #   py-lets-be-rational
+    #   py-vollib
+    #   scikit-learn
+    #   scipy
+    #   skops
+    #   statsmodels
+    #   xgboost
+    #   yfinance
+nvidia-nccl-cu12==2.31.2 ; platform_machine != 'aarch64' and sys_platform == 'linux'
+    # via xgboost
+packaging==26.3
+    # via
+    #   matplotlib
+    #   plotly
+    #   pyinstaller
+    #   pyinstaller-hooks-contrib
+    #   skops
+    #   statsmodels
 pandas==2.2.2
-requests==2.32.3
-python-multipart==0.0.9
+    # via
+    #   bharatterminal-compute
+    #   catboost
+    #   pandas-ta-openbb
+    #   py-vollib
+    #   statsmodels
+    #   yfinance
+pandas-ta-openbb==0.4.24
+    # via bharatterminal-compute
+patsy==1.0.2
+    # via statsmodels
+peewee==4.3.0
+    # via yfinance
+pefile==2024.8.26 ; sys_platform == 'win32'
+    # via pyinstaller
+piecewise-rational==1.0.0
+    # via py-lets-be-rational
+pillow==12.3.0
+    # via matplotlib
+platformdirs==4.11.3
+    # via yfinance
+plotly==6.9.0
+    # via catboost
+prettytable==3.18.0
+    # via skops
+protobuf==7.36.0
+    # via yfinance
+py-lets-be-rational==1.1.2
+    # via py-vollib
+py-vollib==1.0.1
+    # via bharatterminal-compute
+pyarrow==25.0.1
+    # via bharatterminal-compute
+pycparser==3.0 ; implementation_name != 'PyPy'
+    # via cffi
+pydantic==2.13.4
+    # via
+    #   fastapi
+    #   groq
+pydantic-core==2.46.4
+    # via pydantic
+pyinstaller==6.21.0
+    # via bharatterminal-compute
+pyinstaller-hooks-contrib==2026.6
+    # via pyinstaller
+pyotp==2.9.0
+    # via bharatterminal-compute
+pyparsing==3.3.2
+    # via matplotlib
+python-dateutil==2.9.0.post0
+    # via
+    #   matplotlib
+    #   pandas
+    #   smartapi-python
+python-multipart==0.0.32
+    # via bharatterminal-compute
+pytz==2026.3.post1
+    # via
+    #   pandas
+    #   yfinance
+pywin32-ctypes==0.2.3 ; sys_platform == 'win32'
+    # via
+    #   keyring
+    #   pyinstaller
+redis==5.0.4
+    # via bharatterminal-compute
+requests==2.34.2
+    # via
+    #   bharatterminal-compute
+    #   jugaad-data
+    #   smartapi-python
+    #   yfinance
+scikit-learn==1.5.2
+    # via
+    #   bharatterminal-compute
+    #   skops
+scipy==1.15.3
+    # via
+    #   bharatterminal-compute
+    #   catboost
+    #   lightgbm
+    #   pandas-ta-openbb
+    #   py-vollib
+    #   scikit-learn
+    #   skops
+    #   statsmodels
+    #   xgboost
+secretstorage==3.5.0 ; sys_platform == 'linux'
+    # via keyring
+setuptools==84.0.0
+    # via pyinstaller
+sgmllib3k==1.0.0
+    # via feedparser
+simplejson==3.20.1
+    # via
+    #   bharatterminal-compute
+    #   py-vollib
+six==1.17.0
+    # via
+    #   catboost
+    #   python-dateutil
+    #   smartapi-python
+skops==0.14.0
+    # via bharatterminal-compute
+smartapi-python==1.5.5
+    # via bharatterminal-compute
+sniffio==1.3.1
+    # via groq
+soupsieve==2.9.2
+    # via beautifulsoup4
+starlette==1.6.0
+    # via fastapi
+statsmodels==0.14.4
+    # via
+    #   bharatterminal-compute
+    #   pandas-ta-openbb
+threadpoolctl==3.6.0
+    # via scikit-learn
+typing-extensions==4.16.0
+    # via
+    #   anyio
+    #   beautifulsoup4
+    #   fastapi
+    #   groq
+    #   pydantic
+    #   pydantic-core
+    #   starlette
+    #   typing-inspection
+typing-inspection==0.4.4
+    # via
+    #   fastapi
+    #   pydantic
+tzdata==2026.3
+    # via
+    #   pandas
+    #   tzlocal
+tzlocal==5.4.4
+    # via apscheduler
+urllib3==2.7.0
+    # via requests
+uvicorn==0.30.0
+    # via bharatterminal-compute
+wcwidth==0.8.2
+    # via prettytable
+websocket-client==1.8.0
+    # via bharatterminal-compute
+websockets==17.0.1
+    # via yfinance
+xgboost==2.1.4
+    # via bharatterminal-compute
+yfinance==0.2.65
+    # via bharatterminal-compute

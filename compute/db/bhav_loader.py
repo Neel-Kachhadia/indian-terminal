@@ -8,7 +8,9 @@ from typing import Any
 
 import requests
 
-from db.duckdb_client import DB_WRITE_LOCK, get_connection
+from data.exchange_calendar import is_trading_day_candidate
+from db.duckdb_client import DB_WRITE_LOCK, writer_connection
+from db.write_service import ReadOperation, resolve_read
 
 BHAV_URL = (
     "https://nsearchives.nseindia.com/content/cm/"
@@ -64,31 +66,37 @@ def download_index_bhav(date: datetime.date) -> list[dict[str, Any]] | None:
 def get_missing_dates(
     from_date: datetime.date,
     to_date: datetime.date,
+    symbols: tuple[str, ...] = ("NIFTY 50",),
 ) -> list[datetime.date]:
+    from data.market_data_quality import INDEX_SYMBOLS
+    from ml.feature_engineering import _symbol_candidates
+
     if from_date > to_date:
         return []
 
-    con = get_connection()
-    try:
-        rows = con.execute(
-            """
-            SELECT DISTINCT date
-            FROM ohlcv
-            WHERE symbol IN ('NIFTY', 'NIFTY 50')
-              AND date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
-            """,
-            [from_date.isoformat(), to_date.isoformat()],
-        ).fetchall()
-    finally:
-        con.close()
+    requested = {str(symbol).strip().upper() for symbol in symbols}
+    invalid = requested - INDEX_SYMBOLS
+    if invalid:
+        raise ValueError(f"not canonical index symbols: {sorted(invalid)}")
 
-    present_dates = {_coerce_date(row[0]) for row in rows}
+    # Different index rows may legitimately land under either alias spelling
+    # (e.g. 'BANKNIFTY' vs 'NIFTY BANK') depending on source -- expand via the
+    # repository's existing alias table rather than checking one literal spelling.
+    aliases: set[str] = set()
+    for symbol in requested:
+        aliases.update(_symbol_candidates(symbol))
+
+    result = resolve_read(
+        ReadOperation.LOAD_INDEX_BHAVCOPY_PRESENT_DATES,
+        {"aliases": sorted(aliases), "from_date": from_date.isoformat(), "to_date": to_date.isoformat()},
+    )
+    present_dates = {_coerce_date(value) for value in result["dates"]}
     dates: list[datetime.date] = []
     current = from_date
     one_day = datetime.timedelta(days=1)
 
     while current <= to_date:
-        if current.weekday() < 5 and current not in present_dates:
+        if is_trading_day_candidate(current) and current not in present_dates:
             dates.append(current)
         current += one_day
 
@@ -99,10 +107,11 @@ def load_date_range(
     from_date: datetime.date,
     to_date: datetime.date,
     progress_callback: Callable[[dict[str, int]], None] | None = None,
+    symbols: tuple[str, ...] = ("NIFTY 50",),
 ) -> dict[str, int]:
     result = {"downloaded": 0, "skipped": 0, "errors": 0}
 
-    for date in get_missing_dates(from_date, to_date):
+    for date in get_missing_dates(from_date, to_date, symbols=symbols):
         try:
             rows = download_index_bhav(date)
             if not rows:
@@ -172,14 +181,16 @@ def _parse_bhav_row(raw_row: dict[str, str | None]) -> dict[str, Any] | None:
         "low": low_price,
         "close": close_price,
         "volume": _volume(row.get("TtlTradgVol")),
-        "source": "bhav",
+        "source": "NSE_EQUITY_BHAVCOPY",
     }
 
 
 def _parse_index_row(raw_row: dict[str, str | None]) -> dict[str, Any] | None:
+    from data.market_data_quality import INDEX_SYMBOLS, canonical_index_symbol
+
     row = {str(key).strip(): value for key, value in raw_row.items()}
-    symbol = str(row.get("Index Name", "")).strip().upper()
-    if symbol != "NIFTY 50":
+    symbol = canonical_index_symbol(str(row.get("Index Name", "")))
+    if symbol not in INDEX_SYMBOLS:
         return None
 
     try:
@@ -198,7 +209,7 @@ def _parse_index_row(raw_row: dict[str, str | None]) -> dict[str, Any] | None:
         "low": low_price,
         "close": close_price,
         "volume": _volume(row.get("Volume")),
-        "source": "bhav",
+        "source": "NSE_INDEX_BHAVCOPY",
     }
 
 
@@ -218,11 +229,11 @@ def _insert_ohlcv_rows(rows: list[dict[str, Any]]) -> None:
     ]
 
     with DB_WRITE_LOCK:
-        con = get_connection()
+        con = writer_connection()
         try:
             con.executemany(
                 """
-                INSERT OR IGNORE INTO ohlcv
+                INSERT OR REPLACE INTO ohlcv
                     (symbol, date, open, high, low, close, volume, source)
                 VALUES (?, CAST(? AS DATE), ?, ?, ?, ?, ?, ?)
                 """,
@@ -252,7 +263,7 @@ def _volume(value: str | None) -> int:
 
 def _parse_trade_date(value: str) -> datetime.date:
     cleaned = value.strip()
-    for date_format in ("%d-%m-%Y", "%Y-%m-%d"):
+    for date_format in ("%d-%m-%Y", "%Y-%m-%d", "%d/%m/%Y"):
         try:
             return datetime.datetime.strptime(cleaned, date_format).date()
         except ValueError:

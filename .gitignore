@@ -1,10 +1,15 @@
 # Dependencies
 node_modules/
 compute/.venv/
+compute/.venv-clean/
+compute/.venv-release/
+compute/.venv*/
 .venv/
 
 # Build outputs
 dist/
+compute/build/
+compute/dist/
 src-tauri/target/
 target/
 
@@ -13,28 +18,46 @@ __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
+.test-tmp*/
 .mypy_cache/
 .ruff_cache/
 
 # Rust and Tauri generated artifacts
 src-tauri/gen/schemas/
 
+# P17-generated release outputs (release definitions/scripts remain tracked)
+/release/packaged-openapi.json
+/release/release-identity.json
+/release/resource-manifest.json
+/release/resource-manifest.sig
+
 # Logs and local process output
 *.log
+*.tmp
 .codex-*.log
 compute/*.out.log
 compute/*.err.log
 
 # Local data and caches
 .uv-cache/
+data/terminal.db
+bundle-data/terminal.db.gz
+bundle-data/terminal.db.parts/*
+compute/models/*
+!compute/models/.gitkeep
+!compute/models/README.md
+!compute/models/manifest.json
 *.db
 *.sqlite
 *.sqlite3
+%APPDATA%/BharatTerminal/
 
 # Environment and secrets
 .env
 .env.*
 !.env.example
+**/.env
+**/credentials*
 
 # OS/editor files
 .DS_Store

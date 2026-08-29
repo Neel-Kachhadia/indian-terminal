@@ -1,0 +1,120 @@
+{
+  "schema_version": 2,
+  "metadata_version": "NSE_FO_2026.20260823",
+  "exchange": "NSE",
+  "segment": "FUTURES_AND_OPTIONS",
+  "timezone": "Asia/Kolkata",
+  "normal_session": {
+    "open": "09:15",
+    "close": "15:30"
+  },
+  "weekly_expiry_weekday": 1,
+  "coverage": {
+    "start": "2026-01-01",
+    "end": "2026-12-31"
+  },
+  "holidays": [
+    "2026-01-15",
+    "2026-01-26",
+    "2026-03-03",
+    "2026-03-26",
+    "2026-03-31",
+    "2026-04-03",
+    "2026-04-14",
+    "2026-05-01",
+    "2026-05-28",
+    "2026-06-26",
+    "2026-09-14",
+    "2026-10-02",
+    "2026-10-20",
+    "2026-11-10",
+    "2026-11-24",
+    "2026-12-25"
+  ],
+  "special_sessions": [
+    {
+      "date": "2026-11-08",
+      "session_type": "MUHURAT",
+      "special_session": true,
+      "open": null,
+      "close": null,
+      "timing_status": "PENDING_EXCHANGE_CIRCULAR",
+      "source_url": "https://www.nseindia.com/resources/exchange-communication-holidays"
+    }
+  ],
+  "sources": [
+    {
+      "url": "https://nsearchives.nseindia.com/content/circulars/FAOP68747.pdf",
+      "purpose": "Tuesday expiry rule and previous-trading-day adjustment"
+    },
+    {
+      "url": "https://nsearchives.nseindia.com/content/circulars/FAOP71777.pdf",
+      "purpose": "2026 F&O trading holidays"
+    },
+    {
+      "url": "https://nsearchives.nseindia.com/content/circulars/FAOP72262.pdf",
+      "purpose": "2026-01-15 exceptional F&O trading holiday"
+    },
+    {
+      "url": "https://www.nseindia.com/resources/exchange-communication-holidays",
+      "purpose": "maintained NSE holidays page and Diwali note"
+    }
+  ],
+  "verified_at": "2026-08-23T00:00:00+05:30",
+  "contract_fixtures": [
+    {
+      "name": "normal_session",
+      "at_utc": "2026-08-17T04:00:00Z",
+      "session": "OPEN",
+      "next_weekly_expiry": "18-Aug-2026"
+    },
+    {
+      "name": "expiry_before_cutoff",
+      "at_utc": "2026-08-18T09:59:00Z",
+      "session": "OPEN",
+      "next_weekly_expiry": "18-Aug-2026"
+    },
+    {
+      "name": "expiry_cutoff_boundary",
+      "at_utc": "2026-08-18T10:00:00Z",
+      "session": "CLOSED",
+      "next_weekly_expiry": "25-Aug-2026"
+    },
+    {
+      "name": "after_close_1605",
+      "at_utc": "2026-08-18T10:35:00Z",
+      "session": "CLOSED",
+      "next_weekly_expiry": "25-Aug-2026"
+    },
+    {
+      "name": "holiday_adjusted_expiry",
+      "at_utc": "2026-03-30T09:00:00Z",
+      "session": "OPEN",
+      "next_weekly_expiry": "30-Mar-2026"
+    },
+    {
+      "name": "month_end",
+      "at_utc": "2026-06-29T04:00:00Z",
+      "session": "OPEN",
+      "next_weekly_expiry": "30-Jun-2026"
+    },
+    {
+      "name": "year_end",
+      "at_utc": "2026-12-29T04:00:00Z",
+      "session": "OPEN",
+      "next_weekly_expiry": "29-Dec-2026"
+    },
+    {
+      "name": "timezone_conversion",
+      "at_utc": "2026-08-17T03:44:00Z",
+      "session": "PRE_OPEN",
+      "next_weekly_expiry": "18-Aug-2026"
+    },
+    {
+      "name": "holiday_session",
+      "at_utc": "2026-01-26T04:00:00Z",
+      "session": "CLOSED",
+      "next_weekly_expiry": "27-Jan-2026"
+    }
+  ]
+}

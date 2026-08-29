@@ -5,6 +5,8 @@ import math
 from collections import defaultdict
 from typing import Any
 
+from data.exchange_calendar import today_ist
+
 
 def compute_iv_surface(chain_legs: list[dict[str, Any]]) -> dict[str, Any]:
     """
@@ -200,14 +202,14 @@ def _expiry_sort_key(expiry: str) -> tuple[int, str]:
     parsed = _parse_expiry(expiry)
     if parsed is None:
         return (999_999, expiry.lower())
-    return ((parsed - _dt.date.today()).days, expiry.lower())
+    return ((parsed - today_ist()).days, expiry.lower())
 
 
 def _days_to_expiry(expiry: str) -> int:
     parsed = _parse_expiry(expiry)
     if parsed is None:
         return 0
-    return max((parsed - _dt.date.today()).days, 0)
+    return max((parsed - today_ist()).days, 0)
 
 
 def _parse_expiry(expiry: str) -> _dt.date | None:

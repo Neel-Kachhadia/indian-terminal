@@ -1,6 +1,6 @@
 use std::{cmp::Ordering, time::Duration};
 
-use chrono::{Datelike, Duration as ChronoDuration, Timelike, Utc, Weekday};
+use chrono::{DateTime, Utc};
 use redis::Commands;
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
@@ -9,7 +9,10 @@ use tauri::Emitter;
 use tokio::time;
 
 use crate::{
-    models::{OptionLeg, OptionType, Tick},
+    exchange_calendar::nearest_weekly_expiry_label,
+    models::{
+        MarketDataState, OptionLeg, OptionType, QuoteFreshness, QuoteQuality, QuoteSource, Tick,
+    },
     state::AppState,
 };
 
@@ -18,7 +21,7 @@ const GREEKS_URL: &str = "http://127.0.0.1:8765/greeks";
 const NIFTY_SYMBOL: &str = "NIFTY";
 const REDIS_TTL_SECONDS: u64 = 15;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum PollError {
     SessionExpired,
     RateLimited,
@@ -28,6 +31,7 @@ enum PollError {
 #[derive(Debug, Deserialize)]
 struct NseChainResponse {
     records: Option<NseRecords>,
+    provenance: Option<NseProvenance>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,6 +39,14 @@ struct NseRecords {
     data: Option<Vec<NseRow>>,
     #[serde(rename = "underlyingValue")]
     underlying_value: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NseProvenance {
+    symbol: String,
+    observed_at: String,
+    freshness: QuoteFreshness,
+    decision_eligible: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,19 +64,28 @@ struct NseRow {
 #[derive(Debug, Deserialize)]
 struct NseOptionLeg {
     #[serde(rename = "lastPrice", default)]
-    last_price: f64,
-    #[serde(rename = "bidprice", default)]
-    bid_price: f64,
-    #[serde(rename = "askPrice", default)]
-    ask_price: f64,
+    last_price: Option<f64>,
+    #[serde(rename = "bidprice", alias = "bidPrice", default)]
+    bid_price: Option<f64>,
+    #[serde(rename = "askPrice", alias = "askprice", default)]
+    ask_price: Option<f64>,
     #[serde(rename = "openInterest", default)]
-    open_interest: f64,
+    open_interest: Option<f64>,
     #[serde(rename = "changeinOpenInterest", default)]
-    oi_change: f64,
+    oi_change: Option<f64>,
     #[serde(rename = "totalTradedVolume", default)]
-    volume: f64,
+    volume: Option<f64>,
     #[serde(rename = "impliedVolatility", default)]
-    iv: f64,
+    iv: Option<f64>,
+}
+
+#[derive(Debug)]
+struct ChainSnapshot {
+    legs: Vec<OptionLeg>,
+    spot: f64,
+    observed_at_ms: i64,
+    freshness: QuoteFreshness,
+    decision_eligible: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,18 +106,19 @@ struct GreekLeg {
 }
 
 pub async fn run(state: AppState) -> Result<(), String> {
+    wait_for_process_token(&state).await;
     let client = build_client();
     let mut cookies;
 
     loop {
-        println!("poller: fetching NSE session cookie...");
+        crate::bt_info!("poller", "fetching NSE session cookie");
         match fetch_nse_cookies(&client).await {
             Ok(c) => {
                 cookies = c;
-                println!("poller: NSE session established");
+                crate::bt_info!("poller", "NSE session established");
             }
             Err(error) => {
-                println!("poller: NSE session failed: {error}");
+                crate::bt_error!("poller", "NSE session failed: {error}");
                 time::sleep(Duration::from_secs(10)).await;
                 continue;
             }
@@ -104,69 +126,101 @@ pub async fn run(state: AppState) -> Result<(), String> {
 
         let mut interval = time::interval(Duration::from_secs(3));
         let mut consecutive_errors = 0u32;
+        let mut success_logged = false;
 
         loop {
             interval.tick().await;
 
-            let expiry = nearest_expiry_thursday();
+            let expiry = match nearest_weekly_expiry_label(Utc::now()) {
+                Ok(expiry) => expiry,
+                Err(error) => {
+                    crate::bt_error!("poller", "expiry unavailable: {error}");
+                    time::sleep(Duration::from_secs(60)).await;
+                    continue;
+                }
+            };
 
-            match fetch_chain(&client, &cookies, &expiry).await {
-                Ok((legs, spot)) => {
+            match fetch_chain(&client, &state, &cookies, &expiry).await {
+                Ok(snapshot) => {
                     consecutive_errors = 0;
-                    let pcr = compute_pcr(&legs);
+                    let pcr = compute_pcr(&snapshot.legs);
 
-                    if spot > 0.0 {
-                        update_spot_in_redis(&state, spot).await;
-                    }
+                    update_spot_in_redis(
+                        &state,
+                        snapshot.spot,
+                        snapshot.observed_at_ms,
+                        snapshot.freshness,
+                    )
+                    .await;
 
-                    match write_chain_to_redis(&state, &expiry, &legs, pcr).await {
+                    match write_chain_to_redis(&state, &expiry, &snapshot.legs, pcr).await {
                         Ok(()) => {
-                            if spot > 0.0 {
+                            let mut computed_greeks = 0;
+                            if snapshot.decision_eligible {
                                 match enrich_chain_with_greeks(
-                                    &client, &state, &expiry, &legs, spot, pcr,
+                                    &client,
+                                    &state,
+                                    &expiry,
+                                    &snapshot.legs,
+                                    snapshot.spot,
+                                    pcr,
                                 )
                                 .await
                                 {
                                     Ok(count) => {
-                                        println!("poller: greeks computed for {count} strikes");
+                                        computed_greeks = count;
                                     }
                                     Err(error) => {
-                                        println!("poller: greeks skipped: {error}");
+                                        crate::bt_error!("poller", "greeks skipped: {error}");
                                     }
                                 }
                             } else {
-                                println!("poller: greeks skipped: missing spot");
+                                crate::bt_info!(
+                                    "poller",
+                                    "greeks skipped: chain is not decision-eligible"
+                                );
                             }
 
                             emit_chain_update(&state, &expiry);
-                            println!(
-                                "poller: chain fetched for NIFTY {expiry} spot={spot:.2} pcr={pcr:.2}"
-                            );
+                            if !success_logged {
+                                let pcr_label = pcr
+                                    .map(|value| format!("{value:.2}"))
+                                    .unwrap_or_else(|| String::from("unknown"));
+                                crate::bt_info!(
+                                    "poller",
+                                    "chain ready for NIFTY {expiry} spot={:.2} pcr={} freshness={:?} greeks={} ",
+                                    snapshot.spot,
+                                    pcr_label,
+                                    snapshot.freshness,
+                                    computed_greeks,
+                                );
+                                success_logged = true;
+                            }
                         }
                         Err(error) => {
-                            println!("poller: redis write failed: {error}");
+                            crate::bt_error!("poller", "redis write failed: {error}");
                         }
                     }
                 }
                 Err(PollError::SessionExpired) => {
-                    println!("poller: NSE session expired, refreshing...");
+                    crate::bt_info!("poller", "NSE session expired, refreshing");
                     break;
                 }
                 Err(PollError::RateLimited) => {
-                    println!("poller: NSE rate limited, backing off 30s");
+                    crate::bt_error!("poller", "NSE rate limited, backing off 30s");
                     time::sleep(Duration::from_secs(30)).await;
                     consecutive_errors += 1;
                     if consecutive_errors > 5 {
-                        println!("poller: too many errors, refreshing session");
+                        crate::bt_error!("poller", "too many errors, refreshing session");
                         break;
                     }
                 }
                 Err(PollError::Other(error)) => {
-                    println!("poller: {error}");
+                    crate::bt_error!("poller", "{error}");
                     consecutive_errors += 1;
                     time::sleep(Duration::from_secs(5)).await;
                     if consecutive_errors > 10 {
-                        println!("poller: too many errors, refreshing session");
+                        crate::bt_error!("poller", "too many errors, refreshing session");
                         break;
                     }
                 }
@@ -181,10 +235,11 @@ async fn enrich_chain_with_greeks(
     expiry: &str,
     legs: &[OptionLeg],
     spot: f64,
-    pcr: f64,
+    pcr: Option<f64>,
 ) -> Result<usize, String> {
     let response = client
         .post(GREEKS_URL)
+        .header("X-Process-Token", state.process_token()?)
         .timeout(Duration::from_secs(5))
         .json(&json!({
             "symbol": NIFTY_SYMBOL,
@@ -216,7 +271,7 @@ async fn enrich_chain_with_greeks(
             return Err(format!("endpoint returned no Greeks: {error}"));
         }
     } else if let Some(error) = greeks.error {
-        println!("poller: greeks partial error: {error}");
+        crate::bt_error!("poller", "greeks partial error: {error}");
     }
 
     write_chain_to_redis(state, expiry, &enriched, pcr).await?;
@@ -229,6 +284,16 @@ fn build_client() -> Client {
         .timeout(Duration::from_secs(10))
         .build()
         .unwrap_or_default()
+}
+
+async fn wait_for_process_token(state: &AppState) {
+    for _ in 0..100 {
+        if state.process_token().is_ok() {
+            return;
+        }
+        time::sleep(Duration::from_millis(100)).await;
+    }
+    crate::bt_error!("poller", "process token unavailable after startup wait");
 }
 
 async fn fetch_nse_cookies(client: &Client) -> Result<String, String> {
@@ -270,12 +335,17 @@ async fn fetch_nse_cookies(client: &Client) -> Result<String, String> {
 
 async fn fetch_chain(
     client: &Client,
+    state: &AppState,
     _cookies: &str,
     expiry: &str,
-) -> Result<(Vec<OptionLeg>, f64), PollError> {
+) -> Result<ChainSnapshot, PollError> {
+    let token = state
+        .process_token()
+        .map_err(|error| PollError::Other(format!("process token unavailable: {error}")))?;
     let response = client
         .get(NSE_CHAIN_URL)
         .header("Accept", "application/json")
+        .header("X-Process-Token", token)
         .send()
         .await
         .map_err(|e| PollError::Other(format!("chain request failed: {e}")))?;
@@ -295,25 +365,57 @@ async fn fetch_chain(
         .await
         .map_err(|e| PollError::Other(format!("chain body read failed: {e}")))?;
 
-    // Check for Python-level error response
-    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&body) {
+    parse_chain_body(&body, expiry)
+}
+
+fn parse_chain_body(body: &str, expiry: &str) -> Result<ChainSnapshot, PollError> {
+    // Check for Python-level error response.
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
         if val.get("error").is_some() {
             return Err(PollError::SessionExpired);
         }
     }
 
-    let chain: NseChainResponse = serde_json::from_str(&body)
+    let chain: NseChainResponse = serde_json::from_str(body)
         .map_err(|e| PollError::Other(format!("chain JSON parse failed: {e}")))?;
 
     let records = chain
         .records
         .ok_or_else(|| PollError::Other("chain missing records".to_string()))?;
+    let provenance = chain
+        .provenance
+        .ok_or_else(|| PollError::Other("chain missing provenance".to_string()))?;
+    if provenance.symbol != NIFTY_SYMBOL {
+        return Err(PollError::Other(format!(
+            "chain symbol mismatch: expected {NIFTY_SYMBOL}, received {}",
+            provenance.symbol
+        )));
+    }
+    if provenance.decision_eligible && provenance.freshness != QuoteFreshness::Fresh {
+        return Err(PollError::Other(String::from(
+            "chain provenance marks non-fresh data decision-eligible",
+        )));
+    }
+    let observed_at_ms = DateTime::parse_from_rfc3339(&provenance.observed_at)
+        .map_err(|error| PollError::Other(format!("chain observed_at invalid: {error}")))?
+        .timestamp_millis();
 
-    let spot = records.underlying_value.unwrap_or(0.0);
+    let spot = records
+        .underlying_value
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .ok_or_else(|| PollError::Other("chain missing valid underlying value".to_string()))?;
     let target_expiry_lower = expiry.to_lowercase();
 
     let mut legs = Vec::new();
-    for row in records.data.unwrap_or_default() {
+    let rows = records
+        .data
+        .ok_or_else(|| PollError::Other("chain missing rows".to_string()))?;
+    for row in rows {
+        if !row.strike_price.is_finite() || row.strike_price <= 0.0 {
+            return Err(PollError::Other(String::from(
+                "chain contains invalid strike",
+            )));
+        }
         if row.expiry_date.to_lowercase() != target_expiry_lower {
             continue;
         }
@@ -324,7 +426,9 @@ async fn fetch_chain(
                 row.strike_price,
                 OptionType::CE,
                 &ce,
-            ));
+                observed_at_ms,
+                provenance.freshness,
+            )?);
         }
         if let Some(pe) = row.pe {
             legs.push(map_nse_leg(
@@ -332,8 +436,16 @@ async fn fetch_chain(
                 row.strike_price,
                 OptionType::PE,
                 &pe,
-            ));
+                observed_at_ms,
+                provenance.freshness,
+            )?);
         }
+    }
+
+    if legs.is_empty() {
+        return Err(PollError::Other(format!(
+            "chain has no legs for expiry {expiry}"
+        )));
     }
 
     legs.sort_by(|a, b| {
@@ -343,7 +455,13 @@ async fn fetch_chain(
             .then_with(|| option_type_rank(&a.option_type).cmp(&option_type_rank(&b.option_type)))
     });
 
-    Ok((legs, spot))
+    Ok(ChainSnapshot {
+        legs,
+        spot,
+        observed_at_ms,
+        freshness: provenance.freshness,
+        decision_eligible: provenance.decision_eligible,
+    })
 }
 
 fn merge_greeks(legs: &mut [OptionLeg], greeks: &[GreekLeg]) {
@@ -392,27 +510,97 @@ fn map_nse_leg(
     strike: f64,
     option_type: OptionType,
     leg: &NseOptionLeg,
-) -> OptionLeg {
-    OptionLeg {
+    observed_at_ms: i64,
+    freshness: QuoteFreshness,
+) -> Result<OptionLeg, PollError> {
+    let received_at_ms = Utc::now().timestamp_millis();
+    let ltp = finite_nonnegative(leg.last_price)
+        .ok_or_else(|| PollError::Other(String::from("chain leg missing valid lastPrice")))?;
+    let bid = finite_nonnegative(leg.bid_price);
+    let ask = finite_nonnegative(leg.ask_price);
+    let volume = finite_nonnegative_u64(leg.volume);
+    let oi = finite_nonnegative_u64(leg.open_interest);
+    let oi_change = finite_i64(leg.oi_change);
+    let iv = finite_positive(leg.iv);
+    let mut field_completeness = vec![String::from("ltp")];
+    for (field, present) in [
+        ("bid", bid.is_some()),
+        ("ask", ask.is_some()),
+        ("volume", volume.is_some()),
+        ("oi", oi.is_some()),
+        ("oi_change", oi_change.is_some()),
+        ("iv", iv.is_some()),
+    ] {
+        if present {
+            field_completeness.push(field.into());
+        }
+    }
+
+    Ok(OptionLeg {
+        schema_version: Tick::SCHEMA_VERSION,
         symbol: NIFTY_SYMBOL.to_string(),
         expiry: expiry.to_string(),
         strike,
         option_type,
-        ltp: leg.last_price,
-        bid: leg.bid_price,
-        ask: leg.ask_price,
-        volume: leg.volume as u64,
-        oi: leg.open_interest as u64,
-        oi_change: leg.oi_change as i64,
-        iv: if leg.iv > 0.0 { Some(leg.iv) } else { None },
+        ltp,
+        bid,
+        ask,
+        volume,
+        oi,
+        oi_change,
+        iv,
         delta: None,
         gamma: None,
         theta: None,
         vega: None,
-    }
+        source_type: QuoteSource::NseChain,
+        observed_at_ms,
+        received_at_ms,
+        sequence: None,
+        field_completeness,
+        freshness,
+        quality: QuoteQuality::ReferenceOnly,
+        fallback: false,
+        fallback_reason: None,
+    })
 }
 
-async fn update_spot_in_redis(state: &AppState, spot: f64) {
+fn finite_nonnegative(value: Option<f64>) -> Option<f64> {
+    value.filter(|number| number.is_finite() && *number >= 0.0)
+}
+
+fn finite_positive(value: Option<f64>) -> Option<f64> {
+    value.filter(|number| number.is_finite() && *number > 0.0)
+}
+
+fn finite_nonnegative_u64(value: Option<f64>) -> Option<u64> {
+    value
+        .filter(|number| {
+            number.is_finite()
+                && *number >= 0.0
+                && number.fract() == 0.0
+                && *number <= u64::MAX as f64
+        })
+        .map(|number| number as u64)
+}
+
+fn finite_i64(value: Option<f64>) -> Option<i64> {
+    value
+        .filter(|number| {
+            number.is_finite()
+                && number.fract() == 0.0
+                && *number >= i64::MIN as f64
+                && *number <= i64::MAX as f64
+        })
+        .map(|number| number as i64)
+}
+
+async fn update_spot_in_redis(
+    state: &AppState,
+    spot: f64,
+    observed_at_ms: i64,
+    freshness: QuoteFreshness,
+) {
     let mut redis_guard = state.redis.lock().await;
     let connection = match redis_guard.as_mut() {
         Some(c) => c,
@@ -424,20 +612,37 @@ async fn update_spot_in_redis(state: &AppState, spot: f64) {
         return;
     }
 
+    let received_at_ms = Utc::now().timestamp_millis();
     let tick = Tick {
+        schema_version: Tick::SCHEMA_VERSION,
         symbol: NIFTY_SYMBOL.to_string(),
-        token: String::new(),
+        token: String::from("NSE_CHAIN:NIFTY"),
         ltp: spot,
-        open: 0.0,
-        high: 0.0,
-        low: 0.0,
-        close: 0.0,
-        volume: 0,
-        oi: 0,
-        bid: 0.0,
-        ask: 0.0,
-        timestamp: Utc::now().timestamp_millis(),
+        open: None,
+        high: None,
+        low: None,
+        close: None,
+        volume: None,
+        oi: None,
+        bid: None,
+        ask: None,
         exchange: crate::models::Exchange::NSE,
+        source_type: QuoteSource::NseChain,
+        observed_at_ms,
+        received_at_ms,
+        sequence: None,
+        field_completeness: vec!["ltp".into()],
+        freshness,
+        quality: QuoteQuality::ReferenceOnly,
+        fallback: true,
+        fallback_reason: Some(String::from(
+            "Angel stream unavailable; NSE chain underlying reference",
+        )),
+        market_state: if freshness == QuoteFreshness::Fresh {
+            MarketDataState::Degraded
+        } else {
+            MarketDataState::Stale
+        },
     };
 
     if let Ok(payload) = serde_json::to_string(&tick) {
@@ -449,7 +654,7 @@ async fn write_chain_to_redis(
     state: &AppState,
     expiry: &str,
     legs: &[OptionLeg],
-    pcr: f64,
+    pcr: Option<f64>,
 ) -> Result<(), String> {
     let chain_payload =
         serde_json::to_string(legs).map_err(|e| format!("chain serialize failed: {e}"))?;
@@ -465,9 +670,32 @@ async fn write_chain_to_redis(
     chain_result.map_err(|e| format!("SET {chain_key} failed: {e}"))?;
 
     let pcr_key = format!("pcr:{NIFTY_SYMBOL}:{expiry}");
-    let pcr_result: redis::RedisResult<()> =
-        connection.set_ex(&pcr_key, pcr.to_string(), REDIS_TTL_SECONDS);
-    pcr_result.map_err(|e| format!("SET {pcr_key} failed: {e}"))?;
+    if let Some(pcr) = pcr {
+        let pcr_result: redis::RedisResult<()> =
+            connection.set_ex(&pcr_key, pcr.to_string(), REDIS_TTL_SECONDS);
+        pcr_result.map_err(|e| format!("SET {pcr_key} failed: {e}"))?;
+    }
+
+    let latest_leg = legs.iter().max_by_key(|leg| leg.observed_at_ms);
+    let observed_at_ms = latest_leg.map(|leg| leg.observed_at_ms);
+    let freshness = latest_leg
+        .map(|leg| leg.freshness)
+        .unwrap_or(QuoteFreshness::Unknown);
+
+    let health = json!({
+        "schema_version": 1,
+        "state": if freshness == QuoteFreshness::Fresh { "LIVE" } else { "STALE" },
+        "source": "RUST_NSE_CHAIN_POLLER",
+        "last_success_ms": Utc::now().timestamp_millis(),
+        "observed_at_ms": observed_at_ms,
+        "freshness": freshness,
+        "expiry": expiry,
+        "leg_count": legs.len(),
+        "pcr_available": pcr.is_some(),
+    });
+    let health_result: redis::RedisResult<()> =
+        connection.set_ex("health:nse_chain_poller", health.to_string(), 30);
+    health_result.map_err(|e| format!("SET poller health failed: {e}"))?;
 
     Ok(())
 }
@@ -483,45 +711,123 @@ fn emit_chain_update(state: &AppState, expiry: &str) {
     });
 
     if let Err(error) = app_handle.emit("chain_update", payload) {
-        println!("poller: chain_update emit failed: {error}");
+        crate::bt_error!("poller", "chain_update emit failed: {error}");
     }
 }
 
-fn compute_pcr(legs: &[OptionLeg]) -> f64 {
+fn compute_pcr(legs: &[OptionLeg]) -> Option<f64> {
     let mut call_oi = 0_u64;
     let mut put_oi = 0_u64;
 
     for leg in legs {
+        let oi = leg.oi?;
         match leg.option_type {
-            OptionType::CE => call_oi = call_oi.saturating_add(leg.oi),
-            OptionType::PE => put_oi = put_oi.saturating_add(leg.oi),
+            OptionType::CE => call_oi = call_oi.saturating_add(oi),
+            OptionType::PE => put_oi = put_oi.saturating_add(oi),
         }
     }
 
     if call_oi == 0 {
-        return 0.0;
+        return None;
     }
 
-    put_oi as f64 / call_oi as f64
+    Some(put_oi as f64 / call_oi as f64)
 }
 
-fn nearest_expiry_thursday() -> String {
-    let now_ist = Utc::now() + ChronoDuration::minutes(330);
-    let today = now_ist.date_naive();
-    let current_weekday = today.weekday().num_days_from_monday() as i64;
-    // NSE changed NIFTY expiry from Thursday to Tuesday in 2024
-    let tuesday = Weekday::Tue.num_days_from_monday() as i64;
-    let mut days_until = (tuesday - current_weekday + 7) % 7;
-    let before_close = now_ist.hour() < 15 || (now_ist.hour() == 15 && now_ist.minute() < 30);
-    if days_until == 0 && !before_close {
-        days_until = 7;
-    }
-    let expiry = today + ChronoDuration::days(days_until);
-    expiry.format("%d-%b-%Y").to_string()
-}
 fn option_type_rank(option_type: &OptionType) -> u8 {
     match option_type {
         OptionType::CE => 0,
         OptionType::PE => 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_chain_body, PollError};
+
+    #[test]
+    fn malformed_chain_payload_fails_closed() {
+        let error = parse_chain_body("not-json", "27-Aug-2026").unwrap_err();
+        assert!(
+            matches!(error, PollError::Other(message) if message.contains("JSON parse failed"))
+        );
+    }
+
+    #[test]
+    fn upstream_error_forces_session_refresh() {
+        assert_eq!(
+            parse_chain_body(r#"{"error":"session expired"}"#, "27-Aug-2026").unwrap_err(),
+            PollError::SessionExpired
+        );
+    }
+
+    #[test]
+    fn valid_chain_is_filtered_and_sorted_deterministically() {
+        let body = r#"{
+            "records": {
+                "underlyingValue": 25123.45,
+                "data": [
+                    {
+                        "strikePrice": 25200,
+                        "expiryDate": "27-Aug-2026",
+                        "CE": {"lastPrice": 10, "openInterest": 20},
+                        "PE": {"lastPrice": 30, "openInterest": 40}
+                    },
+                    {
+                        "strikePrice": 25100,
+                        "expiryDate": "27-Aug-2026",
+                        "CE": {"lastPrice": 50, "openInterest": 60}
+                    },
+                    {
+                        "strikePrice": 25000,
+                        "expiryDate": "03-Sep-2026",
+                        "CE": {"lastPrice": 70, "openInterest": 80}
+                    }
+                ]
+            },
+            "provenance": {
+                "symbol": "NIFTY",
+                "observed_at": "2026-08-27T10:05:00+05:30",
+                "freshness": "FRESH",
+                "decision_eligible": true
+            }
+        }"#;
+        let snapshot = parse_chain_body(body, "27-Aug-2026").unwrap();
+        assert_eq!(snapshot.spot, 25123.45);
+        assert!(snapshot.decision_eligible);
+        assert_eq!(snapshot.freshness, crate::models::QuoteFreshness::Fresh);
+        assert_eq!(snapshot.legs.len(), 3);
+        assert_eq!(snapshot.legs[0].strike, 25100.0);
+        assert_eq!(snapshot.legs[1].strike, 25200.0);
+        assert_eq!(snapshot.legs[2].strike, 25200.0);
+        assert_eq!(snapshot.legs[0].bid, None);
+        assert!(!snapshot.legs[0]
+            .field_completeness
+            .contains(&String::from("bid")));
+    }
+
+    #[test]
+    fn missing_provenance_and_fake_decision_eligibility_fail_closed() {
+        let no_provenance = r#"{
+            "records": {"underlyingValue": 25123.45, "data": []}
+        }"#;
+        assert!(matches!(
+            parse_chain_body(no_provenance, "27-Aug-2026").unwrap_err(),
+            PollError::Other(message) if message.contains("missing provenance")
+        ));
+
+        let inconsistent = r#"{
+            "records": {"underlyingValue": 25123.45, "data": []},
+            "provenance": {
+                "symbol": "NIFTY",
+                "observed_at": "2026-08-27T10:05:00+05:30",
+                "freshness": "STALE",
+                "decision_eligible": true
+            }
+        }"#;
+        assert!(matches!(
+            parse_chain_body(inconsistent, "27-Aug-2026").unwrap_err(),
+            PollError::Other(message) if message.contains("non-fresh")
+        ));
     }
 }

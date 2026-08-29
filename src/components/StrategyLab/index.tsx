@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import Plotly from "plotly.js-dist-min";
 import type { Config, Data, Layout } from "plotly.js";
 
+import { loadPlotly } from "../../lib/plotly";
 import { useQuotesStore } from "../../store/quotes";
+import { executableQuotePrice } from "../../market/quote";
 
 type LegAction = "BUY" | "SELL";
 type LegType = "CE" | "PE" | "FUT";
@@ -33,6 +34,7 @@ type PayoffResult = {
   spot_range: number[];
   pnl_at_expiry: number[];
   pnl_today: number[];
+  pnl_today_degraded: boolean;
   breakevens: number[];
   max_profit: number | null;
   max_loss: number | null;
@@ -86,11 +88,12 @@ const PRESETS: { label: string; value: Preset }[] = [
 
 export function StrategyLab() {
   const spot = useQuotesStore(
-    (state) => state.quotes.NIFTY?.ltp ?? state.quotes["NIFTY 50"]?.ltp ?? 0,
+    (state) => executableQuotePrice(state.quotes.NIFTY ?? state.quotes["NIFTY 50"]),
   );
   const [expiries, setExpiries] = useState<string[]>([]);
   const [selectedExpiry, setSelectedExpiry] = useState("");
   const [chain, setChain] = useState<OptionLeg[]>([]);
+  const [lotSize, setLotSize] = useState<number | null>(null);
   const [legs, setLegs] = useState<StrategyLeg[]>([]);
   const [preset, setPreset] = useState<Preset>("custom");
   const [payoff, setPayoff] = useState<PayoffResult | null>(null);
@@ -128,10 +131,29 @@ export function StrategyLab() {
 
   useEffect(() => {
     if (!selectedExpiry) {
+      setLotSize(null);
       return;
     }
 
     let active = true;
+
+    const loadLotSize = async () => {
+      setLotSize(null);
+      try {
+        const nextLotSize = await invoke<number>("get_lot_size", {
+          expiry: selectedExpiry,
+          symbol: "NIFTY",
+        });
+        if (active) {
+          setLotSize(nextLotSize);
+        }
+      } catch (error) {
+        if (active) {
+          setLotSize(null);
+          setPayoffMessage(error instanceof Error ? error.message : String(error));
+        }
+      }
+    };
 
     const loadChain = async () => {
       try {
@@ -149,6 +171,7 @@ export function StrategyLab() {
       }
     };
 
+    loadLotSize();
     loadChain();
     const timer = window.setInterval(loadChain, 3000);
 
@@ -293,7 +316,7 @@ export function StrategyLab() {
       {
         line: { color: "#546e7a", dash: "dash", width: 2 },
         mode: "lines",
-        name: "P&L Today",
+        name: payoff.pnl_today_degraded ? "P&L Today (approx, IV unsolved)" : "P&L Today",
         type: "scatter",
         x: payoff.spot_range,
         y: payoff.pnl_today,
@@ -388,12 +411,18 @@ export function StrategyLab() {
   );
 
   const addLeg = () => {
-    if (!selectedExpiry) {
+    if (!selectedExpiry || lotSize === null) {
+      setPayoffMessage("Validated lot size unavailable");
       return;
     }
 
+    const leg = makeLeg("BUY", "CE", atmStrike);
+    if (leg === null) {
+      setPayoffMessage("No observed market price for the selected leg");
+      return;
+    }
     setPreset("custom");
-    setLegs((current) => [...current, makeLeg("BUY", "CE", atmStrike)]);
+    setLegs((current) => [...current, leg]);
   };
 
   const applyPreset = (nextPreset: Preset) => {
@@ -430,24 +459,38 @@ export function StrategyLab() {
                   ["BUY", "CE", atmStrike + 200],
                 ];
 
-    setLegs(specs.map(([action, optionType, strike]) => makeLeg(action, optionType, strike)));
+    const nextLegs = specs
+      .map(([action, optionType, strike]) => makeLeg(action, optionType, strike))
+      .filter((leg): leg is StrategyLeg => leg !== null);
+    if (nextLegs.length !== specs.length) {
+      setLegs([]);
+      setPayoffMessage("Preset unavailable: one or more observed market prices are missing");
+      return;
+    }
+    setLegs(nextLegs);
   };
 
   const makeLeg = (
     action: LegAction,
     optionType: LegType,
     strike: number,
-  ): StrategyLeg => ({
-    action,
-    entry_price: marketPrice(optionType, strike),
-    expiry: selectedExpiry,
-    id: createId(),
-    lot_size: 75,
-    option_type: optionType,
-    quantity: 1,
-    strike,
-    symbol: "NIFTY",
-  });
+  ): StrategyLeg | null => {
+    const entryPrice = marketPrice(optionType, strike);
+    if (entryPrice === null || lotSize === null) {
+      return null;
+    }
+    return {
+      action,
+      entry_price: entryPrice,
+      expiry: selectedExpiry,
+      id: createId(),
+      lot_size: lotSize,
+      option_type: optionType,
+      quantity: 1,
+      strike,
+      symbol: "NIFTY",
+    };
+  };
 
   const updateLeg = (id: string, updates: Partial<StrategyLeg>) => {
     setPreset("custom");
@@ -463,7 +506,10 @@ export function StrategyLab() {
           updates.strike !== undefined ||
           updates.expiry !== undefined
         ) {
-          next.entry_price = marketPrice(next.option_type, next.strike);
+          const observedPrice = marketPrice(next.option_type, next.strike);
+          if (observedPrice !== null) {
+            next.entry_price = observedPrice;
+          }
         }
         return next;
       }),
@@ -477,13 +523,13 @@ export function StrategyLab() {
 
   const marketPrice = (optionType: LegType, strike: number) => {
     if (optionType === "FUT") {
-      return spot > 0 ? Number(spot.toFixed(2)) : 0;
+      return spot > 0 ? Number(spot.toFixed(2)) : null;
     }
 
     const leg = chain.find(
       (item) => item.option_type === optionType && Math.abs(item.strike - strike) < 0.01,
     );
-    return leg?.ltp && leg.ltp > 0 ? Number(leg.ltp.toFixed(2)) : 0;
+    return leg?.ltp !== undefined && leg.ltp >= 0 ? Number(leg.ltp.toFixed(2)) : null;
   };
 
   return (
@@ -548,9 +594,9 @@ export function StrategyLab() {
           ))}
         </select>
         <button
-          disabled={!selectedExpiry}
+          disabled={!selectedExpiry || lotSize === null}
           onClick={addLeg}
-          style={buttonStyle(Boolean(selectedExpiry))}
+          style={buttonStyle(Boolean(selectedExpiry && lotSize !== null))}
           type="button"
         >
           Add Leg
@@ -702,6 +748,11 @@ export function StrategyLab() {
               <span>Gamma: {payoff.net_greeks.gamma.toFixed(4)}</span>
               <span>Theta: {payoff.net_greeks.theta.toFixed(2)}</span>
               <span>Vega: {payoff.net_greeks.vega.toFixed(2)}</span>
+              {payoff.pnl_today_degraded ? (
+                <span style={{ color: "#facc15" }}>
+                  Greeks/P&amp;L Today: approximate (entry price implied vol unsolved)
+                </span>
+              ) : null}
               <span>Max Profit: {formatLimit(payoff.max_profit)}</span>
               <span>Max Loss: {formatLimit(payoff.max_loss)}</span>
               <span>
@@ -756,17 +807,23 @@ function PlotlyChart({
     if (!container) {
       return;
     }
-
-    Plotly.react(container, data, layout, plotConfig);
-
-    const resizeObserver = new ResizeObserver(() => {
-      Plotly.Plots.resize(container);
+    let active = true;
+    let resizeObserver: ResizeObserver | null = null;
+    let plotly: Awaited<ReturnType<typeof loadPlotly>> | null = null;
+    void loadPlotly().then((loaded) => {
+      if (!active) {
+        return;
+      }
+      plotly = loaded;
+      loaded.react(container, data, layout, plotConfig);
+      resizeObserver = new ResizeObserver(() => loaded.Plots.resize(container));
+      resizeObserver.observe(container);
     });
-    resizeObserver.observe(container);
 
     return () => {
-      resizeObserver.disconnect();
-      Plotly.purge(container);
+      active = false;
+      resizeObserver?.disconnect();
+      plotly?.purge(container);
     };
   }, [data, layout]);
 
