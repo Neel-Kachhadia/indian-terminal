@@ -318,6 +318,38 @@ def test_collector_rejects_malformed_read_responses(monkeypatch) -> None:
         smart_collector.row_count_for_date("ohlcv", date(2026, 8, 25))
 
 
+def test_signal_pending_check_uses_its_decision_eligible_source_domain(monkeypatch) -> None:
+    """Raw OHLCV can advance before its rows become decision eligible. The
+    signal scheduler must compare signals with the exact view used by the
+    backfill engine, otherwise it records a zero-row false success and masks
+    the still-ineligible date for the rest of the day."""
+    today = date(2026, 8, 31)
+    monkeypatch.setattr(smart_collector, "ist_today", lambda: today)
+    monkeypatch.setattr(smart_collector, "ist_hour", lambda: 12.0)
+    monkeypatch.setattr(smart_collector, "instrument_master_age_hours", lambda: 0.0)
+    monkeypatch.setattr(smart_collector, "task_done", lambda *_args: False)
+    monkeypatch.setattr(smart_collector, "days_since_last_success", lambda *_args: 0)
+
+    def latest(dataset: str, symbol: str | None = None):
+        values = {
+            ("ohlcv", None): today,
+            ("signals_source_ohlcv", "NIFTY"): date(2026, 8, 26),
+            ("signals_history", "NIFTY"): date(2026, 8, 26),
+            ("bif_history", "NIFTY"): date(2026, 8, 26),
+        }
+        return values[(dataset, symbol)]
+
+    monkeypatch.setattr(smart_collector, "latest_date_in", latest)
+
+    pending = smart_collector.get_pending_tasks()
+
+    assert all(item["task"] != "signals" for item in pending)
+    assert _collector_read_dataset("signals_source_ohlcv") == (
+        "decision_eligible_ohlcv",
+        "date",
+    )
+
+
 def test_manual_rerun_of_already_succeeded_task_does_not_crash(monkeypatch, tmp_path) -> None:
     """Reproduces a real live crash: `--task NAME` (a manual/operator re-run,
     unlike the automatic pending-cycle path which never re-invokes an
@@ -390,6 +422,10 @@ def test_setup_retries_via_elevation_when_schtasks_reports_access_denied(monkeyp
     monkeypatch.setattr(setup_autostart, "validate_environment", lambda runtime=None: [])
     monkeypatch.setattr(setup_autostart, "validate_installed", lambda: 0)
     monkeypatch.setattr(setup_autostart, "_current_user", lambda: r"HOST\user")
+    # Not under test here (see test_autostart_data_root_consistency.py); must
+    # be isolated like every other real side-effecting call setup() makes,
+    # or it hits the real registry (see conftest.py's winreg guard).
+    monkeypatch.setattr(setup_autostart, "_sync_app_data_override", lambda: None)
 
     calls: list[str] = []
 
@@ -418,6 +454,7 @@ def test_setup_reports_elevation_decline_without_crashing(monkeypatch) -> None:
 
     monkeypatch.setattr(setup_autostart, "validate_environment", lambda runtime=None: [])
     monkeypatch.setattr(setup_autostart, "_current_user", lambda: r"HOST\user")
+    monkeypatch.setattr(setup_autostart, "_sync_app_data_override", lambda: None)
     monkeypatch.setattr(
         setup_autostart.subprocess,
         "run",
@@ -442,6 +479,7 @@ def test_setup_does_not_attempt_elevation_for_unrelated_failures(monkeypatch) ->
 
     monkeypatch.setattr(setup_autostart, "validate_environment", lambda runtime=None: [])
     monkeypatch.setattr(setup_autostart, "_current_user", lambda: r"HOST\user")
+    monkeypatch.setattr(setup_autostart, "_sync_app_data_override", lambda: None)
     monkeypatch.setattr(
         setup_autostart.subprocess,
         "run",

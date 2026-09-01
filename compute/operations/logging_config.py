@@ -17,8 +17,46 @@ from security.log_scrubber import SecretScrubber, scrub_text
 MAX_LOG_BYTES = 5 * 1024 * 1024
 LOG_BACKUPS = 5
 _configured = False
-_original_stdout = sys.stdout
-_original_stderr = sys.stderr
+
+
+class _NullStream:
+    """A structurally-real, always-non-interactive stand-in for a missing
+    `sys.stdout`/`sys.stderr`. Deliberately NOT `open(os.devnull, "w")`:
+    opening Windows' NUL device can report `isatty() == True` (a real,
+    verified platform quirk -- opening it is a character device, and
+    Windows' isatty() check is device-type-based, not "is this an actual
+    console" based), which would wrongly select the human-interactive
+    console formatter for a stream that goes nowhere."""
+
+    encoding = "utf-8"
+
+    def isatty(self) -> bool:
+        return False
+
+    def write(self, _value: str) -> int:
+        return 0
+
+    def flush(self) -> None:
+        return None
+
+
+def safe_stream_or_devnull(stream: TextIO | None) -> TextIO:
+    """A frozen `--windowed` executable launched with no stdio redirection
+    (e.g. Task Scheduler's InteractiveToken action, which provides no pipes)
+    has `sys.stdout`/`sys.stderr` set to `None` by the interpreter -- there
+    is no console to give it a real handle. Every caller below assumes a
+    real stream (`.isatty()`, `.write()`, `.encoding`, wrapping in
+    `logging.StreamHandler`); substituting a safe stand-in once, here, keeps
+    that assumption true everywhere else instead of scattering `is not None`
+    guards through logging/console-format code that also runs in the
+    interactive/dev case where the stream is real."""
+    if stream is not None:
+        return stream
+    return _NullStream()
+
+
+_original_stdout = safe_stream_or_devnull(sys.stdout)
+_original_stderr = safe_stream_or_devnull(sys.stderr)
 _console_interactive = False
 _console_unicode = True
 

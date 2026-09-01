@@ -239,6 +239,7 @@ def test_supervisor_refuses_to_spawn_when_job_object_ownership_fails(monkeypatch
 
     monkeypatch.setattr(job_supervisor, "create_kill_on_close_job", fail_job_setup)
     monkeypatch.setattr(job_supervisor, "_spawn_collector", lambda: spawned.append(True))
+    monkeypatch.setattr(job_supervisor, "_configure_lifecycle_logging", lambda _component: None)
 
     assert job_supervisor.run() == 1
     assert spawned == []

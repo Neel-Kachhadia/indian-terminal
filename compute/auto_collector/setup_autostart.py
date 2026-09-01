@@ -76,7 +76,9 @@ def runtime_layout(
 
 
 def _current_user() -> str:
-    result = subprocess.run([str(WHOAMI)], capture_output=True, text=True, timeout=10)
+    result = subprocess.run(
+        [str(WHOAMI)], capture_output=True, text=True, timeout=10, creationflags=subprocess.CREATE_NO_WINDOW
+    )
     if result.returncode != 0 or not result.stdout.strip():
         raise RuntimeError("unable to determine current Windows user")
     return result.stdout.strip()
@@ -261,6 +263,17 @@ def validate_task_xml(xml_text: str, runtime: TaskRuntime | None = None) -> list
         actual = value(path)
         if actual.casefold() != expected_value.casefold():
             errors.append(f"task field mismatch {path}: {actual!r}")
+    # `schtasks /Query /XML` never round-trips `<Enabled>` for an enabled
+    # task -- Windows only emits the element at all when a task has been
+    # explicitly disabled (`<Enabled>false</Enabled>`). Reproduced live:
+    # a freshly re-registered, genuinely-enabled task (confirmed via
+    # Get-ScheduledTask -> State "Ready") still reported this field as
+    # mismatched on every successful setup(), because absent was compared
+    # against the literal string "true" instead of being treated as the
+    # enabled default. Only an explicit non-true value is a real defect.
+    enabled = value(".//t:Settings/t:Enabled")
+    if enabled and enabled.casefold() != "true":
+        errors.append(f"task field mismatch .//t:Settings/t:Enabled: {enabled!r}")
     arguments = value(".//t:Exec/t:Arguments")
     if arguments.casefold() != runtime.arguments.casefold():
         errors.append("task arguments do not match the expected collector supervisor entrypoint")
@@ -277,6 +290,7 @@ def query_xml(task_name: str = TASK_NAME) -> tuple[str | None, str | None]:
         capture_output=True,
         text=True,
         timeout=20,
+        creationflags=subprocess.CREATE_NO_WINDOW,
     )
     if result.returncode != 0:
         return None, (result.stderr.strip() or result.stdout.strip() or "task not found")
@@ -412,6 +426,7 @@ def _register_task(task_name: str, xml_text: str) -> tuple[bool, str]:
             capture_output=True,
             text=True,
             timeout=30,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
         if result.returncode != 0 and _access_denied(result.stderr or result.stdout or ""):
             elevated_ok, elevated_error = _create_task_elevated(xml_path, task_name)
@@ -428,6 +443,51 @@ def _register_task(task_name: str, xml_text: str) -> tuple[bool, str]:
     return True, ""
 
 
+def _sync_app_data_override() -> None:
+    """Persist BHARATTERMINAL_APP_DATA to the user's registry environment
+    block so Task Scheduler-launched runs resolve the same data root as
+    this (interactive) process.
+
+    Task Scheduler never inherits a variable set with the shell builtin
+    `set` -- that is local to the setting process and whatever it directly
+    launches as a child. It DOES build each task action's environment
+    fresh from the user's persisted `HKCU\\Environment` block at spawn
+    time, the same registry key `setx` writes to. Without this, a machine
+    where an operator has set BHARATTERMINAL_APP_DATA in their interactive
+    session (to point the collector at a non-default data root) ends up
+    with two silently diverging data directories: the interactive/dev
+    launch path honors the override, while every Task Scheduler-driven run
+    -- the actual unattended production path -- falls back to
+    data.paths._base_dir()'s default (%APPDATA%\\BharatTerminal) instead,
+    reproduced live: the real production DuckDB went untouched for hours
+    while a healthy, correctly-recovering collector kept writing to the
+    wrong directory with no error, no crash, and no log difference to
+    distinguish it from success.
+
+    A machine with no override set is untouched: normal installs keep
+    using the documented %APPDATA%\\BharatTerminal default everywhere.
+    """
+    override = os.environ.get("BHARATTERMINAL_APP_DATA")
+    if not override:
+        return
+    import ctypes
+    import winreg
+
+    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_SET_VALUE) as key:
+        winreg.SetValueEx(key, "BHARATTERMINAL_APP_DATA", 0, winreg.REG_EXPAND_SZ, override)
+    # Broadcast so already-running processes that read the environment at
+    # startup (e.g. Explorer, for anything launched from the Start Menu)
+    # see the change too. Task Scheduler itself re-reads the registry
+    # directly on every launch and does not need this broadcast, but a
+    # human-launched process later in the same session might.
+    HWND_BROADCAST = 0xFFFF
+    WM_SETTINGCHANGE = 0x001A
+    SMTO_ABORTIFHUNG = 0x0002
+    ctypes.windll.user32.SendMessageTimeoutW(
+        HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment", SMTO_ABORTIFHUNG, 5000, None
+    )
+
+
 def setup() -> int:
     runtime = runtime_layout()
     errors = validate_environment(runtime)
@@ -435,6 +495,8 @@ def setup() -> int:
         for error in errors:
             print(f"ERROR: {error}")
         return 1
+
+    _sync_app_data_override()
 
     ok, error = _register_task(TASK_NAME, task_xml(_current_user(), runtime))
     if not ok:
@@ -463,6 +525,7 @@ def remove() -> int:
             capture_output=True,
             text=True,
             timeout=20,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
         if result.returncode == 0:
             print(f"Removed: {task_name}")

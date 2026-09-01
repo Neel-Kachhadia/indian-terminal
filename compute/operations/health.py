@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 from auto_collector.supervision import status_snapshot
 from data.exchange_calendar import exchange_calendar
-from db.duckdb_client import connect_observational
+from db.write_service import ReadOperation, resolve_read
 from db.writer_lease import writer_lease_status
 from ml.registry import registry_health
 from security.log_scrubber import scrub_text
@@ -316,14 +316,10 @@ def _database_health(
     freshness: dict[str, Any] = {}
     started = time.perf_counter()
     try:
-        with connect_observational(path) as connection:
-            connection.execute("SELECT 1").fetchone()
-            schema_row = connection.execute(
-                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
-            ).fetchone()
-            for table in ("ohlcv", "fo_eod", "iv_history", "signals_history"):
-                row = connection.execute(f"SELECT MAX(date) FROM {table}").fetchone()
-                freshness[table] = _freshness_record(row[0], instant)
+        snapshot = resolve_read(ReadOperation.LOAD_HEALTH_SNAPSHOT, {}, database=path)
+        schema_version = int(snapshot["schema_version"])
+        for table in ("ohlcv", "fo_eod", "iv_history", "signals_history"):
+            freshness[table] = _freshness_record(snapshot["latest"].get(table), instant)
     except Exception as error:
         return (
             {
@@ -342,7 +338,7 @@ def _database_health(
             "state": "HEALTHY",
             "critical": True,
             "path": str(path),
-            "schema_version": int(schema_row[0] or 0),
+            "schema_version": schema_version,
             "latency_ms": round((time.perf_counter() - started) * 1000, 3),
             "writer_lease": lease,
             "checked_at": checked_at,

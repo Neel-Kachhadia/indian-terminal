@@ -122,6 +122,10 @@ def test_submit_read_serves_typed_reads_through_the_live_writer(tmp_path: Path) 
             queue_path=queue,
         )
         assert result == {"count": 1}
+        with sqlite3.connect(queue) as queue_connection:
+            assert queue_connection.execute(
+                "SELECT COUNT(*) FROM writer_requests WHERE kind = 'READ'"
+            ).fetchone()[0] == 0
     finally:
         service.stop()
 
@@ -140,6 +144,10 @@ def test_submit_read_rejects_non_allowlisted_dataset(tmp_path: Path) -> None:
                 database=database,
                 queue_path=queue,
             )
+        with sqlite3.connect(queue) as queue_connection:
+            assert queue_connection.execute(
+                "SELECT COUNT(*) FROM writer_requests WHERE kind = 'READ'"
+            ).fetchone()[0] == 0
     finally:
         service.stop()
 
@@ -424,6 +432,191 @@ def test_slow_dispatch_keeps_heartbeat_fresh_and_submitter_connected(
         service.stop()
 
     assert results == [{"completed": True}]
+
+
+def test_timed_out_reader_is_cancelled_instead_of_poisoning_queue(tmp_path: Path) -> None:
+    """Exact live failure: one long write occupied the writer for hours and
+    every 30-second collector/API read remained PENDING forever.  A caller
+    that has timed out must cancel its still-unclaimed request."""
+    database = tmp_path / "terminal.db"
+    queue = tmp_path / "writer.sqlite"
+    duckdb.connect(database).close()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_dispatch(*_: object) -> dict[str, bool]:
+        entered.set()
+        assert release.wait(timeout=5)
+        return {"ok": True}
+
+    service = WriterService(database, queue_path=queue, dispatcher=blocking_dispatch)
+    service.start()
+    writer_result: list[object] = []
+
+    def submit_blocking_write() -> None:
+        try:
+            writer_result.append(
+                submit_write(
+                    WriteOperation.UPSERT_FII_DII,
+                    _fii_payload(),
+                    database=database,
+                    queue_path=queue,
+                    timeout=5,
+                )
+            )
+        except Exception as error:
+            writer_result.append(error)
+
+    thread = threading.Thread(target=submit_blocking_write)
+    thread.start()
+    assert entered.wait(timeout=2)
+    try:
+        with pytest.raises(WriterUnavailableError, match="reader request timed out"):
+            submit_read(
+                ReadOperation.LATEST_DATE_IN,
+                {"dataset": "ohlcv"},
+                database=database,
+                queue_path=queue,
+                timeout=0.1,
+            )
+        with sqlite3.connect(queue) as connection:
+            states = connection.execute(
+                "SELECT state, error FROM writer_requests WHERE kind = 'READ'"
+            ).fetchall()
+        assert states == [("FAILED", "reader request timed out")]
+    finally:
+        release.set()
+        thread.join(timeout=5)
+        service.stop()
+    assert writer_result == [{"ok": True}]
+
+
+def test_writer_handoff_discards_abandoned_reads_but_keeps_writes(tmp_path: Path) -> None:
+    database = tmp_path / "terminal.db"
+    queue = tmp_path / "writer.sqlite"
+    duckdb.connect(database).close()
+    _ensure_queue_schema(queue)
+    now = _utc_text()
+    with sqlite3.connect(queue) as connection:
+        connection.executemany(
+            "INSERT INTO writer_requests "
+            "(request_id, operation, payload_json, state, kind, created_at, updated_at) "
+            "VALUES (?, ?, '{}', ?, ?, ?, ?)",
+            [
+                ("pending-read", ReadOperation.LATEST_DATE_IN.value, "PENDING", "READ", now, now),
+                ("running-read", ReadOperation.LATEST_DATE_IN.value, "RUNNING", "READ", now, now),
+            ],
+        )
+
+    service = WriterService(database, queue_path=queue)
+    service.start()
+    try:
+        with sqlite3.connect(queue) as connection:
+            rows = connection.execute(
+                "SELECT request_id, state, error FROM writer_requests ORDER BY request_id"
+            ).fetchall()
+        assert rows == [
+            ("pending-read", "FAILED", "reader abandoned during writer handoff"),
+            ("running-read", "FAILED", "reader abandoned during writer handoff"),
+        ]
+    finally:
+        service.stop()
+
+
+def test_writer_start_prunes_only_orphaned_completed_reads(tmp_path: Path) -> None:
+    database = tmp_path / "terminal.db"
+    queue = tmp_path / "writer.sqlite"
+    duckdb.connect(database).close()
+    _ensure_queue_schema(queue)
+    with sqlite3.connect(queue) as connection:
+        connection.executemany(
+            "INSERT INTO writer_requests "
+            "(request_id, operation, payload_json, state, result_json, kind, created_at, updated_at) "
+            "VALUES (?, 'LATEST_DATE_IN', '{}', 'SUCCEEDED', ?, 'READ', ?, ?)",
+            [
+                ("orphaned", '"large old result"', "2020-01-01T00:00:00+00:00", "2020-01-01T00:00:00+00:00"),
+                ("recent", '"still observable"', _utc_text(), _utc_text()),
+            ],
+        )
+
+    service = WriterService(database, queue_path=queue)
+    service.start()
+    try:
+        with sqlite3.connect(queue) as connection:
+            rows = connection.execute(
+                "SELECT request_id FROM writer_requests WHERE kind = 'READ' ORDER BY request_id"
+            ).fetchall()
+        assert rows == [("recent",)]
+    finally:
+        service.stop()
+
+
+def test_model_training_is_rejected_from_writer_queue(tmp_path: Path) -> None:
+    database = tmp_path / "terminal.db"
+    queue = tmp_path / "writer.sqlite"
+    duckdb.connect(database).close()
+    service = WriterService(database, queue_path=queue)
+    service.start()
+    try:
+        for operation in (
+            WriteOperation.TRAIN_NIFTY_MODELS,
+            WriteOperation.TRAIN_STOCK_MODELS,
+            WriteOperation.TRAIN_SINGLE_STOCK,
+        ):
+            with pytest.raises(WriterRequestFailed, match="not permitted"):
+                submit_write(
+                    operation,
+                    {"symbol": "NIFTY", "force": False},
+                    database=database,
+                    queue_path=queue,
+                    timeout=2,
+                )
+    finally:
+        service.stop()
+
+
+def test_ml_training_audit_is_a_short_typed_writer_operation(tmp_path: Path) -> None:
+    database = tmp_path / "terminal.db"
+    queue = tmp_path / "writer.sqlite"
+    duckdb.connect(database).close()
+    service = WriterService(database, queue_path=queue)
+    service.start()
+    try:
+        result = submit_write(
+            WriteOperation.RECORD_ML_TRAINING_LOG,
+            {
+                "symbol": "NIFTY",
+                "model_id": "m01_vol_regime",
+                "trained_at": "2026-08-30T15:00:00+00:00",
+                "n_rows": 250,
+                "n_features": 12,
+                "train_score": 0.75,
+                "val_score": 0.7,
+                "feature_importance_top5": "{}",
+                "bif_rows_used": 0,
+                "ohlcv_rows_used": 250,
+                "status": "success",
+                "error_msg": None,
+            },
+            database=database,
+            queue_path=queue,
+            timeout=2,
+        )
+        assert result == {
+            "symbol": "NIFTY",
+            "model_id": "m01_vol_regime",
+            "status": "success",
+        }
+    finally:
+        service.stop()
+
+    connection = duckdb.connect(database, read_only=True)
+    try:
+        assert connection.execute(
+            "SELECT symbol, model_id, status, n_rows FROM ml_training_log"
+        ).fetchall() == [("NIFTY", "m01_vol_regime", "success", 250)]
+    finally:
+        connection.close()
 
 
 def test_default_connection_cannot_bypass_live_writer_service(

@@ -32,6 +32,8 @@ from db.writer_lease import require_writer_lease
 
 
 QUEUE_CAPACITY = 256
+QUEUE_COMPACT_THRESHOLD_BYTES = 64 * 1024 * 1024
+COMPLETED_READ_RETENTION_SECONDS = 10 * 60
 HEARTBEAT_INTERVAL_SECONDS = 1.0
 HEARTBEAT_STALE_SECONDS = 5.0
 POLL_INTERVAL_SECONDS = 0.05
@@ -135,8 +137,14 @@ class WriteOperation(StrEnum):
     BACKFILL_SIGNALS = "BACKFILL_SIGNALS"
     COMPUTE_BIF = "COMPUTE_BIF"
     RUN_OHLC_FORECASTS = "RUN_OHLC_FORECASTS"
+    # Model training is deliberately executed outside the DuckDB writer
+    # thread.  These legacy values remain only so an old durable queue entry
+    # can be failed explicitly after an upgrade instead of being replayed.
     TRAIN_NIFTY_MODELS = "TRAIN_NIFTY_MODELS"
     TRAIN_STOCK_MODELS = "TRAIN_STOCK_MODELS"
+    TRAIN_SINGLE_STOCK = "TRAIN_SINGLE_STOCK"
+    ENSURE_ML_TRAINING_LOG = "ENSURE_ML_TRAINING_LOG"
+    RECORD_ML_TRAINING_LOG = "RECORD_ML_TRAINING_LOG"
     RECORD_INGESTION_MANIFEST = "RECORD_INGESTION_MANIFEST"
     APPLY_RETENTION = "APPLY_RETENTION"
     RECOVER_BACKTESTS = "RECOVER_BACKTESTS"
@@ -148,7 +156,6 @@ class WriteOperation(StrEnum):
     RECORD_PREDICTION_OUTCOME = "RECORD_PREDICTION_OUTCOME"
     SAVE_BACKTEST_STARTED = "SAVE_BACKTEST_STARTED"
     RUN_BACKTEST_JOB = "RUN_BACKTEST_JOB"
-    TRAIN_SINGLE_STOCK = "TRAIN_SINGLE_STOCK"
     RUN_FULL_BACKFILL = "RUN_FULL_BACKFILL"
     RUN_PARSER_TESTS = "RUN_PARSER_TESTS"
 
@@ -205,6 +212,7 @@ class ReadOperation(StrEnum):
     LOAD_OHLCV_CHART_RANGE = "LOAD_OHLCV_CHART_RANGE"
     LOAD_ML_FORECAST_INPUT_FRAME = "LOAD_ML_FORECAST_INPUT_FRAME"
     LOAD_DATA_SUMMARY_STATS = "LOAD_DATA_SUMMARY_STATS"
+    LOAD_HEALTH_SNAPSHOT = "LOAD_HEALTH_SNAPSHOT"
 
 
 # (table, date_column) for each dataset name a READ request may name. Mirrors
@@ -215,6 +223,7 @@ _READ_DATASETS: dict[str, tuple[str, str]] = {
     "fii_dii_daily": ("fii_dii_daily", "date"),
     "fo_eod": ("fo_eod", "date"),
     "ohlcv": ("ohlcv", "date"),
+    "signals_source_ohlcv": ("decision_eligible_ohlcv", "date"),
     "signals_history": ("signals_history", "date"),
 }
 
@@ -258,6 +267,7 @@ class WriterService:
         self._thread: threading.Thread | None = None
         self._heartbeat_thread: threading.Thread | None = None
         self._connection: duckdb.DuckDBPyConnection | None = None
+        self._consecutive_reads = 0
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -307,10 +317,22 @@ class WriterService:
                     # liveness is False: owner process is provably dead (or the
                     # PID was reused by an unrelated process) -- reclaim now
                     # instead of waiting out the heartbeat TTL.
+                recovered_at = _utc_text()
+                # READ callers are synchronous and bounded.  If the old
+                # writer died, every in-flight caller died or timed out with
+                # it; replaying those reads has no consumer and can leave a
+                # large stale FIFO ahead of live GUI traffic.  Writes retain
+                # their durable replay semantics.
+                connection.execute(
+                    "UPDATE writer_requests SET state = 'FAILED', owner_id = NULL, "
+                    "error = ?, updated_at = ? "
+                    "WHERE kind = 'READ' AND state IN ('PENDING', 'RUNNING')",
+                    ["reader abandoned during writer handoff", recovered_at],
+                )
                 connection.execute(
                     "UPDATE writer_requests SET state = 'PENDING', owner_id = NULL, updated_at = ? "
-                    "WHERE state = 'RUNNING'",
-                    [_utc_text()],
+                    "WHERE kind <> 'READ' AND state = 'RUNNING'",
+                    [recovered_at],
                 )
                 connection.execute(
                     "INSERT OR REPLACE INTO writer_runtime "
@@ -319,6 +341,7 @@ class WriterService:
                     [self.owner_id, os.getpid(), own_start_time, _utc_text()],
                 )
                 connection.commit()
+            _compact_queue_if_needed(self.queue_path)
         except BaseException:
             with _SERVICE_REGISTRY_LOCK:
                 _ACTIVE_DATABASE_SERVICES.discard(self.database)
@@ -519,9 +542,13 @@ class WriterService:
     def _claim_next(self) -> tuple[str, str, str, str] | None:
         with _queue_connection(self.queue_path) as connection:
             connection.execute("BEGIN IMMEDIATE")
+            prefer_reads = self._consecutive_reads < 8
+            preferred_kind = "READ" if prefer_reads else "WRITE"
             row = connection.execute(
                 "SELECT request_id, kind, operation, payload_json FROM writer_requests "
-                "WHERE state = 'PENDING' ORDER BY created_at, request_id LIMIT 1"
+                "WHERE state = 'PENDING' "
+                "ORDER BY CASE WHEN kind = ? THEN 0 ELSE 1 END, created_at, request_id LIMIT 1",
+                [preferred_kind],
             ).fetchone()
             if row is None:
                 connection.commit()
@@ -532,6 +559,11 @@ class WriterService:
                 [self.owner_id, _utc_text(), row[0]],
             ).rowcount
             connection.commit()
+            if changed == 1:
+                if str(row[1]) == "READ":
+                    self._consecutive_reads += 1
+                else:
+                    self._consecutive_reads = 0
             return (
                 (str(row[0]), str(row[1]), str(row[2]), str(row[3])) if changed == 1 else None
             )
@@ -682,11 +714,24 @@ def submit_read(
             raise WriterServiceError("reader request disappeared")
         state = str(row[0])
         if state == "SUCCEEDED":
-            return json.loads(str(row[1]))
+            result = json.loads(str(row[1]))
+            _delete_completed_read(path, request_id, "SUCCEEDED")
+            return result
         if state == "FAILED":
-            raise WriterRequestFailed(str(row[2] or "reader request failed"))
+            error = str(row[2] or "reader request failed")
+            _delete_completed_read(path, request_id, "FAILED")
+            raise WriterRequestFailed(error)
         _assert_writer_live(path, accept_new=False)
         time.sleep(POLL_INTERVAL_SECONDS)
+    # A timed-out synchronous reader has no consumer left.  Cancel it while
+    # still pending so it cannot accumulate ahead of later live requests.
+    # If the writer already claimed it, let that bounded read finish/ack.
+    with _queue_connection(path) as connection:
+        connection.execute(
+            "UPDATE writer_requests SET state = 'FAILED', error = ?, updated_at = ? "
+            "WHERE request_id = ? AND state = 'PENDING' AND kind = 'READ'",
+            ["reader request timed out", _utc_text(), request_id],
+        )
     raise WriterUnavailableError(f"reader request timed out: {operation.value}")
 
 
@@ -868,6 +913,37 @@ def _queue_connection(path: Path, *, read_only: bool = False) -> sqlite3.Connect
         connection = sqlite3.connect(str(path), timeout=5)
     connection.execute("PRAGMA busy_timeout=5000")
     return connection
+
+
+def _delete_completed_read(path: Path, request_id: str, state: str) -> None:
+    with _queue_connection(path) as connection:
+        connection.execute(
+            "DELETE FROM writer_requests "
+            "WHERE request_id = ? AND kind = 'READ' AND state = ?",
+            [request_id, state],
+        )
+
+
+def _compact_queue_if_needed(path: Path) -> None:
+    cutoff = (
+        dt.datetime.now(dt.timezone.utc)
+        - dt.timedelta(seconds=COMPLETED_READ_RETENTION_SECONDS)
+    ).isoformat(timespec="microseconds")
+    with _queue_connection(path) as connection:
+        connection.execute(
+            "DELETE FROM writer_requests "
+            "WHERE kind = 'READ' AND state = 'SUCCEEDED' AND updated_at < ?",
+            [cutoff],
+        )
+    try:
+        oversized = path.stat().st_size >= QUEUE_COMPACT_THRESHOLD_BYTES
+    except OSError:
+        return
+    if not oversized:
+        return
+    with _queue_connection(path) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        connection.execute("VACUUM")
 
 
 def _read_dataset(dataset: str) -> tuple[str, str]:
@@ -1946,6 +2022,26 @@ def _dispatch_read(
             "instr": list(instr),
             "gift": list(gift),
         }
+    if operation is ReadOperation.LOAD_HEALTH_SNAPSHOT:
+        schema_row = connection.execute(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
+        ).fetchone()
+        rows = {
+            "ohlcv": connection.execute("SELECT MAX(date) FROM ohlcv").fetchone(),
+            "fo_eod": connection.execute("SELECT MAX(date) FROM fo_eod").fetchone(),
+            "iv_history": connection.execute("SELECT MAX(date) FROM iv_history").fetchone(),
+            "signals_history": connection.execute(
+                "SELECT MAX(date) FROM signals_history"
+            ).fetchone(),
+        }
+        latest = {
+            table: str(row[0]) if row and row[0] is not None else None
+            for table, row in rows.items()
+        }
+        return {
+            "schema_version": int(schema_row[0] or 0) if schema_row else 0,
+            "latest": latest,
+        }
     raise ValueError(f"unhandled read operation: {operation_text}")
 
 
@@ -1976,14 +2072,18 @@ def _dispatch_operation(operation: WriteOperation, payload: dict[str, Any], data
         from bif.engine import BIFEngine
 
         return BIFEngine().compute_all(_required_symbol(payload), persist=True)
-    if operation is WriteOperation.TRAIN_NIFTY_MODELS:
-        from ml.trainer import train_all_models
-
-        return train_all_models(force=bool(payload.get("force", False)), symbol="NIFTY")
-    if operation is WriteOperation.TRAIN_STOCK_MODELS:
-        from ml.stock_trainer import StockModelTrainer
-
-        return StockModelTrainer().train_all_fno_stocks(force=bool(payload.get("force", False)))
+    if operation in {
+        WriteOperation.TRAIN_NIFTY_MODELS,
+        WriteOperation.TRAIN_STOCK_MODELS,
+        WriteOperation.TRAIN_SINGLE_STOCK,
+    }:
+        raise WriterRequestFailed(
+            "model training is not permitted on the DuckDB writer queue"
+        )
+    if operation is WriteOperation.ENSURE_ML_TRAINING_LOG:
+        return _ensure_ml_training_log()
+    if operation is WriteOperation.RECORD_ML_TRAINING_LOG:
+        return _record_ml_training_log(payload)
     if operation is WriteOperation.RUN_OHLC_FORECASTS:
         return _run_ohlc_forecast(payload)
     if operation is WriteOperation.APPLY_RETENTION:
@@ -2066,13 +2166,6 @@ def _dispatch_operation(operation: WriteOperation, payload: dict[str, Any], data
             raise ValueError("invalid backtest-job payload")
         main._run_backtest_job(str(payload["job_id"]), payload["params"])
         return main._get_backtest_job(str(payload["job_id"])) or {}
-    if operation is WriteOperation.TRAIN_SINGLE_STOCK:
-        from ml.stock_trainer import StockModelTrainer
-
-        return StockModelTrainer().train_symbol(
-            _required_symbol(payload),
-            force=bool(payload.get("force", False)),
-        )
     if operation is WriteOperation.RUN_FULL_BACKFILL:
         import main
 
@@ -2092,6 +2185,88 @@ def _dispatch_operation(operation: WriteOperation, payload: dict[str, Any], data
         main._run_test_parsers()
         return main._get_parser_report()
     raise ValueError(f"unsupported typed writer operation: {operation.value}")
+
+
+_ML_TRAINING_LOG_CREATE_SQL = """
+CREATE TABLE IF NOT EXISTS ml_training_log (
+    symbol                  TEXT        NOT NULL,
+    model_id                TEXT        NOT NULL,
+    trained_at              TIMESTAMP   NOT NULL,
+    n_rows                  INTEGER,
+    n_features              INTEGER,
+    train_score             DOUBLE,
+    val_score               DOUBLE,
+    feature_importance_top5 TEXT,
+    bif_rows_used           INTEGER,
+    ohlcv_rows_used         INTEGER,
+    status                  TEXT        NOT NULL,
+    error_msg               TEXT
+)
+"""
+
+
+def _ensure_ml_training_log() -> dict[str, Any]:
+    connection = writer_connection()
+    try:
+        connection.execute(_ML_TRAINING_LOG_CREATE_SQL)
+    finally:
+        connection.close()
+    return {"ready": True}
+
+
+def _record_ml_training_log(payload: dict[str, Any]) -> dict[str, Any]:
+    columns = (
+        "symbol",
+        "model_id",
+        "trained_at",
+        "n_rows",
+        "n_features",
+        "train_score",
+        "val_score",
+        "feature_importance_top5",
+        "bif_rows_used",
+        "ohlcv_rows_used",
+        "status",
+        "error_msg",
+    )
+    if set(payload) != set(columns):
+        raise ValueError("invalid ML training-log payload schema")
+    symbol = _required_symbol(payload)
+    model_id = str(payload["model_id"]).strip()
+    status = str(payload["status"]).strip().lower()
+    if not model_id or len(model_id) > 100:
+        raise ValueError("invalid ML training-log model_id")
+    if status not in {"success", "failed"}:
+        raise ValueError("invalid ML training-log status")
+    connection = writer_connection()
+    try:
+        connection.execute(_ML_TRAINING_LOG_CREATE_SQL)
+        connection.execute(
+            """
+            INSERT INTO ml_training_log
+                (symbol, model_id, trained_at, n_rows, n_features,
+                 train_score, val_score, feature_importance_top5,
+                 bif_rows_used, ohlcv_rows_used, status, error_msg)
+            VALUES (?, ?, CAST(? AS TIMESTAMP), ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                symbol,
+                model_id,
+                payload["trained_at"],
+                payload["n_rows"],
+                payload["n_features"],
+                payload["train_score"],
+                payload["val_score"],
+                str(payload["feature_importance_top5"]),
+                payload["bif_rows_used"],
+                payload["ohlcv_rows_used"],
+                status,
+                payload["error_msg"],
+            ],
+        )
+    finally:
+        connection.close()
+    return {"symbol": symbol, "model_id": model_id, "status": status}
 
 
 def _upsert_fii_dii(database: Path, payload: dict[str, Any]) -> dict[str, Any]:

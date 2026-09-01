@@ -90,6 +90,23 @@ STILL_ACTIVE = 259
 PARENT_WATCHDOG_INTERVAL_SECONDS = 2.0
 
 
+def _configure_lifecycle_logging(component: str) -> Path:
+    """Route headless supervisor/watchdog lifecycle events to durable JSONL.
+
+    Task Scheduler launches the frozen windowed executable with no usable
+    stderr, so a stream-only handler silently discarded every restart and
+    recovery event.  Keep the two processes in separate rotating files to
+    avoid cross-process rotation races while sharing the same structured
+    logging directory and secret-scrubbing policy as the backend.
+    """
+    from data.paths import DATA_DIR
+    from operations.logging_config import configure_structured_logging
+
+    path = DATA_DIR / "logs" / f"{component}.jsonl"
+    configure_structured_logging(path, redirect_prints=False)
+    return path
+
+
 class _IO_COUNTERS(ctypes.Structure):
     _fields_ = [
         ("ReadOperationCount", ctypes.c_uint64),
@@ -282,7 +299,7 @@ def _spawn_collector() -> subprocess.Popen:
     return subprocess.Popen(
         command,
         cwd=cwd,
-        creationflags=CREATE_NEW_PROCESS_GROUP,
+        creationflags=CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
     )
 
 
@@ -375,7 +392,8 @@ def _graceful_stop_child(child: subprocess.Popen) -> None:
 
 
 def run() -> int:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    _configure_lifecycle_logging("collector-supervisor")
+    log.info("collector supervisor starting")
     try:
         create_kill_on_close_job()
     except OSError:
@@ -443,11 +461,11 @@ def run_watchdog_check() -> int:
     Scheduler to start the main task, which has its own IgnoreNew guard, and
     it does not even ask unless status_snapshot() says the collector is down.
     """
+    from auto_collector import supervision
     from data.paths import DATA_DIR
 
-    from auto_collector import supervision
-
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    _configure_lifecycle_logging("collector-watchdog")
+    log.info("collector watchdog starting")
     log_db = DATA_DIR / "collector_log.db"
     state_file = DATA_DIR / "collector_watchdog_state.json"
 
@@ -470,6 +488,7 @@ def run_watchdog_check() -> int:
             capture_output=True,
             text=True,
             timeout=30,
+            creationflags=CREATE_NO_WINDOW,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         log.error("watchdog: failed to invoke schtasks /run: %s", error)

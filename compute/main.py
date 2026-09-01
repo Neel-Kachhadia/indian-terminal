@@ -324,6 +324,72 @@ SYMBOL_TO_NAME: dict[str, str] = {}
 # and exactly what it still cryptographically enforces.
 _INTEGRITY_EXPECTED_PHASE = "FINAL"
 
+# Bounded local startup budget for each writer-queue call made during
+# lifespan startup (see the RECOVER_BACKTESTS/APPLY_RETENTION calls below).
+# Deliberately well under write_service's own internal 120s poll timeout so
+# a stalled or unreachable writer authority degrades this one step instead
+# of stalling the whole FastAPI readiness sequence.
+_STARTUP_WRITER_BUDGET_SECONDS = 10.0
+
+
+async def _startup_submit_write(
+    operation: WriteOperation, payload: dict[str, Any], *, budget: float = _STARTUP_WRITER_BUDGET_SECONDS
+) -> Any:
+    """Run a writer-queue submit during lifespan startup without ever
+    blocking the event loop or stalling startup past `budget` seconds.
+
+    submit_write() is a synchronous, thread-blocking polling loop (see
+    db/write_service.py: `time.sleep(POLL_INTERVAL_SECONDS)` inside a `while`
+    bounded by its own internal timeout of up to 120s). Calling it directly
+    from an async function blocks the whole process for however long the
+    writer authority takes to respond -- `asyncio.to_thread` keeps that I/O
+    off the event loop, and `asyncio.wait_for` enforces this process's own,
+    much shorter, startup budget independent of write_service's internal
+    timeout. Raises on timeout/failure; callers decide how to degrade.
+    """
+    return await asyncio.wait_for(asyncio.to_thread(submit_write, operation, payload), timeout=budget)
+
+
+async def _run_writer_owner_startup_maintenance(*, owns_writer: bool) -> bool:
+    """Run database-mutating startup maintenance only in the process that
+    actually owns the DuckDB WriterService.
+
+    A collector-first desktop (or an acceptance sidecar) is a remote queue
+    client, not another startup authority.  Enqueuing recovery/retention from
+    every remote client made a nominally read-only process launch mutate the
+    production database and repeated global housekeeping once per process.
+    The collector already owns and maintains that database; a standalone API
+    still runs these tasks because it becomes the local writer owner.
+    """
+    if not owns_writer:
+        logger.info("writer-owner startup maintenance skipped in remote-client process")
+        return False
+    try:
+        interrupted_backtests = (
+            await _startup_submit_write(WriteOperation.RECOVER_BACKTESTS, {})
+        ).get("recovered", 0)
+        if interrupted_backtests:
+            logger.warning(
+                "marked %s interrupted backtest run(s) failed after restart",
+                interrupted_backtests,
+            )
+    except Exception as error:
+        logger.warning("interrupted-backtest recovery skipped: %s", error)
+    try:
+        retention = await _startup_submit_write(WriteOperation.APPLY_RETENTION, {})
+        logger.info("runtime retention complete: %s", retention)
+    except Exception as error:
+        logger.warning("runtime retention failed: %s", error)
+    return True
+
+
+def _start_instrument_refresh_if_owner(*, owns_writer: bool) -> bool:
+    if not owns_writer:
+        logger.info("instrument refresh skipped in remote-client process")
+        return False
+    Thread(target=_refresh_instrument_master_safely, daemon=True).start()
+    return True
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -361,20 +427,11 @@ async def lifespan(app: FastAPI):
         # non-owning client once `_writer_service` is left None.
         logger.warning("DuckDB writer authority owned elsewhere; running as a remote client: %s", error)
         _writer_service = None
-    interrupted_backtests = submit_write(WriteOperation.RECOVER_BACKTESTS, {}).get("recovered", 0)
-    if interrupted_backtests:
-        logger.warning(
-            "marked %s interrupted backtest run(s) failed after restart",
-            interrupted_backtests,
-        )
-    try:
-        retention = submit_write(WriteOperation.APPLY_RETENTION, {})
-        logger.info("runtime retention complete: %s", retention)
-    except Exception as error:
-        logger.warning("runtime retention failed: %s", error)
+    owns_writer = _writer_service is not None
+    await _run_writer_owner_startup_maintenance(owns_writer=owns_writer)
     SYMBOL_TO_NAME = _load_symbol_to_name()
     await seed_nifty_if_empty()
-    Thread(target=_refresh_instrument_master_safely, daemon=True).start()
+    _start_instrument_refresh_if_owner(owns_writer=owns_writer)
     _start_sentiment_refresh()
     try:
         yield
@@ -1578,7 +1635,9 @@ def get_risk_correlations(symbol: str = "NIFTY") -> Any:
 
 def _run_ml_training(force: bool = False) -> None:
     try:
-        report = submit_write(WriteOperation.TRAIN_NIFTY_MODELS, {"force": force})
+        from ml.trainer import train_all_models
+
+        report = train_all_models(force=force, symbol="NIFTY")
         with _ml_training_lock:
             _ml_training_state["last_report"] = report
             _ml_training_state["last_error"] = None
@@ -1592,7 +1651,9 @@ def _run_ml_training(force: bool = False) -> None:
 
 def _run_stock_training(force: bool = False) -> None:
     try:
-        summary = submit_write(WriteOperation.TRAIN_STOCK_MODELS, {"force": force})
+        from ml.stock_trainer import StockModelTrainer
+
+        summary = StockModelTrainer().train_all_fno_stocks(force=force)
         with _stock_training_lock:
             _stock_training_state["last_report"] = summary
             _stock_training_state["stage"] = "complete"
@@ -1609,10 +1670,9 @@ def _run_stock_training(force: bool = False) -> None:
 
 def _run_single_stock_training(symbol: str, force: bool = False) -> None:
     try:
-        result = submit_write(
-            WriteOperation.TRAIN_SINGLE_STOCK,
-            {"symbol": symbol, "force": force},
-        )
+        from ml.stock_trainer import StockModelTrainer
+
+        result = StockModelTrainer().train_symbol(symbol, force=force)
         with _stock_training_lock:
             _stock_training_state["done"] = 1
             _stock_training_state["trained"] = 1 if result.get("models_trained") else 0

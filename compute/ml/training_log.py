@@ -7,16 +7,11 @@ from typing import Any
 
 import pandas as pd
 
-from db.duckdb_client import DB_WRITE_LOCK, writer_connection
+from db.write_service import WriteOperation, submit_write
 
 
 def ensure_training_log_table() -> None:
-    with DB_WRITE_LOCK:
-        con = writer_connection()
-        try:
-            con.execute(_CREATE_SQL)
-        finally:
-            con.close()
+    submit_write(WriteOperation.ENSURE_ML_TRAINING_LOG, {})
 
 
 def log_training_result(
@@ -29,7 +24,6 @@ def log_training_result(
     error_msg: str | None = None,
 ) -> None:
     payload = result or {}
-    ensure_training_log_table()
     resolved_status = status or ("success" if payload.get("is_trained") else "failed")
     resolved_error = error_msg
     if resolved_error is None and resolved_status != "success":
@@ -63,35 +57,23 @@ def log_training_result(
         if isinstance(ohlcv, pd.DataFrame):
             ohlcv_rows_used = int(len(ohlcv))
 
-    top5 = _top_feature_importance(payload)
-    with DB_WRITE_LOCK:
-        con = writer_connection()
-        try:
-            con.execute(
-                """
-                INSERT INTO ml_training_log
-                    (symbol, model_id, trained_at, n_rows, n_features,
-                     train_score, val_score, feature_importance_top5,
-                     bif_rows_used, ohlcv_rows_used, status, error_msg)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    symbol.strip().upper(),
-                    model_id,
-                    dt.datetime.now(dt.timezone.utc),
-                    n_rows,
-                    n_features,
-                    _float_or_none(payload.get("train_score")),
-                    _float_or_none(payload.get("val_score")),
-                    json.dumps(top5, sort_keys=True),
-                    bif_rows_used,
-                    ohlcv_rows_used,
-                    resolved_status,
-                    resolved_error,
-                ],
-            )
-        finally:
-            con.close()
+    submit_write(
+        WriteOperation.RECORD_ML_TRAINING_LOG,
+        {
+            "symbol": symbol.strip().upper(),
+            "model_id": model_id,
+            "trained_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "n_rows": n_rows,
+            "n_features": n_features,
+            "train_score": _float_or_none(payload.get("train_score")),
+            "val_score": _float_or_none(payload.get("val_score")),
+            "feature_importance_top5": json.dumps(_top_feature_importance(payload), sort_keys=True),
+            "bif_rows_used": bif_rows_used,
+            "ohlcv_rows_used": ohlcv_rows_used,
+            "status": resolved_status,
+            "error_msg": resolved_error,
+        },
+    )
 
 
 def _top_feature_importance(payload: dict[str, Any]) -> dict[str, float]:
@@ -134,21 +116,3 @@ def _float_or_none(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
-
-
-_CREATE_SQL = """
-CREATE TABLE IF NOT EXISTS ml_training_log (
-    symbol                  TEXT        NOT NULL,
-    model_id                TEXT        NOT NULL,
-    trained_at              TIMESTAMP   NOT NULL,
-    n_rows                  INTEGER,
-    n_features              INTEGER,
-    train_score             DOUBLE,
-    val_score               DOUBLE,
-    feature_importance_top5 TEXT,
-    bif_rows_used           INTEGER,
-    ohlcv_rows_used         INTEGER,
-    status                  TEXT        NOT NULL,
-    error_msg               TEXT
-)
-"""

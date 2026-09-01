@@ -56,6 +56,7 @@ _COLLECTOR_READ_DATASETS: dict[str, tuple[str, str]] = {
     "fii_dii_daily": ("fii_dii_daily", "date"),
     "fo_eod": ("fo_eod", "date"),
     "ohlcv": ("ohlcv", "date"),
+    "signals_source_ohlcv": ("decision_eligible_ohlcv", "date"),
     "signals_history": ("signals_history", "date"),
 }
 
@@ -429,14 +430,21 @@ def run_ohlc_forecasts(_: date) -> str:
 
 
 def run_weekly_retrain(_: date) -> str:
-    report = submit_write(WriteOperation.TRAIN_NIFTY_MODELS, {})
+    # Training is CPU/file work which performs small typed DB reads/writes as
+    # needed.  Running the whole job as one WriterService operation held the
+    # sole DuckDB queue for hours and starved every GUI/API read.
+    from ml.trainer import train_all_models
+
+    report = train_all_models(force=False, symbol="NIFTY")
     models = report.get("models", {})
     trained = sum(1 for item in models.values() if isinstance(item, dict) and item.get("is_trained"))
     return f"models={trained} feature_rows={report.get('feature_rows')}"
 
 
 def run_stock_training(_: date) -> str:
-    result = submit_write(WriteOperation.TRAIN_STOCK_MODELS, {"force": False})
+    from ml.stock_trainer import StockModelTrainer
+
+    result = StockModelTrainer().train_all_fno_stocks(force=False)
     return _compact_details(result)
 
 
@@ -531,7 +539,12 @@ def get_pending_tasks() -> list[dict[str, Any]]:
                     }
                 )
 
-    latest_eq = latest_date_in("ohlcv")
+    # Signals are computed from decision_eligible_ohlcv, not raw ohlcv. A new
+    # bhavcopy can be present in the raw table while still ineligible for a
+    # current decision; comparing those two different domains caused a real
+    # false-success loop (task date 2026-08-31, zero rows written, source only
+    # through 2026-08-26) and then suppressed retries for the rest of the day.
+    latest_eq = latest_date_in("signals_source_ohlcv", "NIFTY")
     latest_sig = latest_date_in("signals_history", "NIFTY")
     if latest_eq and (latest_sig is None or latest_sig < latest_eq):
         task_date = latest_eq

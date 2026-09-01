@@ -105,6 +105,90 @@ import duckdb  # noqa: E402 -- test root must exist before this import
 _REAL_DUCKDB_CONNECT = duckdb.connect
 duckdb.connect = make_guarded_duckdb_connect(_REAL_DUCKDB_CONNECT)  # type: ignore[assignment]
 
+
+class ProductionRegistryAccessError(RuntimeError):
+    """Raised before a test process can write to the real Windows registry.
+
+    Reproduced live: BHARATTERMINAL_APP_DATA is set process-wide above (line
+    22) so every test resolves data paths under the disposable
+    TEST_APP_DATA_ROOT instead of production. That is correct for path
+    resolution, but auto_collector.setup_autostart._sync_app_data_override()
+    treats *any* set BHARATTERMINAL_APP_DATA as an operator's real intent and
+    persists it to HKCU\\Environment so Task Scheduler inherits it -- a test
+    that exercises setup() without mocking that one call silently overwrote
+    the real production registry value with this session's disposable temp
+    path, corrupting the real collector's data-root resolution on next
+    launch. sys.modules is pre-seeded with this guard so `import winreg`
+    inside that function hits it by default; a test that legitimately wants
+    to exercise the real persistence logic must explicitly install its own
+    fake via monkeypatch.setitem(sys.modules, "winreg", fake) (see
+    test_autostart_data_root_consistency.py), which shadows this guard only
+    for that test and is reverted automatically at teardown.
+    """
+
+
+import sys as _sys  # noqa: E402
+import winreg as _real_winreg  # noqa: E402
+
+# Functions that can mutate the real registry. Read-only calls (OpenKey,
+# QueryValueEx, ConnectRegistry, EnumKey, CloseKey, ...) pass through
+# untouched -- third-party libraries legitimately read the registry during
+# collection (e.g. dateutil.tz.win reads HKEY_LOCAL_MACHINE timezone data via
+# winreg.ConnectRegistry when pandas is imported), and blocking those breaks
+# unrelated tests for no safety benefit.
+_MUTATING_WINREG_CALLS = frozenset(
+    {
+        "CreateKey",
+        "CreateKeyEx",
+        "SetValue",
+        "SetValueEx",
+        "SetValueExW",
+        "DeleteKey",
+        "DeleteKeyEx",
+        "DeleteValue",
+    }
+)
+
+
+class _GuardedWinreg:
+    """Proxies the real winreg module, refusing only registry writes.
+
+    Reproduced live: BHARATTERMINAL_APP_DATA is set process-wide above (line
+    22) so every test resolves data paths under the disposable
+    TEST_APP_DATA_ROOT instead of production. That is correct for path
+    resolution, but auto_collector.setup_autostart._sync_app_data_override()
+    treats *any* set BHARATTERMINAL_APP_DATA as an operator's real intent and
+    persists it to HKCU\\Environment so Task Scheduler inherits it -- a test
+    that exercises setup() without mocking that one call silently overwrote
+    the real production registry value with this session's disposable temp
+    path, corrupting the real collector's data-root resolution on next
+    launch. A test that legitimately wants to exercise the real persistence
+    logic must explicitly install its own fake via
+    monkeypatch.setitem(sys.modules, "winreg", fake) (see
+    test_autostart_data_root_consistency.py), which shadows this guard only
+    for that test and is reverted automatically at teardown.
+    """
+
+    def __getattr__(self, name: str):
+        if name in _MUTATING_WINREG_CALLS:
+            def _refuse(*_args, **_kwargs):
+                raise ProductionRegistryAccessError(
+                    f"test process attempted real winreg.{name}(...) -- mock "
+                    "winreg explicitly if this test intends to exercise "
+                    "registry-writing logic"
+                )
+
+            return _refuse
+        return getattr(_real_winreg, name)
+
+
+# Unconditional, not setdefault: some stdlib/third-party module (e.g.
+# mimetypes, dateutil.tz.win) may have already cached the real winreg in
+# sys.modules by this point, and the whole point of this guard is that no
+# code path -- first-party or incidental -- writes to the real registry
+# during a test run.
+_sys.modules["winreg"] = _GuardedWinreg()
+
 import pytest  # noqa: E402
 
 from db.writer_lease import release_writer_lease  # noqa: E402

@@ -193,6 +193,40 @@ def test_database_unavailable_blocks_readiness_without_creating_it(
     assert not missing.exists()
 
 
+def test_database_health_routes_through_typed_remote_writer_read(
+    isolated_app_data: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = isolated_app_data / "data" / "owned-by-collector.db"
+    calls: list[tuple[object, dict, Path]] = []
+
+    def fake_resolve(operation, payload, *, database):
+        calls.append((operation, payload, database))
+        return {
+            "schema_version": 5,
+            "latest": {
+                "ohlcv": "2026-08-28",
+                "fo_eod": "2026-08-28",
+                "iv_history": "2026-08-28",
+                "signals_history": "2026-08-28",
+            },
+        }
+
+    monkeypatch.setattr(health_module, "resolve_read", fake_resolve)
+    monkeypatch.setattr(health_module, "writer_lease_status", lambda: {"state": "REMOTE"})
+
+    writer, freshness = health_module._database_health(
+        database,
+        dt.datetime(2026, 8, 31, 6, 0, tzinfo=dt.timezone.utc),
+        "2026-08-31T06:00:00+00:00",
+    )
+
+    assert calls == [(health_module.ReadOperation.LOAD_HEALTH_SNAPSHOT, {}, database)]
+    assert writer["state"] == "HEALTHY"
+    assert writer["schema_version"] == 5
+    assert freshness["ohlcv"]["latest_date"] == "2026-08-28"
+
+
 @pytest.mark.contract
 def test_structured_log_is_timestamped_bounded_and_scrubbed() -> None:
     record = logging.LogRecord(
