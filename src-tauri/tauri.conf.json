@@ -44,7 +44,9 @@
       "nsis": {
         "displayLanguageSelector": false,
         "installMode": "currentUser",
-        "installerHooks": "installer-hooks.nsh"
+        "installerHooks": "installer-hooks.nsh",
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico"
       }
     }
   }
