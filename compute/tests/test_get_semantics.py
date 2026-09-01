@@ -365,7 +365,20 @@ def test_every_get_route_preserves_all_persistent_state(
     main._apex_cache.clear()
     main._sentiment_cache.clear()
     main._cross_asset_cache.clear()
-    runtime_root = Path(os.environ["BHARATTERMINAL_APP_DATA"]).resolve()
+    # Reproduced live: conftest.py sets BHARATTERMINAL_APP_DATA once,
+    # process-wide, to the shared session root -- and nests pytest's own
+    # tmp_path basetemp *inside* that same root (config.option.basetemp =
+    # TEST_APP_DATA_ROOT / "pytest-tmp"). Re-reading that env var here
+    # scanned every OTHER test's own tmp_path subdirectory as if it were
+    # this test's runtime state: any sibling test's ordinary (correct)
+    # teardown activity landing inside this test's before/after window
+    # (e.g. a SQLite WAL checkpoint on connection close) surfaced as a
+    # false GET-purity violation, non-deterministically, depending only on
+    # collection order and teardown timing -- never on what this test's
+    # own GET requests actually did. isolated_app_data (used two lines
+    # above for `database`) is this test's own already-isolated directory;
+    # scope the filesystem snapshot to exactly that, not the shared root.
+    runtime_root = isolated_app_data.resolve()
 
     before = {
         "duckdb": _duckdb_digest(database),
@@ -404,3 +417,36 @@ def test_every_get_route_preserves_all_persistent_state(
     assert set(responses) == {route.path for route in routes}
     assert all(len(statuses) == 2 for statuses in responses.values())
     assert after == before
+
+
+def test_get_purity_snapshot_is_scoped_to_this_tests_own_directory(
+    isolated_app_data: Path,
+) -> None:
+    """Regression for the exact live flake: BHARATTERMINAL_APP_DATA is one
+    fixed, session-wide directory (conftest.py), and pytest's own tmp_path
+    basetemp is nested *inside* it -- so a filesystem snapshot rooted at
+    os.environ["BHARATTERMINAL_APP_DATA"] (the old, buggy computation)
+    silently includes every sibling test's own tmp_path subdirectory.
+    Reproduced live: some sibling test's ordinary teardown (e.g. a SQLite
+    WAL checkpoint on connection close) landing inside that shared root
+    during this test's before/after window surfaced as a false GET-purity
+    violation, non-deterministically, only in fresh-clone full-suite runs
+    where collection/teardown timing happened to line up. The snapshot
+    root must be this test's own isolated_app_data, never the wider
+    session root a sibling test also happens to write under."""
+    shared_root = Path(os.environ["BHARATTERMINAL_APP_DATA"]).resolve()
+    assert isolated_app_data.resolve().is_relative_to(shared_root), (
+        "test fixture assumption changed: isolated_app_data is no longer "
+        "nested under the shared session root -- re-examine whether the "
+        "contamination this regression guards against is still possible"
+    )
+
+    sibling_dir = shared_root / "pytest-tmp" / "some_other_test0"
+    sibling_dir.mkdir(parents=True, exist_ok=True)
+    before = _tree_manifest(isolated_app_data.resolve())
+
+    (sibling_dir / "unrelated_sibling_artifact.txt").write_bytes(b"not this test's state")
+
+    after = _tree_manifest(isolated_app_data.resolve())
+
+    assert after == before, "a sibling test's own tmp directory must never appear in this scan"
