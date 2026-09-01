@@ -208,7 +208,7 @@ export function ApexHeader({
         <button
           aria-label="Screener"
           onClick={onOpenScreener}
-          style={settingsButtonStyle}
+          style={screenerButtonStyle}
           title="Screener"
           type="button"
         >
@@ -478,7 +478,7 @@ const briefButtonStyle = {
 const rightRailStyle = {
   borderLeft: "1px solid #1a1a2e",
   display: "grid",
-  gridTemplateColumns: "1fr 78px",
+  gridTemplateColumns: "minmax(0, 1fr) 78px 78px",
   gridTemplateRows: "22px minmax(0, 1fr)",
   minWidth: 0,
 } satisfies CSSProperties;
@@ -492,7 +492,7 @@ const warningBadgeStyle = {
   paddingLeft: 14,
 } satisfies CSSProperties;
 
-const settingsButtonStyle = {
+const screenerButtonStyle = {
   background: "#12121f",
   border: 0,
   borderLeft: "1px solid #1a1a2e",
@@ -500,6 +500,18 @@ const settingsButtonStyle = {
   cursor: "pointer",
   fontSize: 11,
   gridColumn: "2 / 3",
+  gridRow: "1 / 3",
+  padding: "0 8px",
+} satisfies CSSProperties;
+
+const settingsButtonStyle = {
+  background: "#12121f",
+  border: 0,
+  borderLeft: "1px solid #1a1a2e",
+  color: "#9ca3af",
+  cursor: "pointer",
+  fontSize: 11,
+  gridColumn: "3 / 4",
   gridRow: "1 / 3",
   padding: "0 8px",
 } satisfies CSSProperties;

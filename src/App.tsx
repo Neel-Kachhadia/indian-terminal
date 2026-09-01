@@ -38,7 +38,11 @@ type IntegrityPayload = {
   trusted?: boolean;
 };
 
+type BackendGateState = "WAITING" | "READY" | "ERROR";
+
 export function App() {
+  const [backendGate, setBackendGate] = useState<BackendGateState>("WAITING");
+  const [backendAttempt, setBackendAttempt] = useState(0);
   const [brokerAuth, setBrokerAuth] = useState<BrokerAuthState>("DISCONNECTED");
   const [brokerMessage, setBrokerMessage] = useState("Angel authentication not connected.");
   const [integrityWarning, setIntegrityWarning] = useState(false);
@@ -53,6 +57,28 @@ export function App() {
   const setQuote = useQuotesStore((state) => state.setQuote);
 
   useEffect(() => {
+    let active = true;
+    setBackendGate("WAITING");
+    invoke("wait_for_backend_ready")
+      .then(() => {
+        if (active) {
+          setBackendGate("READY");
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setBackendGate("ERROR");
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [backendAttempt]);
+
+  useEffect(() => {
+    if (backendGate !== "READY") {
+      return;
+    }
     let active = true;
 
     const loadRuntimeStatus = async () => {
@@ -81,9 +107,12 @@ export function App() {
       active = false;
       window.clearInterval(timer);
     };
-  }, []);
+  }, [backendGate]);
 
   useEffect(() => {
+    if (backendGate !== "READY") {
+      return;
+    }
     let active = true;
 
     const fetchQuote = async () => {
@@ -110,9 +139,12 @@ export function App() {
       active = false;
       window.clearInterval(timer);
     };
-  }, [setQuote]);
+  }, [backendGate, setQuote]);
 
   useEffect(() => {
+    if (backendGate !== "READY") {
+      return;
+    }
     let active = true;
 
     const loadSnapshot = async () => {
@@ -136,7 +168,7 @@ export function App() {
       active = false;
       window.clearInterval(timer);
     };
-  }, [selectedSymbol]);
+  }, [backendGate, selectedSymbol]);
 
   useEffect(() => {
     const unlisten = listen<AlertTriggeredPayload>("alert_triggered", (event) => {
@@ -171,6 +203,28 @@ export function App() {
   const selectNifty = () => {
     setSelectedSymbol("NIFTY");
   };
+
+  if (backendGate !== "READY") {
+    return (
+      <div style={startupGateStyle}>
+        <strong style={startupTitleStyle}>BharatTerminal</strong>
+        <span style={startupStatusStyle}>
+          {backendGate === "WAITING"
+            ? "Starting trusted compute backend…"
+            : "Compute backend unavailable after bounded startup checks."}
+        </span>
+        {backendGate === "ERROR" ? (
+          <button
+            onClick={() => setBackendAttempt((attempt) => attempt + 1)}
+            style={startupRetryStyle}
+            type="button"
+          >
+            Retry
+          </button>
+        ) : null}
+      </div>
+    );
+  }
 
   return (
     <div style={shellStyle}>
@@ -220,6 +274,38 @@ export function App() {
     </div>
   );
 }
+
+const startupGateStyle = {
+  alignItems: "center",
+  background: "#07090f",
+  color: "#dce7ff",
+  display: "flex",
+  flexDirection: "column",
+  gap: 14,
+  height: "100vh",
+  justifyContent: "center",
+} as const;
+
+const startupTitleStyle = {
+  fontFamily: "'JetBrains Mono', monospace",
+  fontSize: 24,
+  letterSpacing: "0.14em",
+} as const;
+
+const startupStatusStyle = {
+  color: "#8996ad",
+  fontFamily: "'JetBrains Mono', monospace",
+  fontSize: 12,
+} as const;
+
+const startupRetryStyle = {
+  background: "#111827",
+  border: "1px solid #334155",
+  color: "#dce7ff",
+  cursor: "pointer",
+  fontFamily: "'JetBrains Mono', monospace",
+  padding: "8px 18px",
+} as const;
 
 function SettingsPanel({
   brokerAuth,

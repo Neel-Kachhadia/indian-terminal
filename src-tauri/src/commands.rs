@@ -3,6 +3,7 @@ use chrono::Utc;
 use redis::Commands;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const MAX_EQUITY_PDF_BYTES: usize = 32 * 1024 * 1024;
@@ -1042,6 +1043,47 @@ pub async fn get_market_session(
     get_python_json("market/session", 5, &state).await
 }
 
+fn backend_payload_ready(payload: &serde_json::Value) -> bool {
+    payload
+        .pointer("/readiness/ready")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        || payload
+            .pointer("/readiness/status")
+            .and_then(serde_json::Value::as_str)
+            == Some("READY")
+}
+
+#[tauri::command]
+pub async fn wait_for_backend_ready(
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    const STARTUP_BUDGET: Duration = Duration::from_secs(90);
+    let deadline = Instant::now() + STARTUP_BUDGET;
+    let mut attempt = 0_u32;
+
+    loop {
+        let last_error = match get_python_json("health", 3, &state).await {
+            Ok(payload) if backend_payload_ready(&payload) => return Ok(payload),
+            Ok(payload) => format!(
+                "backend not ready: {}",
+                payload
+                    .pointer("/readiness/status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("UNKNOWN")
+            ),
+            Err(error) => error,
+        };
+        if Instant::now() >= deadline {
+            return Err(format!("backend readiness budget exhausted: {last_error}"));
+        }
+        let exponent = attempt.min(5);
+        let delay_ms = (250_u64.saturating_mul(1_u64 << exponent)).min(4_000);
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        attempt = attempt.saturating_add(1);
+    }
+}
+
 #[tauri::command]
 pub async fn get_instrument_list(
     _exchange: String,
@@ -1151,4 +1193,21 @@ async fn post_python_json(
         .json::<serde_json::Value>()
         .await
         .map_err(|error| format!("{path} parse failed: {error}"))
+}
+
+#[cfg(test)]
+mod backend_gate_tests {
+    use super::backend_payload_ready;
+
+    #[test]
+    fn startup_gate_opens_only_for_explicit_ready_payload() {
+        assert!(backend_payload_ready(&serde_json::json!({
+            "readiness": {"ready": true, "status": "READY"}
+        })));
+        assert!(!backend_payload_ready(&serde_json::json!({
+            "status": "ALIVE",
+            "readiness": {"ready": false, "status": "NOT_READY"}
+        })));
+        assert!(!backend_payload_ready(&serde_json::json!({})));
+    }
 }

@@ -109,17 +109,36 @@ pub async fn run(state: AppState) -> Result<(), String> {
     wait_for_process_token(&state).await;
     let client = build_client();
     let mut cookies;
+    let mut nse_retry_attempt: u32 = 0;
 
     loop {
         crate::bt_info!("poller", "fetching NSE session cookie");
         match fetch_nse_cookies(&client).await {
             Ok(c) => {
                 cookies = c;
+                nse_retry_attempt = 0;
                 crate::bt_info!("poller", "NSE session established");
             }
             Err(error) => {
-                crate::bt_error!("poller", "NSE session failed: {error}");
-                time::sleep(Duration::from_secs(10)).await;
+                // Reproduced live: this loop previously retried a flat 10s
+                // forever with no cap and no jitter, so a permanently
+                // unreachable NSE (network down, NSE blocking the IP) spins
+                // it identically forever and every installed instance retries
+                // in lockstep. Bounded exponential backoff (capped at
+                // NSE_RETRY_MAX_SECS) + jitter turns that into a well-behaved
+                // background retry -- this loop itself never blocks Tauri
+                // startup (it is spawned via tauri::async_runtime::spawn in
+                // main.rs), so the cap only matters for NSE-outage courtesy
+                // and for keeping the frontend's "BROKER ERROR" state honest
+                // (last_error below) rather than a silent tight loop.
+                let delay = nse_retry_delay(nse_retry_attempt);
+                crate::bt_error!(
+                    "poller",
+                    "NSE session failed: {error}; retrying in {:.1}s",
+                    delay.as_secs_f64()
+                );
+                nse_retry_attempt = nse_retry_attempt.saturating_add(1);
+                time::sleep(delay).await;
                 continue;
             }
         }
@@ -276,6 +295,34 @@ async fn enrich_chain_with_greeks(
 
     write_chain_to_redis(state, expiry, &enriched, pcr).await?;
     Ok(computed_count)
+}
+
+const NSE_RETRY_BASE_SECS: u64 = 10;
+const NSE_RETRY_MAX_SECS: u64 = 300;
+const NSE_RETRY_JITTER_FRACTION: u64 = 5; // up to 1/5 (20%) of the bounded delay
+
+/// Bounded exponential backoff with jitter for NSE session (re)establishment.
+/// `attempt` is the number of consecutive prior failures (0-based). Capped at
+/// `NSE_RETRY_MAX_SECS` so an indefinitely-unreachable NSE never grows the
+/// delay unbounded, and jittered so many installs restarted around the same
+/// time (e.g. after a shared network outage) do not all retry in lockstep.
+fn nse_retry_delay(attempt: u32) -> Duration {
+    let capped_attempt = attempt.min(6); // 10 * 2^6 = 640s, already above the cap
+    let base_secs = NSE_RETRY_BASE_SECS.saturating_mul(1u64 << capped_attempt);
+    let bounded_secs = base_secs.min(NSE_RETRY_MAX_SECS);
+    Duration::from_millis(bounded_secs * 1000 + jitter_millis(bounded_secs))
+}
+
+fn jitter_millis(bounded_secs: u64) -> u64 {
+    let max_jitter_ms = (bounded_secs * 1000) / NSE_RETRY_JITTER_FRACTION;
+    if max_jitter_ms == 0 {
+        return 0;
+    }
+    let mut byte = [0_u8; 1];
+    if getrandom::getrandom(&mut byte).is_err() {
+        return 0;
+    }
+    (byte[0] as u64) * max_jitter_ms / 255
 }
 
 fn build_client() -> Client {
@@ -743,7 +790,54 @@ fn option_type_rank(option_type: &OptionType) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_chain_body, PollError};
+    use super::{
+        nse_retry_delay, parse_chain_body, PollError, NSE_RETRY_JITTER_FRACTION, NSE_RETRY_MAX_SECS,
+    };
+
+    #[test]
+    fn nse_retry_delay_grows_with_attempt() {
+        let d0 = nse_retry_delay(0).as_secs_f64();
+        let d1 = nse_retry_delay(1).as_secs_f64();
+        let d2 = nse_retry_delay(2).as_secs_f64();
+        assert!(
+            (10.0..13.0).contains(&d0),
+            "attempt 0 delay out of range: {d0}"
+        );
+        assert!(d1 > d0, "backoff must grow: {d1} vs {d0}");
+        assert!(d2 > d1, "backoff must grow: {d2} vs {d1}");
+    }
+
+    #[test]
+    fn nse_retry_delay_is_bounded_and_never_a_tight_loop() {
+        // Base delay is capped at NSE_RETRY_MAX_SECS; jitter can add up to a
+        // further 1/NSE_RETRY_JITTER_FRACTION on top of that cap.
+        let max_with_jitter_secs =
+            NSE_RETRY_MAX_SECS + NSE_RETRY_MAX_SECS / NSE_RETRY_JITTER_FRACTION;
+        for attempt in 0..50 {
+            let delay = nse_retry_delay(attempt);
+            assert!(
+                delay.as_secs() <= max_with_jitter_secs + 1,
+                "attempt {attempt} exceeded cap: {delay:?}"
+            );
+            assert!(
+                delay.as_millis() > 0,
+                "attempt {attempt} produced a zero/tight-loop delay"
+            );
+        }
+    }
+
+    #[test]
+    fn nse_retry_delay_jitter_varies() {
+        // Same attempt number, called repeatedly, should not always return
+        // the exact same delay once jitter has room to act (high attempt
+        // numbers sit at the cap where jitter is largest).
+        let samples: std::collections::HashSet<u128> =
+            (0..20).map(|_| nse_retry_delay(6).as_millis()).collect();
+        assert!(
+            samples.len() > 1,
+            "expected jitter to vary the delay across samples"
+        );
+    }
 
     #[test]
     fn malformed_chain_payload_fails_closed() {

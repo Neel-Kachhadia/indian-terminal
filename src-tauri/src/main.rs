@@ -130,6 +130,7 @@ fn main() {
             commands::get_alerts,
             commands::get_market_status,
             commands::get_market_session,
+            commands::wait_for_backend_ready,
             commands::get_instrument_list,
             commands::download_historical,
             commands::get_broker_auth_status,
