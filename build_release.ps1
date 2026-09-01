@@ -138,6 +138,12 @@ try {
   Invoke-Native $releasePython scripts\release_gate.py generate-probe-manifest
   Invoke-Native $releasePython scripts\release_gate.py frozen-runtime
   Invoke-Native $releasePython scripts\release_gate.py packaged-openapi
+  # --frozen-lockfile: this is a release build, never resolve a newer
+  # dependency graph than the one already committed to pnpm-lock.yaml.
+  # Mirrors `uv sync --frozen` above for the Python side -- a pristine
+  # checkout has no node_modules of its own yet, so this pipeline cannot
+  # self-bootstrap without it.
+  Invoke-Native "corepack" pnpm install --frozen-lockfile
   Invoke-Native "corepack" pnpm build
   Invoke-Native $releasePython scripts\release_gate.py generate-prebundle-manifest
   $env:BHARATTERMINAL_RELEASE_PHASE = "PREBUNDLE"

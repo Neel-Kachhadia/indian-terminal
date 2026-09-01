@@ -142,3 +142,13 @@ def test_release_pipeline_runs_frozen_gate_before_openapi_probe() -> None:
     assert build.index("release_gate.py frozen-runtime") < build.index(
         "release_gate.py packaged-openapi"
     )
+
+
+def test_release_pipeline_restores_frontend_dependencies_before_building() -> None:
+    """A pristine checkout has no node_modules of its own -- the canonical
+    pipeline must restore it from the committed lockfile itself (mirroring
+    `uv sync --frozen` for Python) rather than assuming an operator already
+    ran `pnpm install` as an out-of-band precondition."""
+    build = (build_compute.ROOT.parent / "build_release.ps1").read_text(encoding="utf-8")
+    assert "pnpm install --frozen-lockfile" in build
+    assert build.index("pnpm install --frozen-lockfile") < build.index("pnpm build")
