@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
 from pathlib import Path
@@ -157,6 +158,68 @@ def test_internal_feed_bridge_requires_process_token(monkeypatch) -> None:
             assert websocket.receive_json() == {"state": "CONNECTED"}
     finally:
         client.close()
+
+
+def test_angel_bridge_keeps_transport_pings_without_forcing_pong_timeout(monkeypatch) -> None:
+    """Angel produces valid data but does not reliably return RFC pong
+    frames.  The default websockets ping timeout closed the live feed at
+    almost exactly 40 seconds, causing an endless reconnect/auth loop."""
+    main = importlib.import_module("main")
+    captured: dict = {}
+
+    class FakeRemote:
+        pass
+
+    class FakeContext:
+        async def __aenter__(self):
+            return FakeRemote()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class FakeLocal:
+        async def accept(self):
+            return None
+
+        async def close(self, **_kwargs):
+            return None
+
+    def fake_connect(url, **kwargs):
+        captured.update(url=url, **kwargs)
+        return FakeContext()
+
+    async def completed_forward(*_args):
+        return None
+
+    monkeypatch.setattr(
+        main.credential_manager,
+        "get_angel_credentials",
+        lambda: {
+            "ANGEL_CLIENT_ID": "fixture-client",
+            "ANGEL_PASSWORD": "fixture-password",
+            "ANGEL_TOTP_SECRET": "fixture-totp",
+            "ANGEL_API_KEY": "fixture-api-key",
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "_create_angel_session",
+        lambda _credentials: {
+            "client_id": "fixture-client",
+            "api_key": "fixture-api-key",
+            "jwt_token": "fixture-jwt",
+            "feed_token": "fixture-feed",
+        },
+    )
+    monkeypatch.setattr(main.websockets, "connect", fake_connect)
+    monkeypatch.setattr(main, "_forward_local_feed", completed_forward)
+    monkeypatch.setattr(main, "_forward_remote_feed", completed_forward)
+
+    asyncio.run(main._bridge_angel_feed(FakeLocal()))
+
+    assert captured["url"] == "wss://smartapisocket.angelone.in/smart-stream"
+    assert captured["ping_interval"] == 20
+    assert captured["ping_timeout"] is None
 
 
 def test_sentinel_is_scrubbed_from_persistent_error_log(monkeypatch, tmp_path: Path) -> None:

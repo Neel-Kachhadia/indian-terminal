@@ -20,6 +20,8 @@ const FEED_INSTRUMENT_URL: &str = "http://127.0.0.1:8765/instruments/feed/NIFTY"
 const INSTRUMENT_SCHEMA_VERSION: u32 = 1;
 const REDIS_TTL_SECONDS: u64 = 60;
 const INITIAL_DATA_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_EXCHANGE_TIMESTAMP_AGE_MS: i64 = 30_000;
+const MAX_EXCHANGE_TIMESTAMP_FUTURE_SKEW_MS: i64 = 5_000;
 
 // Angel SmartAPI WebSocket V2 byte contract. Offsets match official SDK.
 const MODE_OFFSET: usize = 0;
@@ -491,17 +493,29 @@ fn packet_to_tick(
     packet: DecodedAngelPacket,
     instrument: &ResolvedFeedInstrument,
 ) -> Result<Tick, String> {
+    packet_to_tick_at(packet, instrument, Utc::now().timestamp_millis())
+}
+
+fn packet_to_tick_at(
+    packet: DecodedAngelPacket,
+    instrument: &ResolvedFeedInstrument,
+    received_at_ms: i64,
+) -> Result<Tick, String> {
     if packet.exchange_type != instrument.exchange_type()? || packet.token != instrument.token {
         return Err(String::from(
             "unsupported exchange for canonical NIFTY tick",
         ));
     }
-    let received_at_ms = Utc::now().timestamp_millis();
     let observed_at_ms = if packet.exchange_timestamp < 1_000_000_000_000 {
         packet.exchange_timestamp.saturating_mul(1_000)
     } else {
         packet.exchange_timestamp
     };
+    if received_at_ms.saturating_sub(observed_at_ms) > MAX_EXCHANGE_TIMESTAMP_AGE_MS
+        || observed_at_ms.saturating_sub(received_at_ms) > MAX_EXCHANGE_TIMESTAMP_FUTURE_SKEW_MS
+    {
+        return Err(String::from("stale Angel exchange timestamp"));
+    }
     let mut completeness = vec!["ltp".into()];
     if packet.volume.is_some() {
         completeness.extend(["open", "high", "low", "close", "volume"].map(String::from));
@@ -621,13 +635,14 @@ fn store_tick_monotonic(
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_packet, local_bridge_request, resolve_feed_instrument_at, run_websocket_at,
-        subscription_request, ResolvedFeedInstrument, SubscriptionMode,
+        decode_packet, local_bridge_request, packet_to_tick_at, resolve_feed_instrument_at,
+        run_websocket_at, subscription_request, ResolvedFeedInstrument, SubscriptionMode,
     };
     use crate::{
         models::Tick,
         state::{AppState, FeedPhase},
     };
+    use chrono::Utc;
     use futures_util::{SinkExt, StreamExt};
     use std::time::Duration;
     use tokio::{
@@ -639,6 +654,7 @@ mod tests {
     use tokio_tungstenite::{accept_async, tungstenite::protocol::Message as WsMessage};
 
     const FIXTURE_TOKEN: &str = "99123456";
+    const CAPTURED_NIFTY_QUOTE_HEX: &str = "020139393932363030300000000000000000000000000000000000000000000000000098a5e75ba0010000ddbc240000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004bbd240000000000ebd6240000000000b6a224000000000068be240000000000";
 
     fn instrument(token: &str) -> ResolvedFeedInstrument {
         ResolvedFeedInstrument {
@@ -765,6 +781,56 @@ mod tests {
     }
 
     #[test]
+    fn captured_nifty_quote_packet_decodes_and_proves_fresh_live_data() {
+        // Read-only Smart Stream capture, 2026-09-01 13:08:23 IST.  Packet
+        // contains no credentials; SHA-256 d582787599f8bc66a9107b6d55ffcddf9acfa607312cac2c560d42a0189ff5c1.
+        let bytes = hex::decode(CAPTURED_NIFTY_QUOTE_HEX).unwrap();
+        let packet = decode_packet(&bytes, Some(SubscriptionMode::Quote), Some(1)).unwrap();
+        assert_eq!(packet.token, "99926000");
+        assert_eq!(packet.sequence_number, 0);
+        assert_eq!(packet.exchange_timestamp, 1_788_248_303_000);
+        assert_eq!(packet.ltp, 2_407_645);
+        assert_eq!(packet.volume, Some(0));
+        assert_eq!(packet.open, Some(2_407_755));
+        assert_eq!(packet.high, Some(2_414_315));
+        assert_eq!(packet.low, Some(2_400_950));
+        assert_eq!(packet.close, Some(2_408_040));
+
+        let tick = packet_to_tick_at(packet, &instrument("99926000"), 1_788_248_304_500).unwrap();
+        assert_eq!(tick.ltp, 24_076.45);
+        assert_eq!(tick.observed_at_ms, 1_788_248_303_000);
+    }
+
+    #[test]
+    fn quote_packet_rejects_impossible_ohlc_and_quantity() {
+        let mut impossible_ohlc = quote_fixture(2, 123);
+        write_i64(&mut impossible_ohlc, 99, 2_400_000);
+        assert!(decode_packet(&impossible_ohlc, Some(SubscriptionMode::Quote), Some(1)).is_err());
+
+        let mut impossible_quantity = quote_fixture(2, 123);
+        impossible_quantity[75..83].copy_from_slice(&f64::NAN.to_le_bytes());
+        assert!(
+            decode_packet(&impossible_quantity, Some(SubscriptionMode::Quote), Some(1)).is_err()
+        );
+    }
+
+    #[test]
+    fn stale_or_future_quote_timestamp_never_becomes_a_live_tick() {
+        let bytes = hex::decode(CAPTURED_NIFTY_QUOTE_HEX).unwrap();
+        let packet = decode_packet(&bytes, Some(SubscriptionMode::Quote), Some(1)).unwrap();
+        assert!(
+            packet_to_tick_at(packet.clone(), &instrument("99926000"), 1_788_248_333_001)
+                .unwrap_err()
+                .contains("stale")
+        );
+        assert!(
+            packet_to_tick_at(packet, &instrument("99926000"), 1_788_248_297_999)
+                .unwrap_err()
+                .contains("stale")
+        );
+    }
+
+    #[test]
     fn official_snap_quote_packet_decodes_quote_and_open_interest() {
         let mut fixture = quote_fixture(3, 379);
         write_i64(&mut fixture, 123, 1_756_000_000_000);
@@ -877,7 +943,9 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_lifecycle_reaches_live_only_after_matching_valid_tick() {
-        let (url, server) = websocket_fixture(Some(quote_fixture(2, 123))).await;
+        let mut payload = quote_fixture(2, 123);
+        write_i64(&mut payload, 35, Utc::now().timestamp_millis());
+        let (url, server) = websocket_fixture(Some(payload)).await;
         let (state, mut ticks) = feed_state();
         let task_state = state.clone();
         let task = tokio::spawn(async move {

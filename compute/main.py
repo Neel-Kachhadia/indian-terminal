@@ -2938,6 +2938,15 @@ async def _bridge_angel_feed(websocket: WebSocket) -> None:
             open_timeout=15,
             close_timeout=5,
             ping_interval=20,
+            # Angel's Smart Stream accepts RFC ping frames but does not
+            # reliably answer them with RFC pong frames.  `websockets`
+            # otherwise starts a 20-second pong deadline after its first
+            # ping and closes an otherwise healthy, data-producing feed at
+            # almost exactly 40 seconds.  Keep sending transport pings, as
+            # the official SDK does, without treating a missing pong as a
+            # dead quote stream; application data freshness is enforced by
+            # the Rust ingester from exchange timestamps.
+            ping_timeout=None,
             max_size=2 * 1024 * 1024,
         ) as remote:
             headers.clear()
