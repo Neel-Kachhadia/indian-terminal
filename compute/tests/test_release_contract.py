@@ -176,7 +176,9 @@ def test_nsis_installer_disables_collector_tasks_for_full_install_duration() -> 
 
 
 @pytest.mark.release
-def test_protected_assets_exclude_externalbin_only_sidecar_copy_at_final_only() -> None:
+def test_protected_assets_exclude_externalbin_only_sidecar_copy_at_final_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Reproduces two real, mirror-image deployed defects around
     `compute/dist/`'s two sidecar copies (compute/build_compute.py writes
     both -- the plain-named one and a target-triple-suffixed copy that
@@ -203,10 +205,35 @@ def test_protected_assets_exclude_externalbin_only_sidecar_copy_at_final_only() 
 
     So the exclusion must be phase-specific: present (and verified) at
     PROBE/PREBUNDLE, where it genuinely exists in the scanned root; absent
-    only at FINAL, where it genuinely doesn't."""
+    only at FINAL, where it genuinely doesn't.
+
+    Sandboxed against a synthetic tree, not the real repo: build_release.ps1
+    runs pytest BEFORE compute/build_compute.py, so compute/dist/ never
+    genuinely holds either sidecar copy at the moment this test executes on
+    a truly pristine checkout -- a version of this test that scanned the
+    real ROOT only ever passed because a stale compute/dist/ from an
+    earlier manual build happened to be lying around, silently depending on
+    an artifact this exact pipeline invocation had not produced yet.
+    """
+    import release_gate
+
+    monkeypatch.setattr(release_gate, "ROOT", tmp_path)
+    monkeypatch.setattr(release_gate, "IDENTITY_PATH", tmp_path / "release" / "release-identity.json")
+    monkeypatch.setattr(
+        release_gate, "PACKAGED_OPENAPI_PATH", tmp_path / "release" / "packaged-openapi.json"
+    )
+    (tmp_path / "bundle-data").mkdir(parents=True)
+    (tmp_path / "bundle-data" / "terminal.db.gz").write_bytes(b"synthetic")
+    (tmp_path / "compute" / "models").mkdir(parents=True)
+    (tmp_path / "compute" / "dist").mkdir(parents=True)
+    msvc_name = "bharatterminal-compute-x86_64-pc-windows-msvc.exe"
+    (tmp_path / "compute" / "dist" / msvc_name).write_bytes(b"synthetic")
+    (tmp_path / "compute" / "dist" / "bharatterminal-compute.exe").write_bytes(b"synthetic")
+    (tmp_path / "dist").mkdir(parents=True)
+    (tmp_path / "dist" / "index.html").write_bytes(b"synthetic")
+
     from release_gate import protected_asset_paths
 
-    msvc_name = "bharatterminal-compute-x86_64-pc-windows-msvc.exe"
     for phase in ("PROBE", "PREBUNDLE"):
         names = {path.name for path in protected_asset_paths(phase=phase)}
         assert msvc_name in names
