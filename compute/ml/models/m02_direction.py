@@ -34,16 +34,14 @@ def train_model(context: MLContext, force: bool = False) -> dict[str, Any]:
 def predict(context: MLContext, confidence_multiplier: float = 1.0) -> dict[str, Any]:
     artifact, reason, available_rows = _train(context, train_if_missing=False)
     if artifact is None:
-        fallback = _heuristic_direction(context)
         return untrained_output(
             MODEL_ID,
             reason or "model not trained",
             available_rows=available_rows,
             minimum_rows=MINIMUM_ROWS,
             extra={
-                "direction": fallback,
-                "probabilities": _fallback_probabilities(fallback),
-                "confidence": 0.0,
+                "direction": None,
+                "probabilities": {},
                 "top_features": [],
                 "accuracy_30d": accuracy_for_model(MODEL_ID)["accuracy"],
                 "accuracy_by_confidence": {

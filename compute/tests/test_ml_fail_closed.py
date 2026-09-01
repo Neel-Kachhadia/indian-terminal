@@ -1,8 +1,10 @@
 import datetime as dt
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from ml import service as ml_service
 from ml.service import _apex_action
 from ml.models import m10_ensemble
 from bif.composite import compute_cds
@@ -97,6 +99,39 @@ def test_unvalidated_components_never_emit_actionable_language() -> None:
     assert result["trade"] is False
     assert result["action"] == "UNVALIDATED"
     assert "LONG" not in result["action"] and "SHORT" not in result["action"]
+
+
+@pytest.mark.parametrize(
+    ("market_valid", "current_spot", "ohlcv_empty"),
+    [
+        (False, 0.0, True),
+        (True, 0.0, False),
+        (True, 24_000.0, True),
+    ],
+)
+def test_embedded_ohlc_forecast_fails_closed_without_eligible_spot_and_bars(
+    monkeypatch,
+    market_valid: bool,
+    current_spot: float,
+    ohlcv_empty: bool,
+) -> None:
+    """Regression: /ml/predict once embedded a 0.00-price OHLC forecast
+    while the dedicated forecast endpoint correctly reported unavailable.
+    """
+    now = dt.datetime.now(dt.timezone.utc)
+    context = SimpleNamespace(
+        market_data_eligibility=_market_eligibility(now, valid=market_valid),
+        current_spot=current_spot,
+        ohlcv=SimpleNamespace(empty=ohlcv_empty),
+    )
+
+    class UnexpectedForecaster:
+        def __init__(self) -> None:
+            raise AssertionError("forecaster must not run with ineligible decision inputs")
+
+    monkeypatch.setattr(ml_service, "OHLCForecaster", UnexpectedForecaster)
+
+    assert ml_service._ohlc_forecast(context) is None
 
 
 def test_actual_bif_cds_path_blocks_extreme_untrained_model_output() -> None:

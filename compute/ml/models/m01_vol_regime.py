@@ -67,16 +67,14 @@ def predict(context: MLContext, confidence_multiplier: float = 1.0) -> dict[str,
         train_if_missing=False,
     )
     if artifact is None:
-        fallback = _heuristic_regime(context)
         return untrained_output(
             MODEL_ID,
             reason or "model not trained",
             available_rows=available_rows,
             minimum_rows=MINIMUM_ROWS,
             extra={
-                "regime": fallback,
-                "probabilities": _fallback_probabilities(fallback),
-                "confidence": 0.0,
+                "regime": None,
+                "probabilities": {},
                 "feature_importance": {},
                 "accuracy_30d": accuracy_for_model(MODEL_ID)["accuracy"],
                 "out_of_regime_warning": context.available_rows < MINIMUM_ROWS,

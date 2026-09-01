@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import io
+import logging
 import math
 import re
 import uuid
@@ -54,6 +55,9 @@ TRUSTED_SKOPS_TYPES = frozenset(
 MAX_CACHED_ARTIFACTS = 16
 _ARTIFACT_CACHE: OrderedDict[str, tuple[Path, int, int, dict[str, Any]]] = OrderedDict()
 _ARTIFACT_CACHE_LOCK = Lock()
+_ARTIFACT_LOAD_FAILURES: set[tuple[str, str, str]] = set()
+_ARTIFACT_LOAD_FAILURES_LOCK = Lock()
+_RUNTIME_LOG = logging.getLogger("ml.runtime")
 
 
 def untrained_output(
@@ -335,25 +339,8 @@ def load_latest_artifact(
             cached["fallback_status"] = fallback_status
             cached["requested_symbol"] = symbol or "GLOBAL"
             return cached
-        verified = read_verified_artifact_bytes(
-            record,
-            SAVED_MODELS_DIR,
-            maximum_bytes=MAX_ARTIFACT_BYTES,
-        )
-        if verified is None:
-            continue
-        path, serialized = verified
         try:
-            _validate_skops_payload(serialized)
-            trusted = sio.get_untrusted_types(data=serialized)
-            artifact = sio.loads(serialized, trusted=trusted)
-            if not isinstance(artifact, dict) or artifact.get("model_version") != record["model_version"]:
-                raise RuntimeError("artifact metadata does not match registry")
-            if (
-                artifact.get("serialization_format") != SERIALIZATION_FORMAT
-                or artifact.get("artifact_format_version") != SERIALIZATION_VERSION
-            ):
-                raise RuntimeError("artifact serialization metadata is unsupported")
+            path, artifact = load_verified_artifact(record, SAVED_MODELS_DIR)
             artifact["artifact_hash"] = record["artifact_hash"]
             artifact["registry_record"] = record
             artifact["fallback_status"] = fallback_status
@@ -361,8 +348,64 @@ def load_latest_artifact(
             _cache_artifact(path, record, artifact)
             return artifact
         except Exception as error:
-            print(f"ml: failed loading {path.name}: {error}")
+            _report_artifact_load_failure(model_id, record, error)
     return None
+
+
+def load_verified_artifact(
+    record: dict[str, Any],
+    saved_root: Path = SAVED_MODELS_DIR,
+) -> tuple[Path, dict[str, Any]]:
+    """Hash-check then deserialize one registry record; raise on any defect."""
+    verified = read_verified_artifact_bytes(
+        record,
+        saved_root,
+        maximum_bytes=MAX_ARTIFACT_BYTES,
+    )
+    if verified is None:
+        raise RuntimeError("artifact hash, size, path, or file-type verification failed")
+    path, serialized = verified
+    _validate_skops_payload(serialized)
+    trusted = sio.get_untrusted_types(data=serialized)
+    artifact = sio.loads(serialized, trusted=trusted)
+    if not isinstance(artifact, dict) or artifact.get("model_version") != record["model_version"]:
+        raise RuntimeError("artifact metadata does not match registry")
+    if (
+        artifact.get("serialization_format") != SERIALIZATION_FORMAT
+        or artifact.get("artifact_format_version") != SERIALIZATION_VERSION
+    ):
+        raise RuntimeError("artifact serialization metadata is unsupported")
+    return path, artifact
+
+
+def _report_artifact_load_failure(
+    model_id: str,
+    record: dict[str, Any],
+    error: Exception,
+) -> None:
+    text = str(error).strip()
+    cause = next((line.strip() for line in text.splitlines() if line.strip()), type(error).__name__)
+    cause = cause[:240]
+    key = (model_id, type(error).__name__, cause)
+    with _ARTIFACT_LOAD_FAILURES_LOCK:
+        if key in _ARTIFACT_LOAD_FAILURES:
+            return
+        _ARTIFACT_LOAD_FAILURES.add(key)
+    artifact = Path(str(record.get("artifact_path") or "UNKNOWN")).name
+    _RUNTIME_LOG.exception(
+        "model=%s artifact=%s exception=%s cause=%s state=FAIL_CLOSED",
+        model_id,
+        artifact,
+        type(error).__name__,
+        cause,
+        extra={
+            "console_meta": {
+                "tag": "ERROR",
+                "category": "ML",
+                "detail": "model unavailable; actionability fail-closed",
+            }
+        },
+    )
 
 
 def model_status(model_id: str, symbol: str | None = None) -> dict[str, Any]:

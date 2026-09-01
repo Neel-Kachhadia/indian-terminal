@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import pandas as pd
@@ -8,8 +9,19 @@ import pandas as pd
 def compute_options_flow(
     symbol: str,
     legs: list[dict[str, Any]],
-    spot: float,
+    spot: float | None,
 ) -> dict[str, Any]:
+    if spot is None or not math.isfinite(float(spot)) or float(spot) <= 0:
+        return {
+            "symbol": symbol,
+            "gamma_walls": [],
+            "unusual_oi": [],
+            "iv_skew": {"classification": "unavailable"},
+            "term_structure": {"shape": "unavailable"},
+            "market_maker_inventory": {"signal": "unavailable"},
+            "error": "verified live spot unavailable",
+            "computed_at": pd.Timestamp.utcnow().isoformat(),
+        }
     if not legs:
         return {
             "symbol": symbol,

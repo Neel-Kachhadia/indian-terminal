@@ -26,13 +26,20 @@ def compute_stress_tests(
     symbol: str,
     ohlcv: pd.DataFrame,
     *,
-    spot: float = 0.0,
+    spot: float | None = None,
     lot_size: int | None = None,
 ) -> dict[str, Any]:
     if lot_size is None or lot_size <= 0:
         return {"symbol": symbol, "historical": [], "forward": [], "error": "validated lot size unavailable"}
+    if spot is None or not pd.notna(spot) or float(spot) <= 0:
+        return {
+            "symbol": symbol,
+            "historical": [],
+            "forward": [],
+            "error": "verified live spot unavailable",
+        }
     close = pd.to_numeric(ohlcv.get("close", pd.Series(dtype=float)), errors="coerce").dropna()
-    current = float(spot or (close.iloc[-1] if not close.empty else 0.0))
+    current = float(spot)
     vol = float(close.pct_change().tail(20).std(ddof=0) * (252 ** 0.5) * 100.0) if len(close) > 25 else 15.0
     historical = [
         _scenario(name, move, current, lot_size, _similarity(vol, abs(move)))

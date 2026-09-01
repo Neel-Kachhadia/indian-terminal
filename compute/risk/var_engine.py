@@ -10,16 +10,18 @@ def compute_var(
     symbol: str,
     ohlcv: pd.DataFrame,
     *,
-    spot: float = 0.0,
+    spot: float | None = None,
     lot_size: int | None = None,
 ) -> dict[str, Any]:
     if lot_size is None or lot_size <= 0:
         return {"symbol": symbol, "methods": [], "error": "validated lot size unavailable"}
+    if spot is None or not np.isfinite(float(spot)) or float(spot) <= 0:
+        return {"symbol": symbol, "methods": [], "error": "verified live spot unavailable"}
     close = pd.to_numeric(ohlcv.get("close", pd.Series(dtype=float)), errors="coerce").dropna()
     if len(close) < 30:
         return {"symbol": symbol, "methods": [], "error": "insufficient OHLCV history"}
     returns = close.pct_change().dropna().tail(252).to_numpy(dtype=float)
-    current_spot = float(spot or close.iloc[-1])
+    current_spot = float(spot)
     notional = current_spot * lot_size
     methods = [
         _historical_var(returns, notional),

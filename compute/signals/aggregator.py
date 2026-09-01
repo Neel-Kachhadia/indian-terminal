@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import math
 import time as _time
 from typing import Any, Callable
 
@@ -53,7 +54,7 @@ def compute_all_signals(
     symbol: str,
     ohlcv_df: pd.DataFrame,
     chain_legs: list[dict[str, Any]],
-    spot: float,
+    spot: float | None,
     expiry_str: str,
     cross_asset_snapshot: dict[str, Any],
     sentiment_data: dict[str, Any],
@@ -64,11 +65,29 @@ def compute_all_signals(
     persist: bool = False,
 ) -> dict[str, Any]:
     start = _time.time()
+    if spot is None or not math.isfinite(float(spot)) or float(spot) <= 0:
+        return {
+            "symbol": symbol,
+            "spot": None,
+            "lot_size": lot_size if isinstance(lot_size, int) and lot_size > 0 else None,
+            "computed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "elapsed_ms": int((_time.time() - start) * 1000),
+            "error": "verified live spot unavailable",
+            "signal_counts": {
+                "total": 0,
+                "non_null": 0,
+                "null": 0,
+                "by_category": {},
+            },
+            "categories": {},
+            "composite_scores": {},
+            "duckdb_rows_written": 0,
+        }
     ctx = SignalContext(
         symbol=symbol,
         ohlcv_df=ohlcv_df,
         chain_legs=chain_legs,
-        spot=float(spot or 0.0),
+        spot=float(spot),
         expiry_str=expiry_str,
         cross_asset_snapshot=cross_asset_snapshot or {},
         sentiment_data=sentiment_data or {},

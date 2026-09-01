@@ -444,7 +444,9 @@ class BacktestEngine:
         spot = float(signals.get("spot") or pricer.get_spot(self.symbol, trade_date) or 0.0)
         lot_size = pricer.get_lot_size(self.symbol)
         risk_per_lot = max(spot * lot_size * 0.12, 1.0)
-        win_prob = max(0.05, min(float(signals.get("ml.composite_probabilities.UP") or 0.55), 0.95))
+        ml_up_probability = signals.get("ml.composite_probabilities.UP")
+        no_edge_probability = 0.5  # unavailable ML signal must not fabricate a Kelly edge
+        win_prob = max(0.05, min(float(ml_up_probability if ml_up_probability is not None else no_edge_probability), 0.95))
         closed = portfolio.closed_trades[-30:]
         wins = [float(trade.get("net_pnl") or 0.0) for trade in closed if float(trade.get("net_pnl") or 0.0) > 0]
         losses = [abs(float(trade.get("net_pnl") or 0.0)) for trade in closed if float(trade.get("net_pnl") or 0.0) < 0]

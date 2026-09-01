@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import pandas as pd
@@ -16,8 +17,10 @@ TEMPLATES = {
 def compute_greeks_dashboard(
     symbol: str,
     legs: list[dict[str, Any]],
-    spot: float,
+    spot: float | None,
 ) -> dict[str, Any]:
+    if spot is None or not math.isfinite(float(spot)) or float(spot) <= 0:
+        return {"symbol": symbol, "templates": {}, "error": "verified live spot unavailable"}
     if not legs:
         return {"symbol": symbol, "templates": {}, "error": "chain unavailable"}
     frame = pd.DataFrame(legs)

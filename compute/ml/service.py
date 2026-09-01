@@ -189,13 +189,25 @@ def predict_all_models(
 
 
 def _ohlc_forecast(context: Any) -> dict[str, Any] | None:
+    # This forecast is rendered directly in the decision UI.  It must obey
+    # the same current-decision eligibility contract as the dedicated
+    # /ml/ohlc_forecast endpoint.  In particular, an empty feature context
+    # previously supplied current_spot=0.0 to OHLCForecaster, which produced
+    # a plausible-looking near-zero OHLC forecast instead of unavailable.
+    market_eligibility = getattr(context, "market_data_eligibility", None)
+    if market_eligibility is None or not market_eligibility.decision_eligible:
+        return None
+    current_spot = _as_float(getattr(context, "current_spot", None))
+    ohlcv = getattr(context, "ohlcv", None)
+    if current_spot is None or current_spot <= 0 or ohlcv is None or ohlcv.empty:
+        return None
     try:
         atm_iv = current_value(context, ["atm_iv", "options.atm_iv"])
         vix = current_value(context, ["india_vix", "vix.india_vix"])
         return OHLCForecaster().predict(
             context.symbol,
-            context.ohlcv,
-            context.current_spot,
+            ohlcv,
+            current_spot,
             atm_iv=atm_iv,
             vix=vix,
             include_accuracy=True,

@@ -1014,17 +1014,20 @@ def get_signals(symbol: str) -> Any:
         legs = _read_chain_legs_from_redis(symbol, [expiry])
 
     spot_observation = _read_spot_observation_from_redis(symbol)
-    spot = float(spot_observation.price) if spot_observation.decision_eligible else 0.0
+    spot = float(spot_observation.price) if spot_observation.decision_eligible else None
     try:
         lot_size = instrument_master.get_lot_size(symbol, expiry)
     except InstrumentSchemaError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
 
-    try:
-        options = compute_options_signals(legs, spot, expiry, lot_size)
-    except Exception as e:
-        print(f"signals: options computation error: {e}")
-        options = {"error": str(e), "available": False}
+    if spot is None:
+        options = {"error": "verified live spot unavailable", "available": False}
+    else:
+        try:
+            options = compute_options_signals(legs, spot, expiry, lot_size)
+        except Exception as e:
+            print(f"signals: options computation error: {e}")
+            options = {"error": str(e), "available": False}
 
     return {
         "options": options,
@@ -1054,12 +1057,12 @@ def get_all_signals(symbol: str) -> Any:
         legs = _read_chain_legs_from_redis(normalized_symbol, [expiry])
 
     spot_observation = _read_spot_observation_from_redis(normalized_symbol)
-    spot = float(spot_observation.price) if spot_observation.decision_eligible else 0.0
+    spot = float(spot_observation.price) if spot_observation.decision_eligible else None
     try:
         lot_size = instrument_master.get_lot_size(normalized_symbol, expiry)
     except InstrumentSchemaError:
         lot_size = None
-    if not legs:
+    if not legs and spot is not None:
         fallback_legs, _fallback_spot, fallback_expiry = _fetch_chain_legs_with_greeks(
             normalized_symbol,
             expiry,
@@ -2056,7 +2059,7 @@ def _apex_inputs(symbol: str) -> dict[str, Any]:
     if not legs:
         legs = _read_chain_legs_from_redis(normalized, [expiry])
     spot_observation = _read_spot_observation_from_redis(normalized)
-    spot = float(spot_observation.price) if spot_observation.decision_eligible else 0.0
+    spot = float(spot_observation.price) if spot_observation.decision_eligible else None
     try:
         lot_size = instrument_master.get_lot_size(normalized, expiry)
     except InstrumentSchemaError:
