@@ -75,9 +75,18 @@ def _load_ohlcv(
     to_day: datetime.date,
 ) -> pd.DataFrame:
     symbols = _query_symbols(symbol)
+    # Measured direct-connection cost for this exact query is ~70-90ms (a
+    # bounded daily-OHLCV range scan, not a full-history/tick read), so the
+    # generic 30s cross-process ceiling used for heavier typed reads is far
+    # looser than this interactive chart request needs. A tighter budget
+    # fails fast and honestly (surfaced to the UI as an unavailable state)
+    # instead of a caller-side transport timeout aborting the connection
+    # first -- see src-tauri/src/commands.rs::get_indicators's matching
+    # client timeout, which must stay above this value.
     result = resolve_read(
         ReadOperation.LOAD_TECHNICAL_OHLCV_RANGE,
         {"symbols": symbols, "from_date": from_day.isoformat(), "to_date": to_day.isoformat()},
+        timeout=8.0,
     )
     rows = result["rows"]
 
