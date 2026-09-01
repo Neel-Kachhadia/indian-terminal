@@ -267,6 +267,40 @@ def test_final_signed_manifest_covers_tauri_executable_before_bundle() -> None:
     )
 
 
+def test_release_identity_generated_before_anything_imports_main() -> None:
+    """Reproduced live: main.py binds RELEASE_IDENTITY at module import time
+    (main.py: `RELEASE_IDENTITY = load_release_identity()`), which raises
+    RuntimeError("release identity not found") when no
+    release/release-identity.json exists yet -- true on a genuine clean
+    checkout. build_release.ps1 used to run `pytest` (which imports main.py
+    via test_integrity.py etc.) and `source-openapi` (which imports main.py
+    to introspect the FastAPI app) BEFORE `generate-identity`, so a pristine
+    checkout's release pipeline crashed on its very first step."""
+    build = (ROOT / "build_release.ps1").read_text(encoding="utf-8")
+    generate_identity_pos = build.index("release_gate.py generate-identity")
+    assert build.index("-m pytest") > generate_identity_pos
+    assert build.index("release_gate.py source-openapi") > generate_identity_pos
+    # generate-identity itself hashes bundle-data/terminal.db.gz, which only
+    # Compress-TerminalDb produces -- must run strictly before it. rindex,
+    # not index: the first occurrence of this token is the `function
+    # Compress-TerminalDb {` definition itself, which always sits near the
+    # top of the file regardless of call order -- only the call site (the
+    # last occurrence) matters here.
+    assert build.rindex("Compress-TerminalDb") < generate_identity_pos
+
+
+def test_release_checkpoints_duckdb_wal_before_compressing_snapshot() -> None:
+    """A raw terminal.db copy omits committed rows still present only in its
+    WAL. The canonical build must checkpoint and reject a non-empty WAL before
+    it compresses the bootstrap database into the installer."""
+    build = (ROOT / "build_release.ps1").read_text(encoding="utf-8")
+    checkpoint_pos = build.rindex("Checkpoint-TerminalDb -Python")
+    compress_pos = build.rindex("Compress-TerminalDb")
+    assert checkpoint_pos < compress_pos
+    assert 'connection.execute("CHECKPOINT")' in build
+    assert "WAL remained non-empty after CHECKPOINT" in build
+
+
 @pytest.mark.release
 def test_release_source_fingerprint_excludes_volatile_build_state() -> None:
     volatile_parts = {

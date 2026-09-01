@@ -5151,6 +5151,21 @@ if __name__ == "__main__":
         raise SystemExit(job_supervisor.run_watchdog_check())
     if len(sys.argv) >= 2 and sys.argv[1] == "collector-task":
         raise SystemExit(setup_autostart.cli(sys.argv[2:]))
+    if len(sys.argv) >= 2 and sys.argv[1] == "frozen-runtime-probe":
+        from ml.frozen_runtime import print_probe
+
+        integrity = integrity_check(expected_phase="PROBE")
+        if integrity.get("trusted") is not True:
+            raise RuntimeError(f"frozen-runtime probe integrity failed: {integrity.get('reasons')}")
+        raise SystemExit(print_probe())
+    if len(sys.argv) >= 2 and sys.argv[1] == "frozen-model-sweep":
+        from ml.frozen_runtime import print_sweep
+
+        integrity = integrity_check(expected_phase="FINAL")
+        if integrity.get("trusted") is not True:
+            raise RuntimeError(f"frozen model sweep integrity failed: {integrity.get('reasons')}")
+        symbol = sys.argv[2] if len(sys.argv) >= 3 else None
+        raise SystemExit(print_sweep(symbol))
     if len(sys.argv) >= 2 and sys.argv[1] == "release-openapi-probe":
         # Build-time only: release_gate.py's packaged-openapi step is the
         # ONLY caller of this branch (it launches the sidecar with exactly

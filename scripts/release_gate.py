@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 from collections import deque
+import gc
 import gzip
 import hashlib
 import json
@@ -457,6 +458,173 @@ def obtain_packaged_openapi(sidecar: Path, timeout_seconds: int = 180) -> dict[s
                 drain_thread.join(timeout=5)
 
 
+def validate_frozen_runtime(sidecar: Path, timeout_seconds: int = 300) -> dict[str, Any]:
+    """Verify native archive contents, then load real SKOPS estimator classes."""
+    if not sidecar.is_file():
+        raise RuntimeError(f"sidecar missing: {sidecar}")
+    compute = ROOT / "compute"
+    sys.path.insert(0, str(compute))
+    from build_compute import verify_frozen_native_payload  # noqa: PLC0415
+
+    verify_frozen_native_payload(sidecar)
+    previous_app_data = os.environ.get("BHARATTERMINAL_APP_DATA")
+    with tempfile.TemporaryDirectory(
+        prefix="bharatterminal-frozen-runtime-", ignore_cleanup_errors=True
+    ) as temp_dir:
+        app_root = Path(temp_dir) / "app-data"
+        os.environ["BHARATTERMINAL_APP_DATA"] = str(app_root)
+        try:
+            _stage_frozen_probe_artifacts()
+            env = os.environ.copy()
+            system_root = Path(env.get("SystemRoot", r"C:\Windows")).resolve()
+            env["PATH"] = os.pathsep.join((str(system_root / "System32"), str(system_root)))
+            for key in (
+                "PYTHONHOME",
+                "PYTHONPATH",
+                "VIRTUAL_ENV",
+                "UV_PROJECT_ENVIRONMENT",
+                "UV_CACHE_DIR",
+                "BHARATTERMINAL_RESOURCE_MANIFEST",
+                "BHARATTERMINAL_TAURI_EXECUTABLE",
+            ):
+                env.pop(key, None)
+            env["BHARATTERMINAL_APP_DATA"] = str(app_root)
+            env["BHARATTERMINAL_RESOURCE_ROOT"] = str(ROOT)
+            env["BHARATTERMINAL_PROTECTED_ASSET_ROOT"] = str(ROOT)
+            result = subprocess.run(
+                [str(sidecar), "frozen-runtime-probe"],
+                cwd=temp_dir,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_seconds,
+                check=False,
+            )
+        finally:
+            if previous_app_data is None:
+                os.environ.pop("BHARATTERMINAL_APP_DATA", None)
+            else:
+                os.environ["BHARATTERMINAL_APP_DATA"] = previous_app_data
+            gc.collect()
+        prefix = "FROZEN_RUNTIME_PROBE="
+        payload_line = next(
+            (line[len(prefix) :] for line in result.stdout.splitlines() if line.startswith(prefix)),
+            None,
+        )
+        if result.returncode != 0 or payload_line is None:
+            diagnostic = "\n".join((result.stdout + "\n" + result.stderr).splitlines()[-50:])
+            raise RuntimeError(
+                f"frozen-runtime probe failed with code {result.returncode}"
+                + (f"\n{diagnostic}" if diagnostic else "")
+            )
+        payload = json.loads(payload_line)
+        if (
+            payload.get("status") != "PASS"
+            or payload.get("frozen") is not True
+            or payload.get("native_payload_local") is not True
+            or payload.get("dev_path_dependency") is not False
+            or payload.get("global_python_dependency") is not False
+            or payload.get("models", {}).get("failed") != 0
+            or payload.get("models", {}).get("loaded") != 3
+        ):
+            raise RuntimeError(f"frozen-runtime probe contract failed: {payload}")
+        return payload
+
+
+def _stage_frozen_probe_artifacts() -> None:
+    import numpy as np  # noqa: PLC0415
+    from catboost import CatBoostClassifier  # noqa: PLC0415
+    from lightgbm import LGBMClassifier  # noqa: PLC0415
+    from xgboost import XGBClassifier  # noqa: PLC0415
+
+    from ml.models.common import save_artifact  # noqa: PLC0415
+    from ml.registry import feature_schema_version  # noqa: PLC0415
+
+    features = np.asarray(
+        [
+            [0.0, 0.0],
+            [0.1, 0.2],
+            [0.2, 0.1],
+            [1.0, 1.0],
+            [1.1, 1.2],
+            [1.2, 1.1],
+            [2.0, 2.0],
+            [2.1, 2.2],
+            [2.2, 2.1],
+        ],
+        dtype=float,
+    )
+    labels = np.asarray([0, 0, 0, 1, 1, 1, 2, 2, 2], dtype=int)
+    estimators = (
+        (
+            "m01_vol_regime",
+            XGBClassifier(
+                n_estimators=3,
+                max_depth=2,
+                objective="multi:softprob",
+                eval_metric="mlogloss",
+                random_state=42,
+            ),
+        ),
+        (
+            "m02_direction",
+            LGBMClassifier(n_estimators=3, num_leaves=3, random_state=42, verbosity=-1),
+        ),
+        (
+            "m06_regime_return",
+            CatBoostClassifier(
+                iterations=3,
+                depth=2,
+                loss_function="MultiClass",
+                random_seed=42,
+                verbose=False,
+                allow_writing_files=False,
+            ),
+        ),
+    )
+    for index, (model_id, estimator) in enumerate(estimators, start=1):
+        estimator.fit(features, labels)
+        timestamp = f"2026-08-30T00:00:0{index}+00:00"
+        artifact = {
+            "model_id": model_id,
+            "model_version": f"20260830T00000{index}Z-frozenprobe",
+            "symbol": "FROZEN_PROBE",
+            "universe": "FROZEN_PROBE",
+            "model": estimator,
+            "classes": ["A", "B", "C"],
+            "feature_columns": ["feature_a", "feature_b"],
+            "feature_medians": {"feature_a": 1.0, "feature_b": 1.0},
+            "trained_at": timestamp,
+            "training_timestamp": timestamp,
+            "training_data_horizon": "2026-01-01..2026-06-30",
+            "feature_schema_version": feature_schema_version(["feature_a", "feature_b"]),
+            "code_version": "0.1.0",
+            "release_version": "0.1.0",
+            "validation_status": "VALIDATED",
+            "fallback_status": "PRIMARY",
+            "train_start": "2026-01-01",
+            "train_end": "2026-04-30",
+            "validation_start": "2026-05-02",
+            "validation_end": "2026-05-31",
+            "test_start": "2026-06-02",
+            "test_end": "2026-06-30",
+            "train_rows": 9,
+            "validation_sample_count": 3,
+            "test_sample_count": 3,
+            "validation_metric_name": "fixture",
+            "validation_metric_value": 1.0,
+            "calibration_metric_name": "fixture",
+            "calibration_metric_value": 0.0,
+            "calibration_sample_count": 3,
+            "calibrated": False,
+        }
+        save_artifact(model_id, artifact, "FROZEN_PROBE")
+
+
 def artifact_record(path: Path, version: str, metadata: dict[str, Any]) -> dict[str, Any]:
     digest = sha256_tauri_executable(path) if path == TAURI_EXECUTABLE_PATH else sha256_file(path)
     return {
@@ -677,6 +845,7 @@ def main() -> None:
             "generate-identity",
             "source-openapi",
             "generate-probe-manifest",
+            "frozen-runtime",
             "packaged-openapi",
             "generate-prebundle-manifest",
             "generate-manifest",
@@ -691,6 +860,9 @@ def main() -> None:
         validate_source_openapi()
     elif args.action == "generate-probe-manifest":
         generate_resource_manifest(phase="PROBE")
+    elif args.action == "frozen-runtime":
+        sidecar = args.sidecar or ROOT / "compute" / "dist" / "bharatterminal-compute.exe"
+        validate_frozen_runtime(sidecar.resolve())
     elif args.action == "packaged-openapi":
         sidecar = args.sidecar or ROOT / "compute" / "dist" / "bharatterminal-compute.exe"
         obtain_packaged_openapi(sidecar.resolve())

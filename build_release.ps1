@@ -1,3 +1,7 @@
+param(
+  [switch] $PreserveExistingInstallers
+)
+
 $ErrorActionPreference = "Stop"
 
 function Assert-FreeSpace {
@@ -45,6 +49,32 @@ function Invoke-Native {
   }
 }
 
+function Checkpoint-TerminalDb {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string] $Python
+  )
+
+  $source = (Resolve-Path (Join-Path $PSScriptRoot "..\data\terminal.db")).Path
+  $checkpointScript = @"
+import duckdb
+from pathlib import Path
+
+database = Path(r'''$source''')
+connection = duckdb.connect(str(database))
+try:
+    connection.execute("CHECKPOINT")
+finally:
+    connection.close()
+
+wal = database.with_name(database.name + ".wal")
+if wal.exists() and wal.stat().st_size:
+    raise RuntimeError(f"DuckDB WAL remained non-empty after CHECKPOINT: {wal}")
+"@
+  Invoke-Native $Python -c $checkpointScript
+  Write-Host "Checkpointed terminal.db before release snapshot"
+}
+
 function Compress-TerminalDb {
   $source = Resolve-Path (Join-Path $PSScriptRoot "..\data\terminal.db")
   $bundleDir = Join-Path $PSScriptRoot "bundle-data"
@@ -83,6 +113,20 @@ try {
   Invoke-Native "uv" sync --project compute --frozen --all-groups
   $releasePython = Join-Path $releaseEnvironment "Scripts\python.exe"
   Invoke-Native $releasePython -m pip check
+  # generate-identity must run before anything that imports compute/main.py
+  # (pytest collection and source-openapi both do): main.py binds
+  # RELEASE_IDENTITY at module import time, so on a genuine clean checkout
+  # with no pre-existing release/release-identity.json, running pytest
+  # first crashed collection with "RuntimeError: release identity not
+  # found" before a single test could run. Compress-TerminalDb must run
+  # first in turn -- generate-identity hashes bundle-data/terminal.db.gz,
+  # which only Compress-TerminalDb produces.
+  # A raw copy of terminal.db does not include committed records that still
+  # reside in terminal.db.wal.  The collector is stopped for a release build;
+  # force a clean checkpoint before taking the compressed bootstrap snapshot.
+  Checkpoint-TerminalDb -Python $releasePython
+  Compress-TerminalDb
+  Invoke-Native $releasePython scripts\release_gate.py generate-identity
   Push-Location (Join-Path $PSScriptRoot "compute")
   try {
     Invoke-Native $releasePython -m pytest -c pytest.ini tests -q
@@ -90,10 +134,9 @@ try {
     Pop-Location
   }
   Invoke-Native $releasePython scripts\release_gate.py source-openapi
-  Compress-TerminalDb
-  Invoke-Native $releasePython scripts\release_gate.py generate-identity
   Invoke-Native $releasePython compute\build_compute.py
   Invoke-Native $releasePython scripts\release_gate.py generate-probe-manifest
+  Invoke-Native $releasePython scripts\release_gate.py frozen-runtime
   Invoke-Native $releasePython scripts\release_gate.py packaged-openapi
   Invoke-Native "corepack" pnpm build
   Invoke-Native $releasePython scripts\release_gate.py generate-prebundle-manifest
@@ -113,7 +156,9 @@ try {
   Invoke-Native $releasePython scripts\release_gate.py validate
   Invoke-Native "cargo" tauri bundle --bundles nsis
   Invoke-Native $releasePython scripts\release_gate.py validate
-  Remove-OldInstallers
+  if (-not $PreserveExistingInstallers) {
+    Remove-OldInstallers
+  }
   Write-Host "Installer at: src-tauri/target/release/bundle/nsis/"
 } finally {
   $env:UV_PROJECT_ENVIRONMENT = $previousUvProjectEnvironment
