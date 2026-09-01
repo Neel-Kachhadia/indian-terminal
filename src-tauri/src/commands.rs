@@ -956,11 +956,15 @@ pub async fn get_indicators(
         "indicators": indicators,
     });
 
+    // Backend's own bounded read budget for this query is 8s (see
+    // technical/indicators.py::_load_ohlcv); this must stay comfortably
+    // above that so this client never aborts the connection before the
+    // backend's own timeout has a chance to return an honest error.
     let response = client
         .post(url)
         .header("X-Process-Token", process_token(&state).await?)
         .json(&body)
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(12))
         .send()
         .await
         .map_err(|error| format!("indicators request failed: {error}"))?;

@@ -695,6 +695,7 @@ def resolve_read(
     payload: dict[str, Any],
     *,
     database: Path | None = None,
+    timeout: float = 30.0,
 ) -> Any:
     """Single decision boundary for every bounded typed read in the codebase.
 
@@ -744,7 +745,7 @@ def resolve_read(
                 cursor.close()
     status = writer_service_status(queue_path_for(resolved_database))
     if status.get("live"):
-        return submit_read(operation, payload, database=resolved_database)
+        return submit_read(operation, payload, database=resolved_database, timeout=timeout)
     connection = open_read_connection(resolved_database)
     try:
         return _dispatch_read(operation.value, payload, connection)

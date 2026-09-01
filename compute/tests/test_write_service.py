@@ -27,6 +27,7 @@ from db.write_service import (
     _own_process_start_time,
     _owner_liveness,
     _utc_text,
+    resolve_read,
     submit_read,
     submit_write,
     writer_service_status,
@@ -869,3 +870,93 @@ def test_shutdown_drains_request_already_accepted(tmp_path: Path) -> None:
     shutdown.join(timeout=5)
     assert stopped == []
     assert results == [{"drained": True}]
+
+
+def test_resolve_read_forwards_caller_timeout_to_cross_process_reader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for the Chart-indicators defect: resolve_read used to hand
+    submit_read a hardcoded 30s ceiling no matter what the caller actually
+    needed, so an interactive read had no way to fail faster than a full
+    background-read budget. Proves the plumbing without needing a second
+    process: the routing decision (no local writer, a live remote owner)
+    is forced directly."""
+    calls: list[dict[str, object]] = []
+
+    def fake_status(_queue_path: object) -> dict[str, object]:
+        return {"live": True}
+
+    def fake_submit_read(operation: object, payload: object, **kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        return {"rows": []}
+
+    monkeypatch.setattr(write_service, "writer_service_status", fake_status)
+    monkeypatch.setattr(write_service, "submit_read", fake_submit_read)
+    monkeypatch.setattr(write_service, "_ACTIVE_WRITER_CONNECTION", type("_C", (), {"get": staticmethod(lambda: None)})())
+    monkeypatch.setattr(write_service, "_lookup_writer_connection", lambda _database: None)
+
+    resolve_read(ReadOperation.LATEST_DATE_IN, {"dataset": "ohlcv"}, timeout=8.0)
+    assert calls[-1]["timeout"] == 8.0
+
+    resolve_read(ReadOperation.LATEST_DATE_IN, {"dataset": "ohlcv"})
+    assert calls[-1]["timeout"] == 30.0, "unspecified callers must keep today's existing 30s ceiling"
+
+
+def test_indicator_scale_read_fails_fast_under_contention_instead_of_starving(
+    tmp_path: Path,
+) -> None:
+    """A read using the tight 8s-class budget must not starve behind a
+    single slow write the way the generic 30s ceiling would tolerate --
+    it must come back (as a clean, honest timeout) well under the 10s+
+    a UI client is willing to wait, proving the queue's read-priority
+    fairness plus a caller-scoped timeout together bound worst-case
+    latency for interactive reads."""
+    database = tmp_path / "terminal.db"
+    queue = tmp_path / "writer.sqlite"
+    duckdb.connect(database).close()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_dispatch(*_: object) -> dict[str, bool]:
+        entered.set()
+        assert release.wait(timeout=5)
+        return {"ok": True}
+
+    service = WriterService(database, queue_path=queue, dispatcher=blocking_dispatch)
+    service.start()
+    writer_result: list[object] = []
+
+    def submit_blocking_write() -> None:
+        try:
+            writer_result.append(
+                submit_write(
+                    WriteOperation.UPSERT_FII_DII,
+                    _fii_payload(),
+                    database=database,
+                    queue_path=queue,
+                    timeout=5,
+                )
+            )
+        except Exception as error:
+            writer_result.append(error)
+
+    thread = threading.Thread(target=submit_blocking_write)
+    thread.start()
+    assert entered.wait(timeout=2)
+    try:
+        started = time.monotonic()
+        with pytest.raises(WriterUnavailableError, match="reader request timed out"):
+            submit_read(
+                ReadOperation.LATEST_DATE_IN,
+                {"dataset": "ohlcv"},
+                database=database,
+                queue_path=queue,
+                timeout=1.0,
+            )
+        elapsed = time.monotonic() - started
+        assert elapsed < 2.0, "an 8s-class interactive read must not wait out a 30s-class ceiling"
+    finally:
+        release.set()
+        thread.join(timeout=5)
+        service.stop()
+    assert writer_result == [{"ok": True}]
