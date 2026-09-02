@@ -333,7 +333,7 @@ def test_signal_pending_check_uses_its_decision_eligible_source_domain(monkeypat
     def latest(dataset: str, symbol: str | None = None):
         values = {
             ("ohlcv", None): today,
-            ("signals_source_ohlcv", "NIFTY"): date(2026, 8, 26),
+            ("signals_source_ohlcv", "NIFTY 50"): date(2026, 8, 26),
             ("signals_history", "NIFTY"): date(2026, 8, 26),
             ("bif_history", "NIFTY"): date(2026, 8, 26),
         }
@@ -348,6 +348,41 @@ def test_signal_pending_check_uses_its_decision_eligible_source_domain(monkeypat
         "decision_eligible_ohlcv",
         "date",
     )
+
+
+def test_signal_pending_check_uses_the_real_decision_eligible_symbol_spelling(monkeypatch) -> None:
+    """decision_eligible_ohlcv (data/market_data_quality.py's view SQL) selects
+    `symbol` straight through from raw ohlcv with no alias canonicalization, so
+    index rows sit under the literal source spelling "NIFTY 50" -- never the
+    bare "NIFTY" signals_history/bif_history key their own rows under.
+    Querying this dataset with "NIFTY" always returns None, which makes
+    `if latest_eq and (...)` structurally unreachable no matter how fresh the
+    real decision-eligible index data is. Reproduced live 2026-09-02: with
+    genuinely fresh index bhav data, signals_history stayed frozen 11 days
+    behind because this exact check was silently never true."""
+    today = date(2026, 9, 2)
+    monkeypatch.setattr(smart_collector, "ist_today", lambda: today)
+    monkeypatch.setattr(smart_collector, "ist_hour", lambda: 12.0)
+    monkeypatch.setattr(smart_collector, "instrument_master_age_hours", lambda: 0.0)
+    monkeypatch.setattr(smart_collector, "task_done", lambda *_args: False)
+    monkeypatch.setattr(smart_collector, "days_since_last_success", lambda *_args: 0)
+
+    def latest(dataset: str, symbol: str | None = None):
+        values = {
+            ("ohlcv", None): today,
+            ("signals_source_ohlcv", "NIFTY 50"): today,
+            ("signals_history", "NIFTY"): date(2026, 8, 22),
+            ("bif_history", "NIFTY"): date(2026, 8, 22),
+        }
+        return values[(dataset, symbol)]
+
+    monkeypatch.setattr(smart_collector, "latest_date_in", latest)
+
+    pending = smart_collector.get_pending_tasks()
+
+    signal_tasks = [item for item in pending if item["task"] == "signals"]
+    assert signal_tasks, "fresh decision-eligible NIFTY 50 data must schedule a signals catch-up task"
+    assert signal_tasks[0]["date"] == today
 
 
 def test_manual_rerun_of_already_succeeded_task_does_not_crash(monkeypatch, tmp_path) -> None:

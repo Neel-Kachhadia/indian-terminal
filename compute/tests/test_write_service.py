@@ -1153,3 +1153,66 @@ def test_indicator_scale_read_fails_fast_under_contention_instead_of_starving(
         thread.join(timeout=5)
         service.stop()
     assert writer_result == [{"ok": True}]
+
+
+def _seed_fno_universe_fixture(database: Path) -> None:
+    """One real equity underlying (RELIANCE), one hyphenated real equity
+    underlying (BAJAJ-AUTO, regression against naive '-'-splitting), and the
+    index/derivative underlyings that must never be treated as stocks."""
+    connection = duckdb.connect(database)
+    connection.execute(
+        "CREATE TABLE fo_eod(symbol TEXT, expiry DATE, strike DOUBLE, "
+        "option_type TEXT, date DATE, open DOUBLE, high DOUBLE, low DOUBLE, "
+        "close DOUBLE, volume BIGINT, oi BIGINT, oi_change BIGINT, "
+        "source TEXT, source_format TEXT, price_quality TEXT)"
+    )
+    connection.execute(
+        "CREATE TABLE instruments(token TEXT, symbol TEXT, name TEXT, "
+        "exchange TEXT, instrument_type TEXT, expiry DATE, strike DOUBLE, "
+        "option_type TEXT, lot_size INTEGER, tick_size DOUBLE, isin TEXT, "
+        "updated_at TIMESTAMP)"
+    )
+    fno_symbols = [
+        "RELIANCE", "BAJAJ-AUTO",
+        "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYFPI", "NIFTYNXT50",
+    ]
+    for symbol in fno_symbols:
+        connection.execute(
+            "INSERT INTO fo_eod VALUES (?, DATE '2026-09-02', 100, 'FUT', "
+            "DATE '2026-09-02', 1,1,1,1,0,0,0,'BHAVCOPY','csv','OBSERVED_VERIFIED')",
+            [symbol],
+        )
+    # Only the two real equities have a matching NSE cash-equity instrument row.
+    for symbol in ("RELIANCE", "BAJAJ-AUTO"):
+        connection.execute(
+            "INSERT INTO instruments VALUES (?, ?, ?, 'NSE', '', NULL, NULL, "
+            "NULL, 1, 0.05, NULL, TIMESTAMP '2026-09-02 00:00:00')",
+            [symbol, f"{symbol}-EQ", symbol],
+        )
+    connection.close()
+
+
+def test_fno_universe_excludes_index_and_derivative_underlyings(tmp_path: Path) -> None:
+    """LOAD_FNO_UNIVERSE_SYMBOLS feeds the equity stock screener/universe
+    (data.stock_snapshot._universe_symbols) -- an index has no per-share
+    screener metrics and must never be ranked in it alongside real stocks."""
+    database = tmp_path / "terminal.db"
+    _seed_fno_universe_fixture(database)
+    result = resolve_read(ReadOperation.LOAD_FNO_UNIVERSE_SYMBOLS, {}, database=database)
+    assert sorted(result["symbols"]) == ["BAJAJ-AUTO", "RELIANCE"]
+
+
+def test_stock_trainer_fno_universe_excludes_index_and_derivative_underlyings(
+    tmp_path: Path,
+) -> None:
+    """LOAD_STOCK_TRAINER_FNO_SYMBOLS feeds ml.stock_trainer's per-symbol
+    equity trainer. NIFTY/BANKNIFTY already have a dedicated index-level
+    trainer (ml.trainer.train_all_models); running them back through the
+    equity trainer double-trains the index and pollutes the equity model
+    registry with index entries under the same code path used for real
+    stocks. Previously only FINNIFTY/MIDCPNIFTY were excluded by a hardcoded
+    name list, which silently missed NIFTY, BANKNIFTY, NIFTYFPI, NIFTYNXT50."""
+    database = tmp_path / "terminal.db"
+    _seed_fno_universe_fixture(database)
+    result = resolve_read(ReadOperation.LOAD_STOCK_TRAINER_FNO_SYMBOLS, {}, database=database)
+    assert sorted(result["symbols"]) == ["BAJAJ-AUTO", "RELIANCE"]

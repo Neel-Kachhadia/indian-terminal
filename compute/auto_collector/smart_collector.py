@@ -29,6 +29,7 @@ COMPUTE_DIR = Path(__file__).resolve().parents[1]
 if str(COMPUTE_DIR) not in sys.path:
     sys.path.insert(0, str(COMPUTE_DIR))
 
+from data.index_aliases import INDEX_CANONICAL_NAME, index_symbol_candidates
 from data.paths import DATA_DIR, DUCKDB_PATH, FO_BHAV_DIR, INSTRUMENTS_CACHE, ensure_dirs
 from data.exchange_calendar import is_trading_day, now_ist
 from db.write_service import (
@@ -369,6 +370,33 @@ def run_bhavcopy_fo(for_date: date) -> str:
     return f"source={source} loaded={loaded} rows_on_date={rows_on_date}"
 
 
+def run_bhavcopy_index(for_date: date) -> str:
+    # NSE publishes index (NIFTY 50 etc.) EOD values via a separate feed from
+    # the equity/F&O bhavcopy -- ind_close_all_{date}.csv, not the CM zip --
+    # so it cannot reuse run_bhavcopy_equity/fo's download path. Historically
+    # this dataset had NO recurring collector task at all: db.bhav_loader's
+    # download_index_bhav/load_date_range existed but were wired only to a
+    # one-shot startup seed (main.py, `if count < 200`), which stops firing
+    # forever once the index table clears that threshold. That silently froze
+    # NIFTY 50 index history at whatever date the last seed ran while every
+    # other dataset kept advancing daily. Root-caused via NIFTY freshness
+    # audit 2026-09-02; this task closes the gap using the pre-existing
+    # download/parse function, going through the generic INGEST_OHLCV writer
+    # op (same insert path/table 'ohlcv' the parsed rows already target) so
+    # network I/O still happens outside the writer lock.
+    from db.bhav_loader import download_index_bhav
+
+    rows = download_index_bhav(for_date)
+    if not rows:
+        return "not_available_yet source=index_bhav_404"
+
+    inserted = int(submit_write(WriteOperation.INGEST_OHLCV, {"rows": rows})["inserted"])
+    rows_on_date = row_count_for_date("ohlcv", for_date)
+    if rows_on_date == 0 and for_date == ist_today():
+        return "not_available_yet rows_on_date=0"
+    return f"inserted={inserted} rows_on_date={rows_on_date}"
+
+
 def run_fii_dii(for_date: date) -> str:
     from signals.market_signals import fetch_fii_dii
 
@@ -453,6 +481,7 @@ TASK_RUNNERS: dict[str, TaskRunner] = {
     "instrument_master": run_instrument_master,
     "bhavcopy_equity": run_bhavcopy_equity,
     "bhavcopy_fo": run_bhavcopy_fo,
+    "bhavcopy_index": run_bhavcopy_index,
     "fii_dii": run_fii_dii,
     "signals": run_signals,
     "bif": run_bif,
@@ -521,6 +550,18 @@ def get_pending_tasks() -> list[dict[str, Any]]:
                     }
                 )
 
+        latest_index = latest_date_in("ohlcv", "NIFTY 50")
+        for missing in missing_trading_days(latest_index):
+            if not task_done("bhavcopy_index", missing):
+                tasks.append(
+                    {
+                        "task": "bhavcopy_index",
+                        "date": missing,
+                        "reason": f"missing index bhav {missing}",
+                        "priority": 2,
+                    }
+                )
+
     if now_hour >= 18.0:
         try:
             ensure_fii_dii_table()
@@ -544,7 +585,18 @@ def get_pending_tasks() -> list[dict[str, Any]]:
     # current decision; comparing those two different domains caused a real
     # false-success loop (task date 2026-08-31, zero rows written, source only
     # through 2026-08-26) and then suppressed retries for the rest of the day.
-    latest_eq = latest_date_in("signals_source_ohlcv", "NIFTY")
+    #
+    # decision_eligible_ohlcv's view SQL (data/market_data_quality.py) selects
+    # `symbol` straight through from raw ohlcv with no alias canonicalization,
+    # so index rows sit under the literal source spelling "NIFTY 50" -- never
+    # the bare "NIFTY" that signals_history/bif_history key their own rows
+    # under. Querying this dataset with "NIFTY" always returned None, which
+    # made `if latest_eq and (...)` structurally unreachable: this task could
+    # never be (re)scheduled by staleness detection, no matter how fresh the
+    # underlying index data became. Reproduced live 2026-09-02: signals_history
+    # frozen at 2026-08-22 even after bhavcopy_index backfilled ohlcv through
+    # 2026-09-02, root-caused to this exact symbol mismatch.
+    latest_eq = latest_date_in("signals_source_ohlcv", INDEX_CANONICAL_NAME["NIFTY"])
     latest_sig = latest_date_in("signals_history", "NIFTY")
     if latest_eq and (latest_sig is None or latest_sig < latest_eq):
         task_date = latest_eq
@@ -977,12 +1029,7 @@ def load_ohlcv_full_frame(symbol: str) -> pd.DataFrame:
 
 
 def _symbol_candidates(symbol: str) -> list[str]:
-    normalized = symbol.strip().upper()
-    if normalized in {"NIFTY", "NIFTY_50", "NIFTY 50"}:
-        return ["NIFTY 50", "NIFTY"]
-    if normalized in {"BANKNIFTY", "NIFTY_BANK", "NIFTY BANK"}:
-        return ["NIFTY BANK", "BANKNIFTY"]
-    return [normalized]
+    return index_symbol_candidates(symbol.replace("_", " "))
 
 
 def _parse_market_date(value: str) -> date | None:

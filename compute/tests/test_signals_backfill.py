@@ -236,3 +236,63 @@ def test_write_signal_rows_deduplicates_within_a_single_batch() -> None:
         assert result == [(2.0,)]
     finally:
         duckdb_client._ACTIVE_WRITER_CONNECTION.reset(token)
+
+
+@pytest.mark.integration
+def test_banknifty_signal_backfill_resolves_through_the_canonical_alias_table(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Reproduces a live defect: signals.backfill._load_symbol_ohlcv
+    hand-duplicated its own partial index candidate table -- only
+    NIFTY <-> "NIFTY 50", never BANKNIFTY <-> "NIFTY BANK" -- the same bug
+    class as ml/stock_trainer.py's _load_ohlcv. Verified actual OHLCV for the
+    index is stored under "NIFTY BANK", so per-symbol signal backfill (called
+    from ml.stock_trainer.StockModelTrainer.train_symbol for every symbol,
+    including BANKNIFTY) silently saw 0 OHLCV rows and wrote nothing."""
+    import duckdb
+
+    database = tmp_path / "terminal.db"
+    queue = queue_path_for(database)
+    monkeypatch.setattr(duckdb_client, "DB_PATH", database)
+
+    con = duckdb.connect(str(database))
+    try:
+        con.execute(
+            "CREATE TABLE ohlcv(symbol VARCHAR, date DATE, open DOUBLE, high DOUBLE, "
+            "low DOUBLE, close DOUBLE, volume BIGINT, source VARCHAR)"
+        )
+        con.execute(DECISION_ELIGIBLE_OHLCV_VIEW_SQL)
+        con.execute(
+            """
+            CREATE TABLE signals_history (
+                date        DATE    NOT NULL,
+                signal_name TEXT    NOT NULL,
+                symbol      TEXT    NOT NULL,
+                value       DOUBLE,
+                PRIMARY KEY (date, signal_name, symbol)
+            )
+            """
+        )
+        start = dt.date(2020, 1, 1)
+        values = []
+        price = 100.0
+        for i in range(MINIMUM_LOOKBACK_ROWS + 50):
+            day = start + dt.timedelta(days=i)
+            price += 0.1
+            values.append(
+                ("NIFTY BANK", day.isoformat(), price, price + 1, price - 1, price + 0.5, 1000, "NSE_INDEX_BHAVCOPY")
+            )
+        con.executemany("INSERT INTO ohlcv VALUES (?, CAST(? AS DATE), ?, ?, ?, ?, ?, ?)", values)
+    finally:
+        con.close()
+
+    service = WriterService(database, queue_path=queue)
+    service.start()
+    try:
+        result = submit_write(
+            WriteOperation.BACKFILL_SIGNALS, {"symbol": "BANKNIFTY"}, database=database, queue_path=queue
+        )
+        assert result["rows_written"] > 0, "BANKNIFTY signal backfill must resolve via the 'NIFTY BANK' verified rows"
+        assert result["source_symbol"] == "NIFTY BANK"
+    finally:
+        service.stop()

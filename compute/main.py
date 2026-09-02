@@ -35,7 +35,7 @@ from pydantic import BaseModel, Field
 
 from data.error_logger import _logger as elog
 from data.exchange_calendar import exchange_calendar, is_trading_day_candidate, next_expiry_labels, today_ist
-from data.index_aliases import INDEX_CANONICAL_NAME
+from data.index_aliases import INDEX_CANONICAL_NAME, index_symbol_candidates
 from data.instrument_master import master as instrument_master
 from data.instrument_schema import InstrumentSchemaError, read_instrument_frame
 from data.market_data_quality import DecisionContext, evaluate_market_bar
@@ -3905,11 +3905,14 @@ def _query_symbols(symbol: str) -> list[str]:
         normalized = validate_symbol(symbol)
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
-    if normalized == "NIFTY":
-        return ["NIFTY", "NIFTY 50"]
-    if normalized == "NIFTY 50":
-        return ["NIFTY 50", "NIFTY"]
-    return [normalized]
+    # Single source of truth for index long-form/short-form aliases (see
+    # data/index_aliases.py). This used to hand-duplicate its own partial
+    # candidate table covering only NIFTY <-> "NIFTY 50" -- BANKNIFTY,
+    # FINNIFTY and MIDCPNIFTY had no equivalent, so /ml/ohlc_forecast/
+    # BANKNIFTY and the other callers of this function (equity/OHLCV chart
+    # range, forecast input frame) silently saw 0 rows for those symbols the
+    # same way NIFTY did before that specific fix.
+    return index_symbol_candidates(normalized) or [normalized]
 
 
 def _redis_symbol(symbol: str) -> str:

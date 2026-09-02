@@ -6,6 +6,7 @@ from typing import Any
 import pandas as pd
 import pandas_ta as ta
 
+from data.index_aliases import index_symbol_candidates
 from db.duckdb_client import DB_WRITE_LOCK, writer_connection
 from db.write_service import ReadOperation, resolve_read
 
@@ -69,7 +70,12 @@ def _load_nifty_ohlcv() -> tuple[pd.DataFrame, str | None]:
 
 
 def _load_symbol_ohlcv(symbol: str) -> tuple[pd.DataFrame, str | None]:
-    candidates = ("NIFTY", "NIFTY 50") if symbol in {"NIFTY", "NIFTY 50"} else (symbol,)
+    # Single source of truth for index long-form/short-form aliases (see
+    # data/index_aliases.py). This used to hand-duplicate its own partial
+    # candidate table -- only NIFTY <-> "NIFTY 50", never BANKNIFTY <->
+    # "NIFTY BANK" / FINNIFTY / MIDCPNIFTY -- the same bug class as
+    # ml/stock_trainer.py's _load_ohlcv.
+    candidates = index_symbol_candidates(symbol) or (symbol,)
     for candidate in candidates:
         result = resolve_read(ReadOperation.LOAD_SYMBOL_OHLCV_FOR_BACKFILL, {"symbol": candidate})
         frame = pd.DataFrame(

@@ -7,6 +7,7 @@ from typing import Any, Callable
 import pandas as pd
 
 from backtest.spot_quality import verified_spot_sources
+from data.index_aliases import index_symbol_candidates
 from db.write_service import ReadOperation, resolve_read
 from ml.feature_engineering import build_context
 from ml.models import (
@@ -325,14 +326,15 @@ class StockModelTrainer:
         )
 
     def _load_ohlcv(self, symbol: str) -> pd.DataFrame:
-        if symbol == "NIFTY":
-            candidates = ["NIFTY"]
-        elif symbol == "NIFTY 50":
-            candidates = ["NIFTY 50", "NIFTY"]
-        elif symbol == "BANKNIFTY":
-            candidates = ["BANKNIFTY", "BANK NIFTY", "NIFTY BANK"]
-        else:
-            candidates = [symbol]
+        # Single source of truth for index long-form/short-form aliases (see
+        # data/index_aliases.py). This used to be a hand-duplicated candidate
+        # table here that only ever queried the literal "NIFTY" -- never the
+        # "NIFTY 50" key the verified NSE_INDEX_BHAVCOPY rows are actually
+        # stored under -- so every NIFTY training run since the index-quality
+        # source-filter tightened has silently seen 0 eligible rows and
+        # failed "insufficient data" while BANKNIFTY (whose hand-written
+        # candidate list happened to include its long forms) kept working.
+        candidates = index_symbol_candidates(symbol) or [symbol]
         sources = sorted(verified_spot_sources(symbol))
         result = resolve_read(
             ReadOperation.LOAD_VERIFIED_SOURCE_OHLCV,

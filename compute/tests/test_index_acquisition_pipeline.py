@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import datetime
 from pathlib import Path
 
 import duckdb
 import pytest
 
+from auto_collector import smart_collector
 from db.bhav_loader import _insert_ohlcv_rows, _parse_index_csv
 from db.duckdb_client import _create_schema_objects_at, _writer_transaction_scope, open_read_connection
 from db.migrations import migrate_database
+from db.write_service import WriteOperation
 from db.writer_lease import release_writer_lease, require_writer_lease
 
 
@@ -114,3 +117,95 @@ def test_no_fo_rows_participate_in_index_ingestion(index_db: Path) -> None:
     finally:
         con.close()
     assert fo_count == 0
+
+
+# ---- collector scheduling regression --------------------------------------
+#
+# Root cause of the NIFTY 50 index-history freshness gap (audited 2026-09-02):
+# db.bhav_loader.download_index_bhav/load_date_range existed and worked, but
+# were wired ONLY into main.py's one-shot startup seed (`if count < 200`),
+# which permanently stops firing once the table clears that threshold. There
+# was no entry in smart_collector.TASK_RUNNERS and no pending-task detection
+# for it at all, so the dataset silently stopped advancing forever while
+# every other scheduled dataset (equity, F&O, FII/DII, signals, BIF) kept
+# updating daily. These tests pin the fix: a real recurring "bhavcopy_index"
+# task, discovered as pending once "ohlcv" WHERE symbol='NIFTY 50' falls
+# behind, that reuses the existing parse function and the generic
+# INGEST_OHLCV writer op (no new writer surface introduced).
+
+
+def test_bhavcopy_index_task_is_registered() -> None:
+    assert "bhavcopy_index" in smart_collector.TASK_RUNNERS
+    assert smart_collector.TASK_RUNNERS["bhavcopy_index"] is smart_collector.run_bhavcopy_index
+
+
+def test_run_bhavcopy_index_inserts_via_generic_ingest_writer_op(monkeypatch: pytest.MonkeyPatch) -> None:
+    sample_rows = _parse_index_csv(INDEX_CSV)
+    assert sample_rows  # fixture sanity: NIFTY 50 + NIFTY BANK rows parsed
+
+    monkeypatch.setattr("db.bhav_loader.download_index_bhav", lambda day: sample_rows)
+
+    captured: dict[str, object] = {}
+
+    def fake_submit_write(operation, payload):
+        captured["operation"] = operation
+        captured["payload"] = payload
+        return {"inserted": len(payload["rows"])}
+
+    monkeypatch.setattr(smart_collector, "submit_write", fake_submit_write)
+    monkeypatch.setattr(smart_collector, "row_count_for_date", lambda dataset, for_date: len(sample_rows))
+
+    details = smart_collector.run_bhavcopy_index(datetime.date(2024, 1, 2))
+
+    assert captured["operation"] is WriteOperation.INGEST_OHLCV
+    assert captured["payload"] == {"rows": sample_rows}
+    assert details == f"inserted={len(sample_rows)} rows_on_date={len(sample_rows)}"
+
+
+def test_run_bhavcopy_index_holiday_is_quiet_wait_not_loud_fail(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("db.bhav_loader.download_index_bhav", lambda day: None)
+
+    details = smart_collector.run_bhavcopy_index(datetime.date(2024, 1, 26))
+    assert "not_available_yet" in details
+
+    success, returned_details = smart_collector.run_task("bhavcopy_index", datetime.date(2024, 1, 26))
+    assert success is False
+    assert "not_available_yet" in returned_details
+
+
+def test_stale_nifty_index_history_is_scheduled_as_pending(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The exact defect reproduced: equity/F&O are fresh (no pending task) but
+    the index table ('ohlcv' filtered to symbol='NIFTY 50') is 10 trading days
+    behind -- get_pending_tasks must surface a catch-up bhavcopy_index task
+    instead of silently never noticing."""
+    today = datetime.date(2026, 9, 2)
+    monkeypatch.setattr(smart_collector, "ist_today", lambda: today)
+    monkeypatch.setattr(smart_collector, "ist_hour", lambda: 17.0)
+    monkeypatch.setattr(smart_collector, "instrument_master_age_hours", lambda: 0.0)
+    monkeypatch.setattr(smart_collector, "task_done", lambda *_args: False)
+    monkeypatch.setattr(smart_collector, "days_since_last_success", lambda *_args: 0)
+    monkeypatch.setattr(
+        smart_collector,
+        "ensure_fii_dii_table",
+        lambda: (_ for _ in ()).throw(RuntimeError("fii/dii not exercised in this test")),
+    )
+
+    def latest(dataset: str, symbol: str | None = None):
+        values = {
+            ("ohlcv", None): today,
+            ("fo_eod", None): today,
+            ("ohlcv", "NIFTY 50"): today - datetime.timedelta(days=12),
+            ("signals_source_ohlcv", "NIFTY 50"): today,
+            ("signals_history", "NIFTY"): today,
+            ("bif_history", "NIFTY"): today,
+        }
+        return values[(dataset, symbol)]
+
+    monkeypatch.setattr(smart_collector, "latest_date_in", latest)
+
+    pending = smart_collector.get_pending_tasks()
+
+    index_tasks = [item for item in pending if item["task"] == "bhavcopy_index"]
+    assert index_tasks, "stale NIFTY 50 index history must produce a pending bhavcopy_index task"
+    assert all(item["priority"] == 2 for item in index_tasks)
+    assert all(item["date"] > today - datetime.timedelta(days=12) for item in index_tasks)

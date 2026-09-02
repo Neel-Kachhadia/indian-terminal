@@ -31,6 +31,25 @@ from db.duckdb_client import (
 from db.writer_lease import require_writer_lease
 
 
+# fo_eod underlying symbols include index/currency/commodity derivative
+# underlyings (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, NIFTYFPI, NIFTYNXT50,
+# ...) alongside real equity underlyings. The equity stock screener/universe
+# and the per-symbol equity ML trainer must only ever see real NSE cash-equity
+# underlyings -- an index has no per-share screener metrics and must not be
+# ranked/trained as if it were a stock (it already has its own dedicated
+# index-level pipeline; see ml/trainer.py::train_all_models()). Rather than a
+# hardcoded symbol blocklist (which silently misses new index/derivative
+# underlyings as NSE adds them -- exactly how this was found: FINNIFTY and
+# MIDCPNIFTY were excluded by name but NIFTY, BANKNIFTY, NIFTYFPI and
+# NIFTYNXT50 were not), this checks real NSE-EQ instrument-master membership.
+_FNO_EQUITY_UNDERLYING_FILTER_SQL = """
+    EXISTS (
+        SELECT 1 FROM instruments i
+        WHERE i.exchange = 'NSE' AND i.instrument_type = ''
+          AND i.symbol = fo_eod.symbol || '-EQ'
+    )
+"""
+
 QUEUE_CAPACITY = 256
 QUEUE_COMPACT_THRESHOLD_BYTES = 64 * 1024 * 1024
 COMPLETED_READ_RETENTION_SECONDS = 10 * 60
@@ -1545,10 +1564,11 @@ def _dispatch_read(
         }
     if operation is ReadOperation.LOAD_FNO_UNIVERSE_SYMBOLS:
         rows = connection.execute(
-            """
+            f"""
             SELECT DISTINCT symbol
             FROM fo_eod
             WHERE date = (SELECT MAX(date) FROM fo_eod)
+              AND {_FNO_EQUITY_UNDERLYING_FILTER_SQL}
             ORDER BY symbol
             """
         ).fetchall()
@@ -1640,11 +1660,11 @@ def _dispatch_read(
         return {"rows": [list(row) for row in rows]}
     if operation is ReadOperation.LOAD_STOCK_TRAINER_FNO_SYMBOLS:
         rows = connection.execute(
-            """
+            f"""
             SELECT DISTINCT symbol
             FROM fo_eod
             WHERE date = (SELECT MAX(date) FROM fo_eod)
-              AND symbol NOT IN ('FINNIFTY', 'MIDCPNIFTY')
+              AND {_FNO_EQUITY_UNDERLYING_FILTER_SQL}
             ORDER BY symbol
             """
         ).fetchall()

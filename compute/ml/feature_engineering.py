@@ -15,6 +15,7 @@ from data.market_data_quality import (
     evaluate_market_bar,
 )
 from db.write_service import ReadOperation, resolve_read
+from data.index_aliases import index_symbol_candidates
 
 
 TRADING_DAYS = 252
@@ -346,14 +347,7 @@ def _ohlcv_features(ohlcv: pd.DataFrame) -> pd.DataFrame:
 
 
 def _symbol_candidates(symbol: str) -> list[str]:
-    upper = symbol.strip().upper()
-    if upper == "NIFTY":
-        return ["NIFTY"]
-    if upper == "NIFTY 50":
-        return ["NIFTY 50", "NIFTY"]
-    if upper == "BANKNIFTY":
-        return ["BANKNIFTY", "NIFTY BANK"]
-    return [upper]
+    return index_symbol_candidates(symbol)
 
 
 def _join_feature_history(ohlcv_features: pd.DataFrame, signal_history: pd.DataFrame) -> pd.DataFrame:

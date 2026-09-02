@@ -57,3 +57,29 @@ CANONICAL_INDEX_SYMBOLS: tuple[str, ...] = (
     "FINNIFTY",
     "MIDCPNIFTY",
 )
+
+
+def index_symbol_candidates(symbol: str) -> list[str]:
+    """Return DB lookup names for an index without losing the caller's alias.
+
+    The persisted NSE index bhavcopy uses long instrument names (for example
+    ``NIFTY 50``), while live callers generally use the short feed symbol
+    (``NIFTY``).  Consumers must query both representations in deterministic
+    preference order.  Non-index symbols pass through unchanged.
+    """
+    original = " ".join(str(symbol or "").strip().upper().split())
+    normalized = original.replace(" ", "")
+    canonical = next(
+        (
+            short
+            for short in CANONICAL_INDEX_SYMBOLS
+            if normalized in INDEX_FEED_ALIASES[short]
+            or original == INDEX_CANONICAL_NAME[short]
+        ),
+        None,
+    )
+    if canonical is None:
+        return [original] if original else []
+
+    ordered = [INDEX_CANONICAL_NAME[canonical], canonical, original]
+    return list(dict.fromkeys(value for value in ordered if value))
