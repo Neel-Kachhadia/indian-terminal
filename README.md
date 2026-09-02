@@ -1,155 +1,222 @@
-# Indian Market Terminal
+# BharatTerminal
 
-A local-first desktop market terminal for Indian equity and F&O research.
+> **Local-first market intelligence and analytics for Indian equities and derivatives.**
 
-Indian Market Terminal is a native Tauri app with a React frontend, a Rust core,
-and a Python FastAPI compute service. It is designed to bring live NIFTY data,
-option-chain analytics, Greeks, IV surface views, technical indicators,
-screeners, alerts, strategy payoff diagrams, and futures basis analysis into
-one local desktop application.
+BharatTerminal is a native desktop research terminal for the Indian equity and F&O markets. It combines a **Tauri desktop shell**, **React + TypeScript interface**, **Rust runtime**, and a **Python/FastAPI analytics service** to provide market data, options analytics, technical studies, screening, risk views, and research workflows from one local application.
 
-> Status: active Phase 1 scaffold. This is not production trading software yet.
+The architecture is deliberately local-first: market data, analytical compute, credentials, and persistent state remain on the user's machine wherever possible.
 
-## What This App Does
+> **Scope:** research and analytical workflows. BharatTerminal does not place live broker orders and is not financial advice.
 
-- Runs as a native desktop app through Tauri v2.
-- Uses React 18 and TypeScript for the terminal UI.
-- Uses Rust for app startup, Tauri IPC, Redis-backed live data reads, token-free
-  WebSocket ingestion, option-chain polling, and alert evaluation.
-- Uses Python FastAPI for analytical compute, NSE data proxying, historical
-  OHLCV loading, indicators, screeners, payoff, IV surface, and futures basis.
-- Stores short-lived live data in Redis.
-- Stores historical market data in DuckDB.
-- Stores alert definitions in SQLite.
+---
 
-The project is local-first: market data cache, compute, and storage all run on
-the user's machine.
+## Highlights
 
-## Current Implementation Status
+- Native Windows desktop application built with **Tauri v2**
+- Live NIFTY market-data ingestion through **Angel One SmartAPI**
+- NSE option-chain and historical-data integration
+- Technical indicators: **EMA, SMA, RSI, MACD, Bollinger Bands**
+- Options analytics: **Greeks, IV, IV surface, skew, term structure**
+- Strategy payoff and net-Greeks analysis
+- Equity/F&O screening and market research views
+- Futures basis and carry analysis
+- Historical storage with **DuckDB**
+- Short-lived live cache with **Redis**
+- Alert/config persistence with **SQLite**
+- Secure credential provisioning through **Windows Credential Manager**
+- Signed release-integrity checks and fail-closed runtime behavior
 
-Implemented or partially implemented:
-
-- Tauri app shell and command registration.
-- React terminal layout with panels for price, charts, options chain, IV
-  surface, screener, alerts, and strategy lab.
-- Rust startup path that launches background ingester, poller, alert engine, and
-  Python subprocess.
-- Angel One SmartAPI authentication uses only Windows secure credential storage;
-  raw credentials and session tokens never cross into the frontend or Tauri IPC.
-- NIFTY WebSocket ingestion resolves the current NSE index token from the canonical instrument master before authentication/subscription.
-- Redis cache for `tick:NIFTY`, option chain, and PCR.
-- NSE option-chain polling through the local Python `/chain/NIFTY` endpoint.
-- Greeks enrichment through Python `/greeks`.
-- DuckDB schema initialization and NIFTY OHLCV seeding.
-- Lightweight Charts candlestick chart with EMA, RSI, MACD, and Bollinger Band
-  overlays.
-- Plotly IV surface, skew, term structure, payoff, and futures basis charts.
-- SQLite-backed alerts with in-app banners and desktop notifications.
-
-Known incomplete areas:
-
-- `src-tauri/src/historical.rs` is still a placeholder.
-- `get_chain_greeks`, `get_market_status`, `get_instrument_list`, and
-  `download_historical` are currently stubs.
-- Frontend panels poll for data instead of using a complete event-push model.
-- Redis must be available locally.
-- The automatic historical seed focuses on NIFTY index data, not complete
-  NIFTY50 equity history.
-- F&O EOD history is required before futures basis can show historical data.
-- The app is research-only. Live order placement is out of scope for Phase 1.
+---
 
 ## Architecture
 
 ```text
-External data
-  |-- Angel One SmartAPI WebSocket
-  |-- NSE public option-chain and bhav endpoints
-  v
-Rust / Tauri core
-  |-- app startup
-  |-- shared state
-  |-- token-free WebSocket ingester
-  |-- option-chain poller
-  |-- alert engine
-  |-- Tauri IPC commands
-  |-- Python subprocess launcher
-  v
-Local services and storage
-  |-- Redis live cache
-  |-- DuckDB market history
-  |-- SQLite alerts/config
-  |-- FastAPI compute service + secure Angel authentication/feed bridge
-  v
-React UI
-  |-- chart panel
-  |-- options chain
-  |-- IV surface
-  |-- screener
-  |-- alerts
-  |-- strategy lab
+External Market Sources
+│
+├── Angel One SmartAPI / WebSocket
+└── NSE public market endpoints
+        │
+        ▼
+┌──────────────────────────────┐
+│       Rust / Tauri Core      │
+│                              │
+│ • application lifecycle      │
+│ • live-feed ingestion        │
+│ • Tauri IPC                  │
+│ • option-chain polling       │
+│ • alert processing           │
+│ • Python supervision         │
+└──────────────┬───────────────┘
+               │
+     ┌─────────┼──────────┐
+     ▼         ▼          ▼
+  Redis      DuckDB     SQLite
+ live data   history    alerts/config
+               │
+               ▼
+┌──────────────────────────────┐
+│   Python / FastAPI Compute   │
+│                              │
+│ • indicators                 │
+│ • screeners                  │
+│ • options analytics          │
+│ • IV surfaces                │
+│ • payoff / futures basis     │
+│ • historical data            │
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│    React + TypeScript UI     │
+│ charts • options • risk      │
+│ signals • models • research  │
+└──────────────────────────────┘
 ```
 
-React talks to Rust through Tauri IPC commands. Rust either reads local stores
-directly or proxies analytical requests to Python at `127.0.0.1:8765`.
+React communicates with the local Tauri runtime through IPC. Rust reads local stores directly where appropriate and proxies analytical requests to the loopback FastAPI service on `127.0.0.1:8765`.
 
-## Tech Stack
+---
+
+## Technology Stack
 
 | Layer | Technology |
 |---|---|
 | Desktop shell | Tauri v2 |
-| Rust runtime | Tokio |
-| Rust HTTP/WebSocket | reqwest, tokio-tungstenite |
 | Frontend | React 18, TypeScript, Vite |
-| State | Zustand |
-| Charts | lightweight-charts, Plotly.js |
+| Frontend state | Zustand |
+| Charts | Lightweight Charts, Plotly.js |
+| Rust runtime | Tokio |
+| Rust networking | reqwest, tokio-tungstenite |
 | Python API | FastAPI, uvicorn |
-| Options math | py_vollib, py_vollib_vectorized |
-| Indicators | pandas, pandas-ta-openbb |
-| Storage | Redis, DuckDB, SQLite |
+| Options analytics | py_vollib, py_vollib_vectorized |
+| Technical analysis | pandas, pandas-ta-openbb |
+| Historical storage | DuckDB |
+| Live cache | Redis |
+| Alert/config storage | SQLite |
+| Credential storage | Windows Credential Manager |
 
-## Project Layout
+---
+
+## Core Capabilities
+
+### Market Data
+
+- Angel One SmartAPI authentication
+- NIFTY WebSocket ingestion
+- NSE option-chain polling
+- Historical OHLCV access
+- Instrument-token resolution
+- Local cache and persistence
+
+### Technical Analysis
+
+- Candlestick and volume views
+- EMA / SMA
+- RSI
+- MACD
+- Bollinger Bands
+- Indicator overlays
+- Screening workflows
+
+### Options & Volatility
+
+- Option-chain inspection
+- Put-call ratio
+- IV and Greeks
+- IV surface
+- Volatility skew
+- Term structure
+- Strategy payoff diagrams
+- Net strategy Greeks
+
+### Research & Risk
+
+The application includes research-oriented modules for screeners, signals, risk, backtesting controls, futures basis, market intelligence, and model-status views.
+
+Unavailable or insufficient data is intended to be represented honestly rather than replaced with fabricated values.
+
+---
+
+## Security Model
+
+BharatTerminal is designed around explicit local trust boundaries.
+
+### Credential handling
+
+Broker and API credentials are provisioned through the operator CLI and stored using the platform credential backend. On Windows this is backed by **Windows Credential Manager / DPAPI**.
+
+Credentials are not intended to be:
+
+- stored in plaintext configuration files,
+- passed through frontend state,
+- embedded in Tauri IPC messages,
+- supplied as normal command-line arguments,
+- committed to Git.
+
+### Runtime protections
+
+The application uses:
+
+- loopback-only internal services,
+- authenticated Redis deployment,
+- local API/process boundaries,
+- fail-closed credential handling,
+- release-resource integrity checks,
+- signed release manifests,
+- coordinated ownership for persistent database writes.
+
+> Never commit real credentials, private signing material, runtime databases, or generated authentication files.
+
+---
+
+## Repository Layout
 
 ```text
 .
-|-- README.md
-|-- package.json
-|-- pnpm-lock.yaml
-|-- vite.config.ts
-|-- tsconfig.json
-|-- tailwind.config.ts
-|-- index.html
-|-- src/
-|   |-- App.tsx
-|   |-- main.tsx
-|   |-- components/
-|   |-- hooks/
-|   `-- store/
-|-- src-tauri/
-|   |-- Cargo.toml
-|   |-- build.rs
-|   |-- tauri.conf.json
-|   `-- src/
-`-- compute/
-    |-- main.py
-    |-- requirements.txt
-    |-- db/
-    |-- futures/
-    |-- options/
-    `-- technical/
+├── README.md
+├── package.json
+├── pnpm-lock.yaml
+├── vite.config.ts
+├── tsconfig.json
+├── index.html
+├── src/                        # React + TypeScript frontend
+│   ├── App.tsx
+│   ├── main.tsx
+│   ├── components/
+│   ├── hooks/
+│   └── store/
+├── src-tauri/                  # Rust / Tauri runtime
+│   ├── Cargo.toml
+│   ├── build.rs
+│   ├── tauri.conf.json
+│   └── src/
+└── compute/                    # Python analytical backend
+    ├── main.py
+    ├── db/
+    ├── futures/
+    ├── options/
+    ├── technical/
+    ├── ml/
+    └── security/
 ```
 
+---
+
 ## Prerequisites
+
+For local development on Windows:
 
 - Node.js 20+
 - pnpm
 - Rust stable
 - Tauri CLI
 - Python 3.11+
-- Redis server
-- Visual Studio Build Tools with C++ workload on Windows
-- WebView2 Runtime on Windows
+- uv
+- Redis
+- Visual Studio Build Tools with the C++ workload
+- Microsoft WebView2 Runtime
 
-Quick checks:
+Quick verification:
 
 ```powershell
 node --version
@@ -157,24 +224,21 @@ pnpm --version
 rustc --version
 cargo --version
 python --version
+uv --version
 redis-cli ping
 ```
 
-`redis-cli ping` should return:
+---
 
-```text
-PONG
-```
+## Development Setup
 
-## Setup
-
-Install frontend dependencies:
+### 1. Frontend dependencies
 
 ```powershell
 pnpm install
 ```
 
-Create the canonical Python environment from the frozen lock:
+### 2. Python environment
 
 ```powershell
 cd compute
@@ -182,7 +246,7 @@ uv sync --frozen --all-groups
 cd ..
 ```
 
-Check Rust dependencies:
+### 3. Rust dependencies
 
 ```powershell
 cd src-tauri
@@ -190,287 +254,210 @@ cargo check
 cd ..
 ```
 
-## Running Locally
+---
 
-Start a loopback-only Redis configured with ACL/password authentication, then
-provide its authenticated URL through the protected process environment as
-`BHARATTERMINAL_REDIS_URL`:
+## Redis Configuration
 
-```powershell
-redis-server C:\path\to\loopback-authenticated-redis.conf
-```
+BharatTerminal expects a loopback-only Redis instance with authentication enabled.
 
-Secret-free deployment examples live in
-`deploy/redis/redis.conf.template` and `deploy/redis/users.acl.template`.
-Provision private runtime copies, replace every `__...__` placeholder with an
-absolute private path or generated credential, and set the protected process
-environment to `redis://bharatterminal:<credential>@127.0.0.1:6379/0`. Redis
-startup must fail if an unresolved placeholder remains. Generated ACL files and
-credentials are operator-owned runtime state and must never enter Git.
-
-Run the full desktop app:
-
-```powershell
-cargo tauri dev
-```
-
-Tauri dev mode starts the Vite server with:
-
-```powershell
-pnpm dev
-```
-
-The Rust app then attempts to launch:
-
-```powershell
-uv run --project compute --frozen python -m uvicorn main:app --host 127.0.0.1 --port 8765
-```
-
-Run the Python service manually during backend development:
-
-```powershell
-cd compute
-uv run --project . --frozen python -m uvicorn main:app --host 127.0.0.1 --port 8765 --reload
-```
-
-Health check:
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:8765/health/live
-```
-
-Frontend-only mode:
-
-```powershell
-pnpm dev
-```
-
-The Vite server listens on:
+Secret-free deployment templates live under:
 
 ```text
-http://127.0.0.1:5173
+deploy/redis/
 ```
+
+Provision private runtime copies and replace placeholders with operator-owned values. Runtime ACL files and credentials must remain outside Git.
+
+Example authenticated local URL:
+
+```text
+redis://bharatterminal:<credential>@127.0.0.1:6379/0
+```
+
+Expose it to the application through `BHARATTERMINAL_REDIS_URL`.
+
+---
 
 ## Secure Credential Provisioning
 
-BharatTerminal has no application Login or Demo workflow. It opens directly to
-the local dashboard. Angel-dependent features fail closed until credentials are
-available in Windows Credential Manager.
+BharatTerminal has no browser-style login or demo credential form. Angel-dependent functionality remains unavailable until valid credentials are provisioned securely.
 
-Provision once through the canonical interactive operator CLI. Values are read
-without terminal echo and never accepted as command-line arguments:
+From the repository:
 
 ```powershell
 cd compute
 uv run --frozen python main.py credentials provision
 ```
 
-For an installed release, run the installed sidecar from the application
-installation directory:
+For an installed release:
 
 ```powershell
 .\bharatterminal-compute.exe credentials provision
 ```
 
-Existing secure values are preserved. Replacing them requires deliberate use of
-`credentials provision --replace`. Check bounded availability without revealing
-values using `credentials status`. Normal startup never reads plaintext TXT or
-environment credential files. Never commit real credentials.
+Check availability without revealing values:
 
-## Runtime Storage
+```powershell
+.\bharatterminal-compute.exe credentials status
+```
+
+---
+
+## Running Locally
+
+### Full desktop app
+
+```powershell
+cargo tauri dev
+```
+
+### Python service only
+
+```powershell
+cd compute
+uv run --project . --frozen python -m uvicorn main:app --host 127.0.0.1 --port 8765 --reload
+```
+
+### Frontend only
+
+```powershell
+pnpm dev
+```
+
+Vite listens on:
+
+```text
+http://127.0.0.1:5173
+```
+
+---
+
+## Health Checks
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8765/health/live
+Invoke-RestMethod http://127.0.0.1:8765/ohlcv/NIFTY
+Invoke-RestMethod http://127.0.0.1:8765/chain/NIFTY
+```
+
+---
+
+## Local Storage
 
 ### Redis
 
-Used for short-lived live market cache.
+Representative short-lived keys:
 
-| Key | Value | TTL |
+| Key | Purpose | Typical TTL |
 |---|---|---:|
-| `tick:NIFTY` | JSON serialized `Tick` | 15-60s |
-| `chain:NIFTY:{expiry}` | JSON serialized `OptionLeg[]` | 15s |
-| `pcr:NIFTY:{expiry}` | PCR float string | 15s |
+| `tick:NIFTY` | Latest NIFTY tick | 15–60 s |
+| `chain:NIFTY:{expiry}` | Cached option chain | 15 s |
+| `pcr:NIFTY:{expiry}` | Put-call ratio | 15 s |
 
 ### DuckDB
 
-DuckDB path:
-
-```text
-~/.indian-terminal/data/terminal.db
-```
-
-Tables:
-
-- `ohlcv`
-- `fo_eod`
-- `iv_history`
+Used for historical market data and analytical state, including OHLCV, F&O EOD history, and IV-related history.
 
 ### SQLite
 
-SQLite alert/config path:
+Used for lightweight local state such as alerts and supporting runtime coordination.
 
-```text
-~/.indian-terminal/config.db
-```
+---
 
-Table:
-
-- `alerts`
-
-## Frontend Modules
-
-| Component | Purpose |
-|---|---|
-| `src/App.tsx` | Main terminal layout and quote polling |
-| `src/components/ChartPanel` | Candles, volume, and indicator overlays |
-| `src/components/OptionsChain` | Option chain table and PCR |
-| `src/components/IVSurface` | IV surface, skew, term structure |
-| `src/components/Screener` | Daily NIFTY50 screener UI |
-| `src/components/Alerts` | Alert creation, listing, deletion |
-| `src/components/StrategyLab` | Payoff diagrams and futures basis |
-| `src/store/quotes.ts` | Latest quote store |
-| `src/store/alerts.ts` | Alert list store |
-| `src/store/chain.ts` | Chain store scaffold |
-
-## Rust Modules
-
-| File | Purpose |
-|---|---|
-| `src-tauri/src/main.rs` | Tauri setup, background tasks, Python launch |
-| `src-tauri/src/state.rs` | Shared app state |
-| `src-tauri/src/models.rs` | Shared serializable structs |
-| `src-tauri/src/commands.rs` | Tauri IPC commands |
-| `src-tauri/src/auth.rs` | Angel One env/TOTP authentication |
-| `src-tauri/src/ingester.rs` | NIFTY SmartAPI WebSocket ingestion |
-| `src-tauri/src/poller.rs` | Option-chain polling and Greeks enrichment |
-| `src-tauri/src/alert_engine.rs` | SQLite alerts and trigger evaluation |
-| `src-tauri/src/historical.rs` | Placeholder historical module |
-
-## Python Modules
-
-| File | Purpose |
-|---|---|
-| `compute/main.py` | FastAPI app and endpoint registration |
-| `compute/db/duckdb_client.py` | DuckDB path and schema |
-| `compute/db/bhav_loader.py` | NSE bhav copy download/load helpers |
-| `compute/options/greeks.py` | IV and Greeks computation |
-| `compute/options/iv_surface.py` | IV surface/skew/term structure shaping |
-| `compute/options/payoff.py` | Strategy payoff and net Greeks |
-| `compute/technical/indicators.py` | EMA, SMA, RSI, MACD, Bollinger Bands |
-| `compute/technical/screener.py` | NIFTY50 daily screener |
-| `compute/futures/basis.py` | Futures basis and annualised carry |
-
-## Tauri Commands
-
-| Command | Status | Description |
-|---|---|---|
-| `get_quote` | Implemented | Reads latest tick from Redis |
-| `get_chain` | Implemented | Reads option chain from Redis |
-| `get_pcr` | Implemented | Reads PCR from Redis |
-| `get_ohlcv` | Implemented | Proxies to Python `/ohlcv/{symbol}` |
-| `get_expiries` | Implemented | Proxies to Python `/expiries/{symbol}` |
-| `get_iv_surface` | Implemented | Proxies to Python `/iv_surface/{symbol}` |
-| `get_payoff` | Implemented | Proxies to Python `/payoff` |
-| `get_futures_basis` | Implemented | Proxies to Python futures endpoint |
-| `get_screener_results` | Implemented | Proxies to Python `/screener` |
-| `get_indicators` | Implemented | Proxies to Python `/indicators` |
-| `set_alert` | Implemented | Saves alert in SQLite |
-| `delete_alert` | Implemented | Deletes alert from SQLite |
-| `get_alerts` | Implemented | Loads alerts from SQLite |
-| `get_chain_greeks` | Stub | Returns empty list |
-| `get_market_status` | Stub | Returns closed |
-| `get_instrument_list` | Stub | Returns empty list |
-| `download_historical` | Stub | Returns queued status |
-
-## FastAPI Endpoints
-
-| Method | Path | Description |
-|---|---|---|
-| GET | `/health` | Service health |
-| POST | `/greeks` | Compute chain Greeks |
-| POST | `/indicators` | Compute technical indicators |
-| POST | `/screener` | Run screener |
-| POST | `/payoff` | Compute strategy payoff |
-| GET | `/futures/basis/{symbol}` | Futures basis |
-| GET | `/chain/{symbol}` | NSE chain proxy |
-| GET | `/expiries/{symbol}` | Next expiries |
-| GET | `/iv_surface/{symbol}` | IV surface from Redis chain |
-| GET | `/ohlcv/{symbol}` | Historical OHLCV |
-| POST | `/ingest/bhav` | Insert OHLCV rows |
-| POST | `/download/historical` | Start bhav download |
-| GET | `/download/status` | Download progress |
-
-## Key Data Contracts
+## Data Contracts
 
 ### Tick
 
 ```text
-symbol, token, ltp, open, high, low, close, volume, oi, bid, ask, timestamp, exchange
+symbol, token, ltp, open, high, low, close, volume, oi,
+bid, ask, timestamp, exchange
 ```
 
-### OptionLeg
+### Option Leg
 
 ```text
-symbol, expiry, strike, option_type, ltp, bid, ask, volume, oi, oi_change,
-iv, delta, gamma, theta, vega
+symbol, expiry, strike, option_type, ltp, bid, ask, volume,
+oi, oi_change, iv, delta, gamma, theta, vega
 ```
 
-### Alert
+### Strategy Leg
 
 ```text
-id, symbol, alert_type, threshold, condition, active, triggered_at, created_at
+symbol, strike, expiry, option_type, action, quantity,
+entry_price, lot_size
 ```
 
-### StrategyLeg
+---
 
-```text
-symbol, strike, expiry, option_type, action, quantity, entry_price, lot_size
-```
+## Validation
 
-## Build and Validation Commands
-
-Build frontend:
+### Frontend
 
 ```powershell
 pnpm build
 ```
 
-Check Rust:
+### Rust
 
 ```powershell
 cd src-tauri
-cargo check
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+cd ..
 ```
 
-Run Rust tests:
-
-```powershell
-cd src-tauri
-cargo test
-```
-
-Compile Python files:
+### Python
 
 ```powershell
 cd compute
-uv run --project . --frozen python -m py_compile main.py options\greeks.py options\payoff.py
+uv run --frozen pytest -q
+cd ..
 ```
+
+### Release
+
+Use the repository's canonical release pipeline and release-integrity gate rather than manually assembling production artifacts.
+
+A production release should verify:
+
+- source-fingerprint coherence,
+- frozen Python runtime integrity,
+- frontend build success,
+- Rust/Tauri release success,
+- resource-manifest integrity,
+- release-signature validity,
+- installer generation,
+- absence of developer-machine paths and secrets in release artifacts.
+
+---
+
+## Engineering Principles
+
+1. **Fail closed on unavailable data.** Missing or unverified market/model data must not become plausible-looking values.
+2. **Keep reads observational.** GET/read paths should not mutate persistent state.
+3. **Coordinate database writes.** DuckDB mutation is controlled through the application's writer boundary.
+4. **Keep internal services local.** Internal APIs are bound to loopback by default.
+5. **Keep secrets out of application content.** Credentials belong in the OS credential store, not source, logs, frontend state, or release bundles.
+6. **Separate source from generated artifacts.** Build products, caches, test databases, and local runtime state are not production source.
+7. **Verify releases cryptographically and structurally.** Production artifacts must pass release-integrity gates.
+
+---
 
 ## Troubleshooting
 
-### "Connecting..." stays on screen
+### Application remains in `CONNECTING`
 
-Check Redis and `tick:NIFTY`:
+Verify:
 
-```powershell
-redis-cli --askpass ping
-redis-cli --askpass get tick:NIFTY
-```
+- Redis is running and authenticated.
+- The local compute service is healthy.
+- Angel credentials are provisioned.
+- NIFTY instrument resolution succeeds.
+- Collector/watchdog processes are healthy.
+- The exchange/feed is available for the current session.
 
-Also verify Angel One environment variables are present if relying on WebSocket
-ticks.
-
-### Python service is unavailable
-
-Run it manually:
+### Python service unavailable
 
 ```powershell
 cd compute
@@ -479,53 +466,43 @@ uv run --project . --frozen python -m uvicorn main:app --host 127.0.0.1 --port 8
 
 ### Chart has no data
 
-Check:
-
 ```powershell
 Invoke-RestMethod "http://127.0.0.1:8765/ohlcv/NIFTY"
-Invoke-RestMethod "http://127.0.0.1:8765/download/status"
 ```
 
-### Chain does not load
-
-Check:
+### Option chain does not load
 
 ```powershell
 Invoke-RestMethod "http://127.0.0.1:8765/chain/NIFTY"
-redis-cli keys "chain:*"
+redis-cli --askpass keys "chain:*"
 ```
 
-### Greeks are blank
+NSE endpoints may rate-limit or change behavior.
 
-Verify Python packages:
+---
 
-```powershell
-cd compute
-uv run --project . --frozen python -c "import py_vollib; print('py_vollib ok')"
-```
+## Project Status
 
-Greeks may also be blank for illiquid legs or values rejected by validation.
+BharatTerminal has evolved beyond an initial desktop scaffold into an integrated local research terminal with live-data, analytics, storage, security, packaging, and release-validation paths.
 
-## Roadmap
+The project remains intentionally **research-oriented**. Live broker order placement is outside the current scope.
 
-Phase 1 focuses on research and analysis:
+Ongoing development may include broader instrument coverage, deeper historical datasets, additional model validation, richer event-driven UI updates, expanded research tooling, and sustained-load performance work.
 
-- Live quotes.
-- Historical OHLCV.
-- Options chain.
-- Greeks and IV.
-- IV surface.
-- Indicators and screener.
-- Strategy lab.
-- Alerts.
+---
 
-Future phases may include paper trading, live trading connectivity, and
-backtesting, but live order placement is intentionally not part of this phase.
+## Disclaimer
 
-## Caveats
+BharatTerminal is an engineering and market-research project.
 
-- This is not financial advice.
-- Do not use unverified calculations for live trading.
-- NSE public endpoints can rate-limit or change behavior.
-- Some modules still use placeholders or partial implementations.
-- Keep credentials out of Git.
+- It does **not** constitute investment advice.
+- Market data may be delayed, incomplete, unavailable, or affected by upstream providers.
+- Analytical outputs and model results should be independently validated before financial decisions.
+- Broker credentials and API keys remain the operator's responsibility.
+- Live order execution is outside the current application scope.
+
+---
+
+## License
+
+No license is declared in this README. Add an explicit project license before public redistribution or accepting external contributions under defined licensing terms.
