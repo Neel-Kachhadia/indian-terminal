@@ -20,12 +20,22 @@ VRC_SCORE = {
     "LATE CONTRACTION": 50.0,
 }
 
-
 NFVE_SCORE = {
     "UNDERVALUED": 70.0,
     "FAIRLY_VALUED": 50.0,
     "OVERVALUED": 30.0,
 }
+
+WEIGHTS = {
+    "bms": 0.25,
+    "ngi": 0.15,
+    "iad": 0.20,
+    "vrc": 0.15,
+    "nfve": 0.10,
+    "ml": 0.15,
+}
+MINIMUM_COMPONENTS = 2
+MINIMUM_WEIGHT_COVERAGE = 0.35
 
 
 def compute_cds(
@@ -38,69 +48,73 @@ def compute_cds(
     *,
     decision_evidence: RecommendationEvidence | dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """Composite score over observed, valid components only.
+
+    Missing components are excluded and weights are renormalized.  Confidence
+    is dispersion agreement multiplied by original-weight coverage, so sparse
+    neutral inputs cannot produce a high-confidence CDS.
     """
-    Composite Decision Score from five BIF indicators plus ML ensemble.
-    """
-    bms_norm = (_number(bms.get("bms"), 0.0) + 100.0) / 2.0
-    ngi_norm = (_number(ngi.get("ngi"), 0.0) + 100.0) / 2.0
-    iad_norm = (_number(iad.get("iad_score"), 0.0) + 100.0) / 2.0
-    # vrc is only usable when the volatility clock actually resolved a regime
-    # (clock_label in VRC_SCORE). An unavailable-IV/insufficient-history read
-    # (vol_clock.py's "NO_DATA"/"INSUFFICIENT_HISTORY" reason codes, is_valid
-    # False) must not silently inject a fabricated neutral-or-real score into
-    # the composite decision -- it is excluded and the remaining weights are
-    # renormalized instead.
-    vrc_label = str(vrc.get("clock_label") or "").upper()
-    vrc_norm = VRC_SCORE.get(vrc_label) if vrc.get("is_valid") else None
-    nfve_norm = NFVE_SCORE.get(str(nfve.get("valuation") or "").upper(), 50.0)
-    ml_norm = _ml_up_probability(ml_prediction) * 100.0
     model_eligibility = model_output_eligibility(
         ml_prediction,
         evidence=decision_evidence,
     )
-    if not model_eligibility.eligible:
-        ml_norm = 50.0
-
-    weights = {
-        "bms": 0.25,
-        "ngi": 0.15,
-        "iad": 0.20,
-        "vrc": 0.15,
-        "nfve": 0.10,
-        "ml": 0.15,
+    candidates = {
+        "bms": _signed_component(bms, "bms"),
+        "ngi": _signed_component(ngi, "ngi"),
+        "iad": _signed_component(iad, "iad_score"),
+        "vrc": _vrc_component(vrc),
+        "nfve": _nfve_component(nfve),
+        "ml": _ml_component(ml_prediction, model_eligibility.eligible),
     }
     available = {
-        "bms": _clamp(bms_norm, 0.0, 100.0),
-        "ngi": _clamp(ngi_norm, 0.0, 100.0),
-        "iad": _clamp(iad_norm, 0.0, 100.0),
-        "nfve": _clamp(nfve_norm, 0.0, 100.0),
-        "ml": _clamp(ml_norm, 0.0, 100.0),
+        name: score for name, score in candidates.items() if score is not None
     }
-    if vrc_norm is not None:
-        available["vrc"] = _clamp(vrc_norm, 0.0, 100.0)
+    coverage = sum(WEIGHTS[name] for name in available) / sum(WEIGHTS.values())
+    analytical_valid = (
+        len(available) >= MINIMUM_COMPONENTS
+        and coverage >= MINIMUM_WEIGHT_COVERAGE
+    )
 
-    scores = {key: available.get(key) for key in weights}
-    weight_total = sum(weights[key] for key in available)
-    cds = sum(available[key] * weights[key] for key in available) / weight_total
+    cds = None
+    confidence = None
+    label = None
+    proposed_action = "FLAT"
+    strength = "NONE"
+    if analytical_valid:
+        weight_total = sum(WEIGHTS[name] for name in available)
+        cds = sum(available[name] * WEIGHTS[name] for name in available) / weight_total
+        anomaly_score, anomaly_flag, anomaly_valid = _anomaly(ml_prediction)
+        anomaly_gate = anomaly_valid and (
+            anomaly_flag is True
+            or (anomaly_score is not None and anomaly_score > 0.7)
+        )
+        if anomaly_gate:
+            cds = 50.0 + (cds - 50.0) * 0.2
+        confidence = _confidence(list(available.values()), coverage)
+        label, proposed_action, strength = _decision(cds)
+    else:
+        anomaly_gate = False
 
-    anomaly_score, anomaly_flag = _anomaly(ml_prediction)
-    anomaly_gate = anomaly_flag or anomaly_score > 0.7
-    if anomaly_gate:
-        cds = 50.0 + (cds - 50.0) * 0.2
-
-    confidence = _confidence(list(available.values()))
-    label, action, strength = _decision(cds)
-    recommendation_state = actionable_state(model_eligibility, action)
+    recommendation_state = actionable_state(model_eligibility, proposed_action)
     if recommendation_state != "ACTIONABLE":
-        action = "UNVALIDATED" if recommendation_state == "UNVALIDATED" else "FLAT"
+        proposed_action = "UNVALIDATED" if recommendation_state == "UNVALIDATED" else "FLAT"
         strength = "NONE"
 
     eligibility_payload = model_eligibility.to_dict()
+    reasons = {
+        "bms": _component_reason(bms, candidates["bms"]),
+        "ngi": _component_reason(ngi, candidates["ngi"]),
+        "iad": _component_reason(iad, candidates["iad"]),
+        "vrc": _component_reason(vrc, candidates["vrc"]),
+        "nfve": _component_reason(nfve, candidates["nfve"]),
+        "ml": None if candidates["ml"] is not None else "MODEL_OUTPUT_INELIGIBLE",
+    }
     return {
-        "cds": round(_clamp(cds, 0.0, 100.0), 3),
+        "cds": round(_clamp(cds, 0.0, 100.0), 3) if cds is not None else None,
         "cds_label": label,
-        "cds_confidence": round(confidence, 4),
-        "action": action,
+        "cds_confidence": round(confidence, 4) if confidence is not None else None,
+        "confidence_formula": "component dispersion agreement x original-weight coverage",
+        "action": proposed_action,
         "action_strength": strength,
         "recommendation_state": recommendation_state,
         "recommendation_eligibility": eligibility_payload,
@@ -114,48 +128,73 @@ def compute_cds(
         "anomaly_gate_active": anomaly_gate,
         "component_scores": {
             key: (round(value, 3) if value is not None else None)
-            for key, value in scores.items()
+            for key, value in candidates.items()
         },
-        "is_valid": recommendation_state == "ACTIONABLE",
-        "analytical_valid": True,
+        "component_reasons": reasons,
+        "available_component_count": len(available),
+        "required_component_count": MINIMUM_COMPONENTS,
+        "component_weight_coverage": round(coverage, 4),
+        "minimum_weight_coverage": MINIMUM_WEIGHT_COVERAGE,
+        "weight_normalization": "renormalized_available_components",
+        "reason_code": None if analytical_valid else "INSUFFICIENT_VALID_COMPONENTS",
+        "is_valid": recommendation_state == "ACTIONABLE" and analytical_valid,
+        "analytical_valid": analytical_valid,
     }
 
 
-def _ml_up_probability(ml_prediction: dict[str, Any]) -> float:
-    probabilities = ml_prediction.get("composite_probabilities")
-    if isinstance(probabilities, dict):
-        for key in ("UP", "bullish", "BULLISH"):
-            value = _finite(probabilities.get(key))
-            if value is not None:
-                return _clamp(value, 0.0, 1.0)
-
-    direction = str(ml_prediction.get("composite_direction") or "").upper()
-    confidence = _finite(ml_prediction.get("composite_confidence"))
-    confidence = _clamp(confidence if confidence is not None else 0.5, 0.0, 1.0)
-    if direction == "UP":
-        return 0.5 + confidence / 2.0
-    if direction == "DOWN":
-        return 0.5 - confidence / 2.0
-    return 0.5
+def _signed_component(payload: dict[str, Any], key: str) -> float | None:
+    if payload.get("is_valid") is not True:
+        return None
+    value = _finite(payload.get(key))
+    return _clamp((value + 100.0) / 2.0, 0.0, 100.0) if value is not None else None
 
 
-def _anomaly(ml_prediction: dict[str, Any]) -> tuple[float, bool]:
+def _vrc_component(payload: dict[str, Any]) -> float | None:
+    if payload.get("is_valid") is not True:
+        return None
+    return VRC_SCORE.get(str(payload.get("clock_label") or "").upper())
+
+
+def _nfve_component(payload: dict[str, Any]) -> float | None:
+    if payload.get("is_valid") is not True:
+        return None
+    return NFVE_SCORE.get(str(payload.get("valuation") or "").upper())
+
+
+def _ml_component(payload: dict[str, Any], eligible: bool) -> float | None:
+    if not eligible:
+        return None
+    probabilities = payload.get("composite_probabilities")
+    if not isinstance(probabilities, dict):
+        return None
+    for key in ("UP", "bullish", "BULLISH"):
+        value = _finite(probabilities.get(key))
+        if value is not None and 0.0 <= value <= 1.0:
+            return value * 100.0
+    return None
+
+
+def _component_reason(payload: dict[str, Any], score: float | None) -> str | None:
+    if score is not None:
+        return None
+    return str(payload.get("reason_code") or "COMPONENT_UNAVAILABLE")
+
+
+def _anomaly(
+    ml_prediction: dict[str, Any],
+) -> tuple[float | None, bool | None, bool]:
     components = ml_prediction.get("component_outputs")
-    if not isinstance(components, dict):
-        return 0.0, False
-    anomaly = components.get("m05_anomaly")
-    if not isinstance(anomaly, dict):
-        return 0.0, False
-    return _number(anomaly.get("anomaly_score"), 0.0), bool(anomaly.get("is_anomalous"))
+    anomaly = components.get("m05_anomaly") if isinstance(components, dict) else None
+    if not isinstance(anomaly, dict) or anomaly.get("is_valid") is not True:
+        return None, None, False
+    return _finite(anomaly.get("anomaly_score")), anomaly.get("is_anomalous"), True
 
 
-def _confidence(scores: list[float]) -> float:
-    if not scores:
-        return 0.0
+def _confidence(scores: list[float], coverage: float) -> float:
     mean = sum(scores) / len(scores)
     variance = sum((score - mean) ** 2 for score in scores) / len(scores)
-    std = math.sqrt(variance)
-    return _clamp(1.0 - std / 50.0, 0.0, 1.0)
+    agreement = _clamp(1.0 - math.sqrt(variance) / 50.0, 0.0, 1.0)
+    return agreement * _clamp(coverage, 0.0, 1.0)
 
 
 def _decision(cds: float) -> tuple[str, str, str]:
@@ -172,11 +211,6 @@ def _decision(cds: float) -> tuple[str, str, str]:
     if cds > 20:
         return "BEAR", "CONSIDER SHORT", "MODERATE"
     return "STRONG BEAR", "CONSIDER SHORT", "STRONG"
-
-
-def _number(value: Any, default: float) -> float:
-    number = _finite(value)
-    return number if number is not None else default
 
 
 def _finite(value: Any) -> float | None:

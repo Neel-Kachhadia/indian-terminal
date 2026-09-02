@@ -1,15 +1,11 @@
 from __future__ import annotations
 
 import math
-import statistics
 from typing import Any
 
 
 NEUTRAL_INDIA_ERP = 2.0
 RUPEE_BASELINE = 75.0
-DEFAULT_REPO_RATE = 6.25
-DEFAULT_GSEC_SPREAD = 0.65
-NEUTRAL_PE = 22.5
 
 
 def compute_nfve(
@@ -21,52 +17,70 @@ def compute_nfve(
     flow_history: dict[str, list[float]],
     signal_values: dict[str, float],
 ) -> dict[str, Any]:
-    """
-    Nifty Fair Value Engine.
+    """Nifty fair value from explicitly observed financial inputs only.
 
-    If explicit EPS or India 10Y data is unavailable, derives a low-confidence
-    proxy from local OHLCV history and existing repo-rate macro signal.
+    OHLC-derived EPS, default FX/VIX, and repo-plus-spread substitutions are
+    deliberately forbidden: they can be useful scenario assumptions, but are
+    not measured inputs and therefore cannot support a live valuation label.
     """
-    del symbol
-    spot = _finite_or_zero(spot)
-    closes = [_finite(row.get("close")) for row in ohlcv_rows]
-    closes = [value for value in closes if value is not None and value > 0]
-    eps, eps_source = _earnings_proxy(spot, closes, signal_values)
+    del symbol, ohlcv_rows
+    spot_value = _finite(spot)
+    eps, eps_source = _earnings(signal_values)
     bond_yield, bond_source = _bond_yield(cross_asset, signal_values)
-    usdinr = _usdinr(cross_asset)
-    vix = _india_vix(cross_asset, market_signals)
-    fii_net_ytd = _fii_ytd(flow_history, market_signals)
+    usdinr, fx_source = _usdinr(cross_asset)
+    vix, vix_source = _india_vix(cross_asset, market_signals)
+    fii_net_ytd, fii_source = _fii_ytd(flow_history, market_signals)
 
-    if spot <= 0 or eps <= 0:
-        return {
-            "fair_value": None,
-            "current_vs_fair": None,
-            "valuation": "FAIRLY_VALUED",
-            "equity_risk_premium": None,
-            "implied_pe": None,
-            "currency_impact": None,
-            "fii_liquidity_premium": None,
-            "confidence": "low",
-            "is_valid": False,
-        }
+    values = {
+        "decision_eligible_spot": spot_value if spot_value and spot_value > 0 else None,
+        "index_eps": eps,
+        "india_10y_yield": bond_yield,
+        "usdinr": usdinr,
+        "india_vix": vix,
+        "fii_net_ytd": fii_net_ytd,
+    }
+    missing = [name for name, value in values.items() if value is None]
+    sources = {
+        "index_eps": eps_source,
+        "india_10y_yield": bond_source,
+        "usdinr": fx_source,
+        "india_vix": vix_source,
+        "fii_net_ytd": fii_source,
+    }
+    if missing:
+        return _unavailable(missing, sources)
 
-    implied_pe = spot / eps
-    earnings_yield = (1.0 / implied_pe) * 100.0 if implied_pe > 0 else 0.0
+    assert spot_value is not None
+    assert eps is not None
+    assert bond_yield is not None
+    assert usdinr is not None
+    assert vix is not None
+    assert fii_net_ytd is not None
+    implied_pe = spot_value / eps
+    earnings_yield = (1.0 / implied_pe) * 100.0
     equity_risk_premium = earnings_yield - bond_yield
     erp_adjustment = (equity_risk_premium - NEUTRAL_INDIA_ERP) / 100.0
-    currency_discount = max(0.85, 1.0 - ((usdinr - RUPEE_BASELINE) / RUPEE_BASELINE) * 0.3)
+    currency_discount = max(
+        0.85,
+        1.0 - ((usdinr - RUPEE_BASELINE) / RUPEE_BASELINE) * 0.3,
+    )
     fii_liquidity_premium = 1.0 + math.tanh(fii_net_ytd / 100_000.0) * 0.1
     vix_discount = 1.0 - max(0.0, (vix - 15.0) / 100.0)
     fair_value = (
-        spot
+        spot_value
         * (1.0 + erp_adjustment)
         * currency_discount
         * fii_liquidity_premium
         * vix_discount
     )
-    current_vs_fair = (spot - fair_value) / fair_value * 100.0 if fair_value > 0 else 0.0
+    current_vs_fair = (
+        (spot_value - fair_value) / fair_value * 100.0
+        if fair_value > 0
+        else None
+    )
+    if current_vs_fair is None:
+        return _unavailable(["positive_fair_value"], sources)
 
-    confidence = _confidence(eps_source, bond_source, usdinr, vix)
     return {
         "fair_value": round(fair_value, 3),
         "current_vs_fair": round(current_vs_fair, 3),
@@ -75,31 +89,46 @@ def compute_nfve(
         "implied_pe": round(implied_pe, 3),
         "currency_impact": round(currency_discount, 4),
         "fii_liquidity_premium": round(fii_liquidity_premium, 4),
-        "confidence": confidence,
+        "confidence": "high",
+        "input_sources": sources,
+        "missing_inputs": [],
+        "reason_code": None,
         "is_valid": True,
     }
 
 
-def _earnings_proxy(
-    spot: float,
-    closes: list[float],
-    signal_values: dict[str, float],
-) -> tuple[float, str]:
+def _unavailable(
+    missing: list[str],
+    sources: dict[str, str | None],
+) -> dict[str, Any]:
+    return {
+        "fair_value": None,
+        "current_vs_fair": None,
+        "valuation": None,
+        "equity_risk_premium": None,
+        "implied_pe": None,
+        "currency_impact": None,
+        "fii_liquidity_premium": None,
+        "confidence": None,
+        "input_sources": sources,
+        "missing_inputs": missing,
+        "reason_code": "MISSING_MEASURED_FINANCIAL_INPUTS",
+        "is_valid": False,
+    }
+
+
+def _earnings(signal_values: dict[str, float]) -> tuple[float | None, str | None]:
     for key in ("nifty_eps", "index_eps", "macro.nifty_eps", "fundamental.eps"):
         value = _finite(signal_values.get(key))
         if value is not None and value > 0:
-            return value, "signal"
-
-    if closes:
-        window = closes[-252:] if len(closes) >= 30 else closes
-        median_close = statistics.median(window)
-        if median_close > 0:
-            return median_close / NEUTRAL_PE, "ohlcv_pe_proxy"
-
-    return max(spot, 1.0) / NEUTRAL_PE, "spot_pe_proxy"
+            return value, f"signal:{key}"
+    return None, None
 
 
-def _bond_yield(cross_asset: dict[str, Any], signal_values: dict[str, float]) -> tuple[float, str]:
+def _bond_yield(
+    cross_asset: dict[str, Any],
+    signal_values: dict[str, float],
+) -> tuple[float | None, str | None]:
     for key in (
         "bond_yield_10y",
         "india_10y_yield",
@@ -109,79 +138,61 @@ def _bond_yield(cross_asset: dict[str, Any], signal_values: dict[str, float]) ->
     ):
         value = _finite(signal_values.get(key))
         if value is not None and value > 0:
-            return value, "signal"
+            return value, f"signal:{key}"
 
     snapshot = _snapshot(cross_asset)
     for key in ("india_10y_yield", "gsec_10y", "bond_yield_10y"):
-        value = snapshot.get(key)
-        if isinstance(value, dict):
-            value = value.get("price") or value.get("yield")
-        number = _finite(value)
-        if number is not None and number > 0:
-            return number, "cross_asset"
-
-    repo = _finite(signal_values.get("macro.repo_rate") or signal_values.get("repo_rate"))
-    if repo is None:
-        repo = DEFAULT_REPO_RATE
-    return repo + DEFAULT_GSEC_SPREAD, "repo_proxy"
-
-
-def _usdinr(cross_asset: dict[str, Any]) -> float:
-    snapshot = _snapshot(cross_asset)
-    quote = snapshot.get("usdinr")
-    if isinstance(quote, dict):
-        value = _finite(quote.get("price"))
+        raw = snapshot.get(key)
+        if isinstance(raw, dict):
+            raw = raw.get("yield") if raw.get("yield") is not None else raw.get("price")
+        value = _finite(raw)
         if value is not None and value > 0:
-            return value
-    return 83.5
+            return value, f"cross_asset:{key}"
+    return None, None
 
 
-def _india_vix(cross_asset: dict[str, Any], market_signals: dict[str, Any]) -> float:
-    snapshot = _snapshot(cross_asset)
-    value = _finite(snapshot.get("india_vix"))
+def _usdinr(cross_asset: dict[str, Any]) -> tuple[float | None, str | None]:
+    quote = _snapshot(cross_asset).get("usdinr")
+    raw = quote.get("price") if isinstance(quote, dict) else quote
+    value = _finite(raw)
+    return (value, "cross_asset:usdinr") if value is not None and value > 0 else (None, None)
+
+
+def _india_vix(
+    cross_asset: dict[str, Any],
+    market_signals: dict[str, Any],
+) -> tuple[float | None, str | None]:
+    raw = _snapshot(cross_asset).get("india_vix")
+    if isinstance(raw, dict):
+        raw = raw.get("price")
+    value = _finite(raw)
     if value is not None and value > 0:
-        return value
+        return value, "cross_asset:india_vix"
     value = _finite(market_signals.get("india_vix"))
     if value is not None and value > 0:
-        return value
-    return 15.0
+        return value, "market:india_vix"
+    return None, None
 
 
-def _fii_ytd(flow_history: dict[str, list[float]], market_signals: dict[str, Any]) -> float:
+def _fii_ytd(
+    flow_history: dict[str, list[float]],
+    market_signals: dict[str, Any],
+) -> tuple[float | None, str | None]:
     values = flow_history.get("fii_net_cash") or []
-    clean = [value for value in values if math.isfinite(value)]
+    clean = [number for value in values[-252:] if (number := _finite(value)) is not None]
     if clean:
-        return float(sum(clean[-252:]))
+        return float(sum(clean)), "flow_history:fii_net_cash"
     fii_dii = market_signals.get("fii_dii")
     if isinstance(fii_dii, dict):
-        return _finite(fii_dii.get("fii_net_cash")) or 0.0
-    return 0.0
+        value = _finite(fii_dii.get("fii_net_cash"))
+        if value is not None:
+            return value, "market:fii_net_cash"
+    return None, None
 
 
 def _snapshot(cross_asset: dict[str, Any]) -> dict[str, Any]:
     snapshot = cross_asset.get("snapshot")
     return snapshot if isinstance(snapshot, dict) else cross_asset
-
-
-def _confidence(eps_source: str, bond_source: str, usdinr: float, vix: float) -> str:
-    score = 0
-    if eps_source == "signal":
-        score += 2
-    elif eps_source == "ohlcv_pe_proxy":
-        score += 1
-    if bond_source in {"signal", "cross_asset"}:
-        score += 2
-    elif bond_source == "repo_proxy":
-        score += 1
-    if usdinr > 0:
-        score += 1
-    if vix > 0:
-        score += 1
-    if score >= 5:
-        return "high"
-    if score >= 3:
-        return "medium"
-    return "low"
 
 
 def _valuation(current_vs_fair: float) -> str:
@@ -198,8 +209,3 @@ def _finite(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
-
-
-def _finite_or_zero(value: Any) -> float:
-    number = _finite(value)
-    return number if number is not None else 0.0

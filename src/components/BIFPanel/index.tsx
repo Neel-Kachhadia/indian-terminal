@@ -9,6 +9,8 @@ type BMS = {
   institutional_momentum?: number | null;
   expiry_adjustment?: number | null;
   regime_multiplier?: number | null;
+  is_valid?: boolean;
+  reason_code?: string | null;
 };
 
 type NGI = {
@@ -19,6 +21,8 @@ type NGI = {
   escape_velocity_up?: number | null;
   escape_velocity_down?: number | null;
   pin_probability?: number | null;
+  is_valid?: boolean;
+  reason_code?: string | null;
 };
 
 type IAD = {
@@ -28,6 +32,9 @@ type IAD = {
   price_volume_score?: number | null;
   fii_flow_score?: number | null;
   options_hedge_score?: number | null;
+  component_coverage?: number | null;
+  is_valid?: boolean;
+  reason_code?: string | null;
 };
 
 type VRC = {
@@ -39,6 +46,10 @@ type VRC = {
   vrp_signal?: string;
   optimal_strategy?: string;
   expected_iv_7d?: number | null;
+  is_valid?: boolean;
+  reason_code?: string | null;
+  iv_observations?: number | null;
+  required_iv_observations?: number | null;
 };
 
 type NFVE = {
@@ -50,6 +61,8 @@ type NFVE = {
   currency_impact?: number | null;
   fii_liquidity_premium?: number | null;
   confidence?: string;
+  is_valid?: boolean;
+  reason_code?: string | null;
 };
 
 type CDS = {
@@ -59,7 +72,12 @@ type CDS = {
   action?: string;
   action_strength?: string;
   anomaly_gate_active?: boolean;
-  component_scores?: Record<string, number>;
+  component_scores?: Record<string, number | null>;
+  component_weight_coverage?: number | null;
+  available_component_count?: number | null;
+  required_component_count?: number | null;
+  analytical_valid?: boolean;
+  reason_code?: string | null;
   recommendation_state?: "ANALYTICAL_OUTPUT" | "INFORMATIONAL" | "UNVALIDATED" | "VALIDATED_NON_ACTIONABLE" | "ACTIONABLE";
   model_validation_state?: string;
   data_quality_state?: string;
@@ -83,6 +101,12 @@ type BIFPayload = {
   nfve?: NFVE;
   cds?: CDS;
   history?: BIFHistoryRow[];
+  history_status?: {
+    status?: string;
+    reason_code?: string | null;
+    rows?: number;
+    persistence_scope?: string;
+  };
   error?: string;
 };
 
@@ -183,6 +207,7 @@ export function BIFPanel({ symbol = "NIFTY" }: BIFPanelProps) {
         </div>
         <div style={cdsMetaStyle}>
           <span>Confidence: {formatUnitPct(cds?.cds_confidence)}</span>
+          <span>Coverage: {formatUnitPct(cds?.component_weight_coverage)}</span>
           <span>Anomaly Gate: {cds?.anomaly_gate_active ? "ON" : "OFF"}</span>
           <span>Spot: {formatPrice(data?.spot)}</span>
           <span>Expiry: {data?.expiry ?? "--"}</span>
@@ -192,7 +217,7 @@ export function BIFPanel({ symbol = "NIFTY" }: BIFPanelProps) {
       <div style={moduleGridStyle}>
         <ModuleCard
           label="BMS"
-          title={data?.bms?.bms_label ?? "--"}
+          title={componentTitle(data?.bms?.is_valid, data?.bms?.bms_label, data?.bms?.reason_code)}
           value={formatSigned(data?.bms?.bms)}
           color={signedColor(data?.bms?.bms)}
           rows={[
@@ -216,7 +241,7 @@ export function BIFPanel({ symbol = "NIFTY" }: BIFPanelProps) {
         />
         <ModuleCard
           label="IAD"
-          title={data?.iad?.iad_label ?? "--"}
+          title={componentTitle(data?.iad?.is_valid, data?.iad?.iad_label, data?.iad?.reason_code)}
           value={formatSigned(data?.iad?.iad_score)}
           color={signedColor(data?.iad?.iad_score)}
           rows={[
@@ -232,7 +257,7 @@ export function BIFPanel({ symbol = "NIFTY" }: BIFPanelProps) {
             <Clock position={data?.vrc?.clock_position} />
           </div>
           <strong style={{ ...moduleValueStyle, color: vrcColor(data?.vrc?.clock_label) }}>
-            {data?.vrc?.clock_label ?? "--"}
+            {data?.vrc?.is_valid === true ? data.vrc.clock_label ?? "--" : data?.vrc?.reason_code ?? "UNAVAILABLE"}
           </strong>
           <div style={rowListStyle}>
             <DataRow label="IV Pct" value={formatPctValue(data?.vrc?.iv_percentile)} />
@@ -271,7 +296,11 @@ export function BIFPanel({ symbol = "NIFTY" }: BIFPanelProps) {
                 <span>{row.cds_label ?? "--"}</span>
               </div>
             ))}
-            {history.length === 0 ? <div style={emptyStyle}>No history.</div> : null}
+            {history.length === 0 ? (
+              <div style={emptyStyle}>
+                {historyStatusText(data?.history_status, data?.symbol ?? symbol)}
+              </div>
+            ) : null}
           </div>
         </div>
       </div>
@@ -318,21 +347,27 @@ function DataRow({ label, value }: { label: string; value: string }) {
 }
 
 function Clock({ position }: { position?: number | null }) {
-  const degrees = asNumber(position) ?? 0;
+  const degrees = asNumber(position);
   return (
-    <svg aria-hidden style={clockStyle} viewBox="0 0 40 40">
+    <svg aria-label={degrees === null ? "Volatility clock unavailable" : `Volatility clock ${degrees} degrees`} role="img" style={clockStyle} viewBox="0 0 40 40">
       <circle cx="20" cy="20" fill="#101827" r="17" stroke="#35405f" strokeWidth="2" />
-      <line
-        stroke="#facc15"
-        strokeLinecap="round"
-        strokeWidth="3"
-        transform={`rotate(${degrees} 20 20)`}
-        x1="20"
-        x2="20"
-        y1="20"
-        y2="7"
-      />
-      <circle cx="20" cy="20" fill="#facc15" r="2.5" />
+      {degrees === null ? (
+        <text fill="#8a94a6" fontSize="12" textAnchor="middle" x="20" y="24">--</text>
+      ) : (
+        <>
+          <line
+            stroke="#facc15"
+            strokeLinecap="round"
+            strokeWidth="3"
+            transform={`rotate(${degrees} 20 20)`}
+            x1="20"
+            x2="20"
+            y1="20"
+            y2="7"
+          />
+          <circle cx="20" cy="20" fill="#facc15" r="2.5" />
+        </>
+      )}
     </svg>
   );
 }
@@ -425,12 +460,36 @@ function historyTrend(history: BIFHistoryRow[]) {
 }
 
 function gravityTitle(ngi: NGI | undefined) {
-  const direction = ngi?.ngi_direction ?? "NEUTRAL";
+  if (ngi?.is_valid !== true) {
+    return ngi?.reason_code ?? "UNAVAILABLE";
+  }
+  const direction = ngi.ngi_direction;
   return direction === "UP"
     ? "UP GRAVITY"
     : direction === "DOWN"
       ? "DOWN GRAVITY"
       : "BALANCED";
+}
+
+function componentTitle(
+  isValid: boolean | undefined,
+  label: string | undefined,
+  reasonCode: string | null | undefined,
+) {
+  return isValid === true ? label ?? "--" : reasonCode ?? "UNAVAILABLE";
+}
+
+function historyStatusText(
+  status: BIFPayload["history_status"],
+  symbol: string,
+) {
+  if (status?.reason_code === "SYMBOL_NOT_IN_SCHEDULED_PERSISTENCE_SCOPE") {
+    return `No persisted history for ${symbol}; scheduled history is NIFTY-only.`;
+  }
+  if (status?.reason_code === "NO_PERSISTED_HISTORY_IN_WINDOW") {
+    return "No persisted NIFTY history in the requested 30-day window.";
+  }
+  return "History unavailable.";
 }
 
 function volSignalLabel(value: string | undefined) {

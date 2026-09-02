@@ -20,22 +20,34 @@ def compute_ngi(
     """
     normalised = [_normalise_leg(leg) for leg in chain_legs]
     normalised = [leg for leg in normalised if leg is not None]
-    spot = _finite_or_zero(spot)
+    spot_value = _finite(spot)
     dte_factor = _dte_factor(expiry)
 
-    if spot <= 0 or not normalised:
+    missing_inputs: list[str] = []
+    if spot_value is None or spot_value <= 0:
+        missing_inputs.append("decision_eligible_spot")
+    if not normalised:
+        missing_inputs.append("option_chain_open_interest")
+    if dte_factor is None:
+        missing_inputs.append("valid_expiry")
+    if missing_inputs:
         return {
-            "ngi": 0.0,
-            "ngi_direction": "NEUTRAL",
+            "ngi": None,
+            "ngi_direction": None,
             "gravity_center": None,
-            "gravity_strength": 0.0,
+            "gravity_strength": None,
             "escape_velocity_up": None,
             "escape_velocity_down": None,
-            "pin_probability": 0.0,
-            "dte_factor": round(dte_factor, 3),
+            "pin_probability": None,
+            "dte_factor": round(dte_factor, 3) if dte_factor is not None else None,
             "top_gravity_strikes": [],
+            "chain_leg_count": len(normalised),
+            "missing_inputs": missing_inputs,
+            "reason_code": "MISSING_REQUIRED_INPUTS",
             "is_valid": False,
         }
+    spot = float(spot_value)
+    assert dte_factor is not None
 
     force_rows: list[dict[str, Any]] = []
     force_by_strike: defaultdict[float, float] = defaultdict(float)
@@ -89,6 +101,9 @@ def compute_ngi(
             }
             for row in top_rows
         ],
+        "chain_leg_count": len(normalised),
+        "missing_inputs": [],
+        "reason_code": None,
         "is_valid": True,
     }
 
@@ -116,10 +131,10 @@ def _force_sign(option_type: str, strike: float, spot: float) -> float:
     return -1.0 if strike <= spot else 0.3
 
 
-def _dte_factor(expiry: str) -> float:
+def _dte_factor(expiry: str) -> float | None:
     dte = _days_to_expiry(expiry)
     if dte is None:
-        dte = 5
+        return None
     return 1.0 / (1.0 + math.exp(0.8 * (float(dte) - 5.0)))
 
 
@@ -187,11 +202,6 @@ def _finite(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
-
-
-def _finite_or_zero(value: Any) -> float:
-    number = _finite(value)
-    return number if number is not None else 0.0
 
 
 def _round_or_none(value: float | None) -> float | None:

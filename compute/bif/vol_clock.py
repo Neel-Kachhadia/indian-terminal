@@ -6,6 +6,9 @@ from typing import Any
 import numpy as np
 
 
+MINIMUM_IV_OBSERVATIONS = 30
+
+
 def compute_vrc(
     iv_history: list[dict[str, Any]],
     option_signals: dict[str, Any],
@@ -25,17 +28,15 @@ def compute_vrc(
     )
     history = [_normalise_iv(row.get("atm_iv") or row.get("iv")) for row in iv_history]
     history = [value for value in history if value is not None and value > 0]
-    if current_iv is None and history:
-        current_iv = history[-1]
     if current_iv is not None and (not history or abs(history[-1] - current_iv) > 1e-9):
         history.append(current_iv)
 
     if current_iv is None or current_iv <= 0:
-        return _unavailable_result("NO_DATA")
+        return _unavailable_result("NO_CURRENT_IV", len(history))
 
     iv_percentile = _iv_percentile(current_iv, history)
     if iv_percentile is None:
-        return _unavailable_result("INSUFFICIENT_HISTORY")
+        return _unavailable_result("INSUFFICIENT_HISTORY", len(history))
 
     slope_now = _slope(history[-5:])
     slope_prev = _slope(history[-10:-5])
@@ -43,7 +44,7 @@ def compute_vrc(
     trend = _trend_label(slope_now)
     clock_label, position = _clock_position(iv_percentile, trend)
     hv20 = _historical_vol_20(ohlcv_rows)
-    vrp = (current_iv - hv20) * 100.0 if hv20 is not None else 0.0
+    vrp = (current_iv - hv20) * 100.0 if hv20 is not None else None
     mean_30 = sum(history[-30:]) / len(history[-30:]) if history else current_iv
     expected_iv_7d = current_iv + 0.15 * (mean_30 - current_iv) * 7.0
 
@@ -53,16 +54,21 @@ def compute_vrc(
         "iv_percentile": round(_clamp(iv_percentile, 0.0, 100.0), 3),
         "iv_trend": trend,
         "iv_acceleration": round(acceleration * 100.0, 6),
-        "vrp": round(vrp, 3),
-        "vrp_signal": _vrp_signal(vrp),
+        "vrp": round(vrp, 3) if vrp is not None else None,
+        "vrp_signal": _vrp_signal(vrp) if vrp is not None else None,
         "optimal_strategy": _optimal_strategy(clock_label, vrp),
         "expected_iv_7d": round(max(0.0, expected_iv_7d), 6),
         "is_valid": True,
+        "status": "READY",
+        "reason_code": None,
+        "iv_observations": len(history),
+        "required_iv_observations": MINIMUM_IV_OBSERVATIONS,
+        "hv_observations": min(len(ohlcv_rows), 21),
     }
 
 
 def _iv_percentile(current_iv: float, history: list[float]) -> float | None:
-    if len(history) < 2:
+    if len(history) < MINIMUM_IV_OBSERVATIONS:
         return None
     clean = history[-252:]
     low = min(clean)
@@ -72,7 +78,7 @@ def _iv_percentile(current_iv: float, history: list[float]) -> float | None:
     return (current_iv - low) / (high - low) * 100.0
 
 
-def _unavailable_result(reason: str) -> dict[str, Any]:
+def _unavailable_result(reason: str, observations: int) -> dict[str, Any]:
     """Explicit unavailable-IV-regime state. `clock_label` is deliberately a
     reason code outside VRC_SCORE's keys (compute/bif/composite.py) so a
     missing/insufficient-history regime is never mistaken for a real
@@ -90,6 +96,11 @@ def _unavailable_result(reason: str) -> dict[str, Any]:
         "optimal_strategy": "Wait for cleaner volatility data",
         "expected_iv_7d": None,
         "is_valid": False,
+        "status": "INSUFFICIENT_DATA" if reason == "INSUFFICIENT_HISTORY" else "UNAVAILABLE",
+        "reason_code": reason,
+        "iv_observations": observations,
+        "required_iv_observations": MINIMUM_IV_OBSERVATIONS,
+        "hv_observations": 0,
     }
 
 
@@ -154,7 +165,7 @@ def _vrp_signal(vrp: float) -> str:
     return "NEUTRAL"
 
 
-def _optimal_strategy(clock_label: str, vrp: float) -> str:
+def _optimal_strategy(clock_label: str, vrp: float | None) -> str:
     if clock_label == "COMPRESSION":
         return "Consider long straddle"
     if clock_label in {"EARLY EXPANSION", "EXPANSION"}:
@@ -163,7 +174,7 @@ def _optimal_strategy(clock_label: str, vrp: float) -> str:
         return "Consider short volatility"
     if clock_label == "LATE EXPANSION":
         return "Reduce long volatility"
-    if vrp > 0.5:
+    if vrp is not None and vrp > 0.5:
         return "Consider premium collection"
     return "Wait for vol edge"
 

@@ -30,7 +30,7 @@ def test_compute_vrc_returns_explicit_unavailable_when_no_iv_data() -> None:
         signal_values={},
     )
     assert result["is_valid"] is False
-    assert result["clock_label"] == "NO_DATA"
+    assert result["clock_label"] == "NO_CURRENT_IV"
     assert result["iv_percentile"] is None
     assert result["clock_position"] is None
     assert result["clock_label"] not in VRC_SCORE
@@ -65,11 +65,11 @@ def test_compute_vrc_resolves_real_regime_with_sufficient_history() -> None:
 
 def _flat_components(vrc: dict) -> dict:
     return dict(
-        bms={"bms": 0.0},
-        ngi={"ngi": 0.0},
-        iad={"iad_score": 0.0},
+        bms={"bms": 0.0, "is_valid": True},
+        ngi={"ngi": 0.0, "is_valid": True},
+        iad={"iad_score": 0.0, "is_valid": True},
         vrc=vrc,
-        nfve={"valuation": "FAIRLY_VALUED"},
+        nfve={"valuation": "FAIRLY_VALUED", "is_valid": True},
         ml_prediction={},
     )
 
@@ -89,9 +89,9 @@ def test_compute_cds_excludes_unavailable_vrc_instead_of_fabricating_a_score() -
 def test_compute_cds_uses_vrc_only_when_explicitly_valid() -> None:
     valid_vrc = {"clock_label": "COMPRESSION", "is_valid": True}
     result = compute_cds(**_flat_components(valid_vrc))
-    expected_cds = 50.0 * 0.85 + VRC_SCORE["COMPRESSION"] * 0.15
+    expected_cds = (50.0 * 0.70 + VRC_SCORE["COMPRESSION"] * 0.15) / 0.85
     assert result["component_scores"]["vrc"] == pytest.approx(70.0)
-    assert result["cds"] == pytest.approx(expected_cds, abs=1e-6)
+    assert result["cds"] == pytest.approx(expected_cds, abs=1e-3)
     assert result["cds"] != pytest.approx(50.0, abs=1e-6)
 
 

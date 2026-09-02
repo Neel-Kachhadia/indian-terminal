@@ -11,6 +11,7 @@ from typing import Any, Callable
 from db.duckdb_client import DB_WRITE_LOCK, writer_connection
 from db.write_service import ReadOperation, resolve_read
 from data.exchange_calendar import next_expiry_labels, today_ist
+from data.index_aliases import index_symbol_candidates
 from data.market_data_quality import (
     DecisionContext,
     MarketDataEligibility,
@@ -100,10 +101,22 @@ class BIFEngine:
             decision_evidence=context["decision_evidence"],
         )
 
+        history = self.get_history(normalized, days=30)
+        iv_observations = _current_iv_observations(
+            normalized,
+            context["chain_legs"],
+            context["spot"],
+            context["expiry"],
+            context["ohlcv_rows"][-1]["date"] if context["ohlcv_rows"] else None,
+            context["chain_provenance"],
+            context["spot_observation"].decision_eligible
+            and context["market_data_eligibility"].decision_eligible,
+        )
         payload = {
             "symbol": normalized,
             "spot": round(context["spot"], 3) if context["spot"] > 0 else None,
             "spot_provenance": context["spot_observation"].as_provenance(),
+            "chain_provenance": context["chain_provenance"],
             "market_data_eligibility": context["market_data_eligibility"].to_dict(),
             "expiry": context["expiry"],
             "computed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
@@ -114,10 +127,21 @@ class BIFEngine:
             "vrc": vrc,
             "nfve": nfve,
             "cds": cds,
-            "history": self.get_history(normalized, days=30),
+            "history": history,
+            "history_status": _history_status(normalized, history),
+            "iv_persistence_status": {
+                "status": "READY_TO_PERSIST" if iv_observations else "UNAVAILABLE",
+                "reason_code": None if iv_observations else "NO_VALIDATED_CURRENT_CHAIN_IV",
+                "observations": len(iv_observations),
+                "future_only": True,
+            },
+            "iv_observations": iv_observations,
             "input_status": {
                 "ohlcv_rows": len(context["ohlcv_rows"]),
                 "chain_legs": len(context["chain_legs"]),
+                "chain_decision_eligible": (
+                    context["chain_provenance"].get("decision_eligible") is True
+                ),
                 "iv_history_rows": len(context["iv_history"]),
                 "signals_available": bool(context["signal_values"]),
                 "ml_available": bool(context["ml_prediction"]),
@@ -126,6 +150,7 @@ class BIFEngine:
         if persist:
             self._write_history(normalized, payload)
             payload["history"] = self.get_history(normalized, days=30)
+            payload["history_status"] = _history_status(normalized, payload["history"])
 
         with self._cache_lock:
             self._cache[normalized] = {"timestamp": now, "data": copy.deepcopy(payload)}
@@ -198,7 +223,7 @@ class BIFEngine:
         signals_payload = self._provider("signals", symbol) or {}
         signal_values.update(_flatten_signal_payload(signals_payload))
 
-        chain_legs, expiry = self._chain(symbol)
+        chain_legs, expiry, chain_provenance = self._chain(symbol, requested_at)
         spot_observation = self._spot(symbol, requested_at)
         spot = (
             float(spot_observation.price)
@@ -225,6 +250,7 @@ class BIFEngine:
             "signal_values": signal_values,
             "signals_payload": signals_payload,
             "chain_legs": chain_legs,
+            "chain_provenance": chain_provenance,
             "expiry": expiry,
             "spot": spot,
             "spot_observation": spot_observation,
@@ -237,18 +263,32 @@ class BIFEngine:
             "ml_prediction": ml_prediction,
         }
 
-    def _chain(self, symbol: str) -> tuple[list[dict[str, Any]], str]:
+    def _chain(
+        self,
+        symbol: str,
+        requested_at: _dt.datetime,
+    ) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
         provided = self._provider("chain", symbol)
         if isinstance(provided, tuple) and len(provided) >= 2:
-            return _as_leg_list(provided[0]), str(provided[1] or _next_expiries(1)[0])
+            provenance = provided[2] if len(provided) >= 3 else {}
+            legs = _as_leg_list(provided[0])
+            expiry = str(provided[1] or _next_expiries(1)[0])
+            return _validated_chain(legs, expiry, provenance, requested_at)
         if isinstance(provided, dict):
-            return (
+            return _validated_chain(
                 _as_leg_list(provided.get("legs") or provided.get("chain_legs")),
                 str(provided.get("expiry") or _next_expiries(1)[0]),
+                provided.get("provenance"),
+                requested_at,
             )
         if isinstance(provided, list):
-            return _as_leg_list(provided), _next_expiries(1)[0]
-        return _read_chain_from_redis(symbol)
+            return _validated_chain(
+                _as_leg_list(provided),
+                _next_expiries(1)[0],
+                None,
+                requested_at,
+            )
+        return _read_chain_from_redis(symbol, requested_at)
 
     def _spot(self, symbol: str, requested_at: _dt.datetime) -> SpotObservation:
         provided = self._provider("spot", symbol)
@@ -344,6 +384,7 @@ class BIFEngine:
                     """,
                     row,
                 )
+                _persist_iv_observations(con, payload.get("iv_observations"))
                 con.execute("COMMIT")
             except Exception as error:
                 con.execute("ROLLBACK")
@@ -429,7 +470,10 @@ def _load_signal_history(symbol: str) -> dict[str, list[float]]:
     return history
 
 
-def _read_chain_from_redis(symbol: str) -> tuple[list[dict[str, Any]], str]:
+def _read_chain_from_redis(
+    symbol: str,
+    requested_at: _dt.datetime,
+) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
     expiries = _next_expiries(4)
     redis_symbol = _redis_symbol(symbol)
     try:
@@ -451,13 +495,21 @@ def _read_chain_from_redis(symbol: str) -> tuple[list[dict[str, Any]], str]:
             payload = client.get(key)
             if payload is None:
                 continue
-            legs = _decode_chain_payload(payload)
+            legs, provenance = _decode_chain_envelope(payload)
             if legs:
                 expiry = key.split(":", 2)[2] if ":" in key else expiries[0]
-                return legs, expiry
+                return _validated_chain(
+                    legs,
+                    expiry,
+                    provenance,
+                    requested_at,
+                )
     except Exception as error:
         print(f"bif: Redis chain unavailable: {error}")
-    return [], expiries[0]
+    return [], expiries[0], {
+        "decision_eligible": False,
+        "reason": "live_chain_missing_from_redis",
+    }
 
 
 def _read_spot_from_redis(symbol: str, requested_at: _dt.datetime) -> SpotObservation:
@@ -672,17 +724,24 @@ def _ensure_bif_schema(con: Any) -> None:
 
 
 def _decode_chain_payload(payload: Any) -> list[dict[str, Any]]:
+    return _decode_chain_envelope(payload)[0]
+
+
+def _decode_chain_envelope(
+    payload: Any,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     try:
         data = json.loads(_redis_text(payload))
     except (TypeError, ValueError, UnicodeDecodeError):
-        return []
+        return [], {}
     if isinstance(data, list):
-        return _as_leg_list(data)
+        return _as_leg_list(data), {}
     if isinstance(data, dict):
         nested = data.get("legs") or data.get("data")
         if isinstance(nested, list):
-            return _as_leg_list(nested)
-    return []
+            provenance = data.get("provenance")
+            return _as_leg_list(nested), provenance if isinstance(provenance, dict) else {}
+    return [], {}
 
 
 def _as_leg_list(value: Any) -> list[dict[str, Any]]:
@@ -691,17 +750,192 @@ def _as_leg_list(value: Any) -> list[dict[str, Any]]:
     return [item for item in value if isinstance(item, dict)]
 
 
+def _validated_chain(
+    legs: list[dict[str, Any]],
+    expiry: str,
+    provenance: Any,
+    requested_at: _dt.datetime,
+) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
+    raw = provenance if isinstance(provenance, dict) else {}
+    observed_at = _parse_timestamp(raw.get("observed_at"))
+    source = str(raw.get("source") or "").strip().upper()
+    freshness = str(raw.get("freshness") or "").strip().upper()
+    age_seconds = (
+        (requested_at.astimezone(_dt.timezone.utc) - observed_at).total_seconds()
+        if observed_at is not None
+        else None
+    )
+    eligible = bool(
+        legs
+        and raw.get("decision_eligible") is True
+        and source not in {"", "NONE", "UNKNOWN"}
+        and freshness == "FRESH"
+        and age_seconds is not None
+        and -300.0 <= age_seconds <= 180.0
+    )
+    normalized = {
+        "source": source or None,
+        "observed_at": observed_at.isoformat() if observed_at is not None else None,
+        "freshness": freshness or None,
+        "age_seconds": round(age_seconds, 3) if age_seconds is not None else None,
+        "decision_eligible": eligible,
+        "raw_leg_count": len(legs),
+        "reason": (
+            "fresh_validated_chain_envelope"
+            if eligible
+            else "chain_provenance_missing_stale_or_invalid"
+        ),
+    }
+    return (legs if eligible else []), expiry, normalized
+
+
+def _parse_timestamp(value: Any) -> _dt.datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = _dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(_dt.timezone.utc)
+
+
+def _current_iv_observations(
+    symbol: str,
+    legs: list[dict[str, Any]],
+    spot: float,
+    expiry: str,
+    as_of_date: Any,
+    provenance: dict[str, Any],
+    market_inputs_eligible: bool,
+) -> list[dict[str, Any]]:
+    if (
+        not market_inputs_eligible
+        or provenance.get("decision_eligible") is not True
+        or not legs
+        or _finite_or_none(spot) is None
+        or float(spot) <= 0
+        or as_of_date is None
+    ):
+        return []
+    expiry_date = _parse_expiry_date(expiry)
+    if expiry_date is None:
+        return []
+    candidates: list[dict[str, Any]] = []
+    for leg in legs:
+        strike = _finite_or_none(leg.get("strike"))
+        iv = _normalise_iv(leg.get("iv"))
+        option_type = str(leg.get("option_type") or "").strip().upper()
+        if option_type in {"CALL", "C"}:
+            option_type = "CE"
+        elif option_type in {"PUT", "P"}:
+            option_type = "PE"
+        if strike is None or strike <= 0 or iv is None or option_type not in {"CE", "PE"}:
+            continue
+        candidates.append(
+            {
+                "symbol": symbol,
+                "expiry": expiry_date.isoformat(),
+                "strike": strike,
+                "option_type": option_type,
+                "date": str(as_of_date),
+                "iv": iv,
+                "source": provenance.get("source"),
+                "observed_at": provenance.get("observed_at"),
+                "quality": "CURRENT_DECISION_ELIGIBLE",
+            }
+        )
+    if not candidates:
+        return []
+    nearest_distance = min(abs(float(row["strike"]) - float(spot)) for row in candidates)
+    return [
+        row
+        for row in candidates
+        if abs(abs(float(row["strike"]) - float(spot)) - nearest_distance) < 1e-9
+    ]
+
+
+def _parse_expiry_date(value: Any) -> _dt.date | None:
+    text = str(value or "").strip()
+    for fmt in ("%Y-%m-%d", "%d-%b-%Y", "%d-%B-%Y", "%d-%m-%Y", "%d/%m/%Y"):
+        try:
+            return _dt.datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _normalise_iv(value: Any) -> float | None:
+    number = _finite_or_none(value)
+    if number is None or number <= 0:
+        return None
+    if number > 3.0:
+        number /= 100.0
+    return number if 0 < number <= 5.0 else None
+
+
+def _persist_iv_observations(con: Any, observations: Any) -> None:
+    if not isinstance(observations, list) or not observations:
+        return
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS iv_history (
+            symbol TEXT NOT NULL, expiry DATE NOT NULL, strike DOUBLE NOT NULL,
+            option_type TEXT NOT NULL, date DATE NOT NULL, iv DOUBLE NOT NULL,
+            PRIMARY KEY (symbol, expiry, strike, option_type, date)
+        )
+        """
+    )
+    for row in observations:
+        if not isinstance(row, dict):
+            continue
+        con.execute(
+            """
+            INSERT OR REPLACE INTO iv_history
+                (symbol, expiry, strike, option_type, date, iv)
+            VALUES (?, CAST(? AS DATE), ?, ?, CAST(? AS DATE), ?)
+            """,
+            [
+                row.get("symbol"),
+                row.get("expiry"),
+                row.get("strike"),
+                row.get("option_type"),
+                row.get("date"),
+                row.get("iv"),
+            ],
+        )
+
+
 def _next_expiries(n: int) -> list[str]:
     return next_expiry_labels(n)
 
 
 def _symbol_candidates(symbol: str) -> list[str]:
-    upper = _normalise_symbol(symbol)
-    if upper == "NIFTY":
-        return ["NIFTY 50", "NIFTY"]
-    if upper == "BANKNIFTY":
-        return ["NIFTY BANK", "BANKNIFTY"]
-    return [upper]
+    return index_symbol_candidates(_normalise_symbol(symbol))
+
+
+def _history_status(symbol: str, history: list[dict[str, Any]]) -> dict[str, Any]:
+    if history:
+        return {
+            "status": "READY",
+            "reason_code": None,
+            "rows": len(history),
+            "latest_date": history[0].get("date"),
+            "persistence_scope": "SCHEDULED_NIFTY_ONLY",
+        }
+    return {
+        "status": "UNAVAILABLE",
+        "reason_code": (
+            "SYMBOL_NOT_IN_SCHEDULED_PERSISTENCE_SCOPE"
+            if symbol != "NIFTY"
+            else "NO_PERSISTED_HISTORY_IN_WINDOW"
+        ),
+        "rows": 0,
+        "latest_date": None,
+        "persistence_scope": "SCHEDULED_NIFTY_ONLY",
+    }
 
 
 def _redis_symbol(symbol: str) -> str:
