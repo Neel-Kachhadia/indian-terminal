@@ -501,8 +501,4 @@ BharatTerminal is an engineering and market-research project.
 - Broker credentials and API keys remain the operator's responsibility.
 - Live order execution is outside the current application scope.
 
----
 
-## License
-
-No license is declared in this README. Add an explicit project license before public redistribution or accepting external contributions under defined licensing terms.
