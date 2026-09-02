@@ -6,7 +6,7 @@ import numpy as np
 
 from ml.feature_engineering import MLContext
 
-from .apex_common import confidence, direction_probabilities, return_series, train_unavailable, untrained_prediction
+from .apex_common import direction_probabilities, return_series, train_unavailable, untrained_prediction
 
 
 MODEL_ID = "m14_wavelet"
@@ -44,7 +44,7 @@ def predict(context: MLContext, confidence_multiplier: float = 1.0) -> dict[str,
     level_predictions = _level_predictions(values)
     weights = _level_weights(level_predictions)
     signal = sum(level_predictions[level] * weights[level] for level in level_predictions)
-    sigma = float(np.std(values[-20:]) or np.std(values) or 0.8)
+    sigma = float(np.std(values[-20:]))
     probs = direction_probabilities(signal, sigma, confidence_multiplier=confidence_multiplier)
     dominant = max(weights, key=weights.get)
     noise_ratio = abs(level_predictions.get("level_1_1_2d", 0.0)) / (
@@ -53,10 +53,15 @@ def predict(context: MLContext, confidence_multiplier: float = 1.0) -> dict[str,
     return {
         "model_id": MODEL_ID,
         "is_trained": False,
+        "is_valid": True,
+        "status": "READY_ANALYTICAL",
+        "reason_code": None,
         "model_used": "rolling_multiscale_fallback",
         "prediction": max(probs, key=probs.get),
         "probabilities": probs,
-        "confidence": confidence(probs),
+        "confidence": None,
+        "confidence_formula": None,
+        "probability_kind": "uncalibrated_multiscale_score",
         "wavelet_signal_1d": round(float(signal), 6),
         "dominant_frequency": dominant,
         "level_predictions": {key: round(float(value), 6) for key, value in level_predictions.items()},

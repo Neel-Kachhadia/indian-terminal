@@ -23,7 +23,9 @@ def train_unavailable(
         "model_id": model_id,
         "is_trained": False,
         "reason": reason,
-        "available_rows": context.available_rows,
+        "status": "UNTRAINED",
+        "reason_code": "TRAINING_PIPELINE_NOT_IMPLEMENTED",
+        "available_rows": int(getattr(context, "available_rows", 0) or 0),
         "minimum_rows": minimum_rows,
     }
 
@@ -43,7 +45,9 @@ def untrained_prediction(
         "probabilities": {},
         "confidence": None,
         "reason": reason,
-        "available_rows": context.available_rows,
+        "status": "INSUFFICIENT_DATA",
+        "reason_code": "INSUFFICIENT_ELIGIBLE_HISTORY",
+        "available_rows": int(getattr(context, "available_rows", 0) or 0),
         "minimum_rows": minimum_rows,
     }
     if extra:
@@ -88,9 +92,9 @@ def direction_probabilities(
     *,
     confidence_multiplier: float = 1.0,
 ) -> dict[str, float]:
-    if expected_return_pct is None:
-        return {"UP": 0.33, "FLAT": 0.34, "DOWN": 0.33}
-    scale = max(float(uncertainty_pct or 0.8), 0.25)
+    if expected_return_pct is None or uncertainty_pct is None:
+        return {}
+    scale = max(float(uncertainty_pct), 0.25)
     strength = max(-1.0, min(1.0, expected_return_pct / (scale * 1.5)))
     flat = max(0.18, 0.48 - abs(strength) * 0.28)
     directional = 1.0 - flat
@@ -120,8 +124,7 @@ def normalise(probabilities: dict[str, float]) -> dict[str, float]:
     }
     total = sum(clean.values())
     if total <= 0:
-        even = 1.0 / max(len(probabilities), 1)
-        return {key: round(even, 6) for key in probabilities}
+        return {}
     return {key: round(value / total, 6) for key, value in clean.items()}
 
 

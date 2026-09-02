@@ -164,7 +164,7 @@ def test_actual_bif_cds_path_blocks_extreme_untrained_model_output() -> None:
 
 
 def test_analytical_ensemble_cannot_emit_action_contract(monkeypatch) -> None:
-    monkeypatch.setattr(m10_ensemble, "_direction_vectors", lambda *_: [])
+    monkeypatch.setattr(m10_ensemble, "_direction_vectors", lambda *_: ([], []))
     monkeypatch.setattr(m10_ensemble, "_accuracy_tracking", lambda: {})
     context = object()
 

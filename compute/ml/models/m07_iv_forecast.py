@@ -8,6 +8,8 @@ from ml.feature_engineering import MLContext, current_value
 
 
 MODEL_ID = "m07_iv_forecast"
+INPUT_DATASET = "iv_history"
+REQUIRED_INPUTS = ("iv_history.atm_iv",)
 MINIMUM_ROWS = 60
 
 
@@ -16,7 +18,10 @@ def train_model(context: MLContext, force: bool = False) -> dict[str, Any]:
     rows = len(context.iv_history)
     return {
         "model_id": MODEL_ID,
-        "is_trained": rows >= MINIMUM_ROWS,
+        "is_trained": False,
+        "is_valid": rows >= MINIMUM_ROWS,
+        "status": "READY_ANALYTICAL" if rows >= MINIMUM_ROWS else "INSUFFICIENT_DATA",
+        "reason_code": None if rows >= MINIMUM_ROWS else "INSUFFICIENT_IV_HISTORY",
         "train_rows": rows,
         "model_used": "holt_winters" if rows >= MINIMUM_ROWS else None,
     }
@@ -38,6 +43,9 @@ def predict(context: MLContext, confidence_multiplier: float = 1.0) -> dict[str,
             "available_rows": len(context.iv_history),
             "minimum_rows": MINIMUM_ROWS,
             "reason": "iv_history needs 60 rows for sequence forecast",
+            "status": "INSUFFICIENT_DATA",
+            "reason_code": "INSUFFICIENT_IV_HISTORY",
+            "is_valid": False,
             "current_atm_iv": current_iv,
         }
     try:
@@ -56,6 +64,9 @@ def predict(context: MLContext, confidence_multiplier: float = 1.0) -> dict[str,
             "available_rows": len(context.iv_history),
             "minimum_rows": MINIMUM_ROWS,
             "reason": str(error),
+            "status": "FAILED",
+            "reason_code": "SEQUENCE_FORECAST_FAILED",
+            "is_valid": False,
         }
 
 
@@ -86,7 +97,10 @@ def _holt_winters(context: MLContext) -> dict[str, Any]:
         mape = None
     return {
         "model_id": MODEL_ID,
-        "is_trained": True,
+        "is_trained": False,
+        "is_valid": True,
+        "status": "READY_ANALYTICAL",
+        "reason_code": None,
         "prediction": round(float(forecast.iloc[2]), 6),
         "iv_forecast_1d": round(one_day, 6),
         "iv_forecast_3d": round(float(forecast.iloc[2]), 6),
@@ -94,4 +108,6 @@ def _holt_winters(context: MLContext) -> dict[str, Any]:
         "confidence_interval_1d": [round(lower, 6), round(upper, 6)],
         "model_used": "holt_winters",
         "mape_30d": round(mape, 6) if mape is not None else None,
+        "confidence": None,
+        "confidence_formula": None,
     }

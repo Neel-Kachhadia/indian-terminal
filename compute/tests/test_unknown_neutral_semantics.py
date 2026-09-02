@@ -19,9 +19,9 @@ class _FakeContext:
         self.current_vector = pd.Series(dtype="float64")
 
 
-def test_m03_strategy_selector_stays_flat_when_options_inputs_missing() -> None:
+def test_m03_strategy_selector_is_unavailable_when_options_inputs_missing() -> None:
     strategy, reasoning = m03_strategy_selector._deterministic_strategy(_FakeContext())
-    assert strategy == "STAY_FLAT"
+    assert strategy is None
     assert any("unavailable" in line for line in reasoning)
 
 
@@ -32,7 +32,7 @@ def test_m03_strategy_selector_does_not_act_on_partial_fabricated_inputs() -> No
     # unavailable. gex/pcr/dte unknown must block the recommendation instead.
     ctx = _FakeContext({"iv_rank": 80.0})  # gex/pcr/dte still missing
     strategy, reasoning = m03_strategy_selector._deterministic_strategy(ctx)
-    assert strategy == "STAY_FLAT"
+    assert strategy is None
     assert any("unavailable" in line for line in reasoning)
 
 
@@ -53,7 +53,10 @@ def test_m18_bandit_discloses_missing_inputs_instead_of_hiding_fabrication() -> 
     assert result["reason"] != "Thompson priors only; update after live outcomes"
 
 
-def test_m18_bandit_can_recommend_directional_strategy_with_real_inputs() -> None:
+def test_m18_bandit_does_not_recommend_without_resolved_outcomes() -> None:
     ctx = _FakeContext({"iv_rank": 20.0, "pcr": 1.0, "overall_score": 70.0})
     result = m18_bandit.predict(ctx)
-    assert result["reason"] == "Thompson priors only; update after live outcomes"
+    assert result["recommended_strategy"] is None
+    assert result["strategy_probabilities"] == {}
+    assert result["status"] == "INSUFFICIENT_DATA"
+    assert "outcomes" in result["reason"]

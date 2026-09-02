@@ -54,26 +54,33 @@ def predict(
     aleatoric = float(np.std(historical[-20:], ddof=0))
     component_outputs = component_outputs or {}
     model_disagreement = _component_disagreement(component_outputs)
-    epistemic = float(min(1.0, std / 3.0 + model_disagreement))
+    epistemic = float(min(1.0, std / 3.0 + (model_disagreement or 0.0)))
     direction = "UP" if mean > 0.15 else "DOWN" if mean < -0.15 else "FLAT"
     stable = epistemic < 0.35 and aleatoric < 1.2
     return {
         "model_id": MODEL_ID,
         "is_trained": False,
+        "is_valid": True,
+        "status": "READY_ANALYTICAL",
+        "reason_code": None,
         "model_used": "bootstrap_mc_dropout_fallback",
         "prediction": direction,
-        "direction_mean": direction,
+        "direction_mean": round(mean, 6),
         "direction_std": round(std, 6),
         "epistemic_uncertainty": round(epistemic, 6),
         "aleatoric_uncertainty": round(aleatoric, 6),
         "mc_samples": 100,
         "prediction_stable": bool(stable),
-        "confidence": round(max(0.0, 1.0 - epistemic), 6),
+        "confidence": None,
+        "confidence_formula": None,
+        "component_disagreement": (
+            round(model_disagreement, 6) if model_disagreement is not None else None
+        ),
         "reason": "Bayesian network optional; historical bootstrap uncertainty used",
     }
 
 
-def _component_disagreement(component_outputs: dict[str, Any]) -> float:
+def _component_disagreement(component_outputs: dict[str, Any]) -> float | None:
     directions = []
     for key in ("m02_direction", "m06_regime_return", "m11_tft", "m14_wavelet"):
         output = component_outputs.get(key) or {}
@@ -81,6 +88,6 @@ def _component_disagreement(component_outputs: dict[str, Any]) -> float:
         if value in {"UP", "FLAT", "DOWN"}:
             directions.append(value)
     if len(directions) < 2:
-        return 0.15
+        return None
     top_count = max(directions.count(item) for item in set(directions))
     return 1.0 - top_count / len(directions)

@@ -12,7 +12,10 @@ def train_model(context: MLContext, force: bool = False) -> dict[str, Any]:
     del force
     return {
         "model_id": MODEL_ID,
-        "is_trained": _sklearn_available() and context.available_rows >= 50,
+        "is_trained": False,
+        "is_valid": not context.current_vector.empty,
+        "status": "READY_ANALYTICAL" if not context.current_vector.empty else "UNAVAILABLE",
+        "reason_code": None if not context.current_vector.empty else "CURRENT_FEATURES_UNAVAILABLE",
         "train_rows": context.available_rows,
     }
 
@@ -25,29 +28,30 @@ def predict(
     del confidence_multiplier
     quality = _data_quality_score(context)
     uncertainty = _regime_uncertainty(component_outputs)
-    trained = _sklearn_available() and context.available_rows >= 50
+    available = not context.current_vector.empty
     return {
         "model_id": MODEL_ID,
-        "is_trained": trained,
-        "prediction": "NORMAL" if quality >= 50 and uncertainty < 0.45 else "UNCERTAIN",
+        "is_trained": False,
+        "is_valid": available,
+        "status": "READY_ANALYTICAL" if available else "UNAVAILABLE",
+        "reason_code": None if available else "CURRENT_FEATURES_UNAVAILABLE",
+        "prediction": (
+            "NORMAL" if quality >= 50 and uncertainty < 0.45 else "UNCERTAIN"
+        ) if available else None,
         "iv_surface_gp": {
             "mean": [],
             "std": [],
-            "quality": round(max(0.0, min(1.0, quality / 100.0)), 6),
+            "quality": (
+                round(max(0.0, min(1.0, quality / 100.0)), 6)
+                if available else None
+            ),
         },
         "regime_uncertainty": round(uncertainty, 6),
-        "data_quality_score": round(quality, 3),
-        "reason": None if trained else "sklearn GP unavailable or insufficient rows; returning uncertainty diagnostics",
+        "data_quality_score": round(quality, 3) if available else None,
+        "reason": "data-quality diagnostic; no Gaussian-process artifact is registered",
+        "confidence": None,
+        "confidence_formula": None,
     }
-
-
-def _sklearn_available() -> bool:
-    try:
-        import sklearn  # noqa: F401
-
-        return True
-    except Exception:
-        return False
 
 
 def _data_quality_score(context: MLContext) -> float:

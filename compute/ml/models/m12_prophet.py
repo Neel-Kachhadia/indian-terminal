@@ -64,8 +64,8 @@ def predict(context: MLContext, confidence_multiplier: float = 1.0) -> dict[str,
     fitted = np.exp(intercept + slope * x)
     residual = float(window.iloc[-1] - fitted[-1])
     residual_series = pd.Series(window.to_numpy(dtype=float) - fitted)
-    residual_std = float(residual_series.std(ddof=0) or 1.0)
-    residual_z = residual / residual_std
+    residual_std = float(residual_series.std(ddof=0))
+    residual_z = residual / residual_std if residual_std > 1e-12 else 0.0
     daily_trend_pct = (np.exp(slope) - 1.0) * 100.0
     trend_strength = min(1.0, abs(daily_trend_pct) / 0.35)
     trend_direction = "UP" if daily_trend_pct > 0.04 else "DOWN" if daily_trend_pct < -0.04 else "FLAT"
@@ -78,12 +78,17 @@ def predict(context: MLContext, confidence_multiplier: float = 1.0) -> dict[str,
     return {
         "model_id": MODEL_ID,
         "is_trained": False,
+        "is_valid": True,
+        "status": "READY_ANALYTICAL",
+        "reason_code": None,
         "model_used": "holt_winters_fallback",
         "prediction": regime,
         "trend_direction": trend_direction,
         "trend_strength": round(float(trend_strength), 6),
-        "weekly_effect_today": round(float(weekly_effect), 6),
-        "yearly_effect_today": 0.0,
+        "weekly_effect_today": (
+            round(float(weekly_effect), 6) if weekly_effect is not None else None
+        ),
+        "yearly_effect_today": None,
         "residual_today": round(float(residual), 6),
         "residual_z_score": round(float(residual_z), 6),
         "regime": regime,
@@ -91,7 +96,8 @@ def predict(context: MLContext, confidence_multiplier: float = 1.0) -> dict[str,
         "forecast_30d": round(forecast_30d, 6),
         "next_event_days": int(event_days),
         "next_event_name": event_name,
-        "confidence": round(0.35 + trend_strength * 0.25, 6),
+        "confidence": None,
+        "confidence_formula": None,
         "reason": "Prophet optional; deterministic trend/seasonality fallback used",
     }
 
@@ -104,16 +110,16 @@ def _regime(trend: str, residual_z: float, vol: float) -> str:
     return {"UP": "TREND_UP", "DOWN": "TREND_DOWN"}.get(trend, "RANGE")
 
 
-def _weekly_effect(context: MLContext) -> float:
+def _weekly_effect(context: MLContext) -> float | None:
     returns = return_series(context)
     if returns.empty:
-        return 0.0
+        return None
     today_dow = dt.date.today().weekday()
     by_day = returns.groupby(pd.Series(returns.index).map(lambda item: item.weekday()).to_numpy()).mean()
     try:
         return float(by_day.loc[today_dow])
     except Exception:
-        return 0.0
+        return None
 
 
 def _next_event(today: dt.date) -> tuple[str, int]:

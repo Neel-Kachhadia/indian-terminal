@@ -7,7 +7,6 @@ import numpy as np
 from ml.feature_engineering import MLContext
 
 from .apex_common import (
-    confidence,
     direction_probabilities,
     return_series,
     top_current_features,
@@ -54,7 +53,9 @@ def predict(context: MLContext, confidence_multiplier: float = 1.0) -> dict[str,
     recent = float(returns.tail(5).mean())
     medium = float(returns.tail(20).mean())
     long = float(returns.mean())
-    sigma = float(returns.tail(20).std(ddof=0) or returns.std(ddof=0) or 0.8)
+    recent_sigma = float(returns.tail(20).std(ddof=0))
+    full_sigma = float(returns.std(ddof=0))
+    sigma = recent_sigma if np.isfinite(recent_sigma) else full_sigma
     forecast_1d = 0.50 * recent + 0.35 * medium + 0.15 * long
     forecast_3d = forecast_1d * 2.2
     forecast_5d = forecast_1d * 3.2
@@ -72,11 +73,16 @@ def predict(context: MLContext, confidence_multiplier: float = 1.0) -> dict[str,
     return {
         "model_id": MODEL_ID,
         "is_trained": False,
+        "is_valid": True,
+        "status": "READY_ANALYTICAL",
+        "reason_code": None,
         "model_used": "statistical_sequence_fallback",
         "prediction": direction,
         "direction": direction,
         "probabilities": probabilities,
-        "confidence": confidence(probabilities),
+        "confidence": None,
+        "confidence_formula": None,
+        "probability_kind": "uncalibrated_statistical_score",
         "return_p10_1d": round(float(p10), 6),
         "return_p50_1d": round(float(forecast_1d), 6),
         "return_p90_1d": round(float(p90), 6),

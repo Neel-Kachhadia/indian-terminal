@@ -374,7 +374,7 @@ class StockModelTrainer:
         avg_gain = gain.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
         avg_loss = loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
         rs = avg_gain / avg_loss.replace(0.0, pd.NA)
-        return (100.0 - (100.0 / (1.0 + rs))).fillna(50.0)
+        return 100.0 - (100.0 / (1.0 + rs))
 
     def _adx(self, frame: pd.DataFrame, period: int) -> pd.Series:
         up_move = frame["high"].diff()

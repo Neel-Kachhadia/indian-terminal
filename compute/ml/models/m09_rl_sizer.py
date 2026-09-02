@@ -2,9 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from ml.calibrator import clipped_confidence
-
-
 MODEL_ID = "m09_rl_sizer"
 
 
@@ -24,9 +21,25 @@ def predict(
 ) -> dict[str, Any]:
     del context
     direction_probs = _direction_probabilities(component_outputs or {})
-    up = direction_probs.get("UP", 0.33)
-    down = direction_probs.get("DOWN", 0.33)
-    flat = direction_probs.get("FLAT", 0.34)
+    if direction_probs is None:
+        return {
+            "model_id": MODEL_ID,
+            "is_trained": False,
+            "is_valid": False,
+            "status": "UNAVAILABLE",
+            "reason_code": "NO_ELIGIBLE_DIRECTION_PROBABILITIES",
+            "reason": "0/2 trained direction models provide eligible probabilities",
+            "prediction": None,
+            "recommended_size": None,
+            "recommended_direction": None,
+            "kelly_fraction": None,
+            "quarter_kelly": None,
+            "model_used": "quarter_kelly_analytical",
+            "confidence": None,
+        }
+    up = direction_probs["UP"]
+    down = direction_probs["DOWN"]
+    flat = direction_probs["FLAT"]
     edge_direction = up - down
     win_probability = max(up, down)
     payoff_ratio = 1.15
@@ -44,24 +57,33 @@ def predict(
     return {
         "model_id": MODEL_ID,
         "is_trained": False,
+        "is_valid": True,
+        "status": "READY_ANALYTICAL",
+        "reason_code": None,
         "prediction": round(recommended_direction, 6),
         "recommended_size": round(recommended_size, 6),
         "recommended_direction": round(recommended_direction, 6),
         "kelly_fraction": round(kelly, 6),
         "quarter_kelly": round(quarter_kelly, 6),
-        "model_used": "kelly_fallback",
-        "confidence": clipped_confidence({"edge": win_probability}, confidence_multiplier),
+        "model_used": "quarter_kelly_analytical",
+        "confidence": None,
+        "confidence_formula": None,
+        "payoff_ratio_assumption": payoff_ratio,
+        "reason": "analytical quarter-Kelly sizing; payoff ratio is an explicit assumption, not measured",
     }
 
 
-def _direction_probabilities(component_outputs: dict[str, Any]) -> dict[str, float]:
+def _direction_probabilities(
+    component_outputs: dict[str, Any],
+) -> dict[str, float] | None:
     candidates: list[dict[str, float]] = []
     for key in ["m02_direction", "m06_regime_return"]:
-        probs = (component_outputs.get(key) or {}).get("probabilities")
-        if isinstance(probs, dict) and probs:
+        output = component_outputs.get(key) or {}
+        probs = output.get("probabilities")
+        if output.get("is_trained") is True and isinstance(probs, dict) and probs:
             candidates.append({label: float(probs.get(label, 0.0)) for label in ["UP", "FLAT", "DOWN"]})
     if not candidates:
-        return {"UP": 0.33, "FLAT": 0.34, "DOWN": 0.33}
+        return None
     return {
         label: sum(item[label] for item in candidates) / len(candidates)
         for label in ["UP", "FLAT", "DOWN"]

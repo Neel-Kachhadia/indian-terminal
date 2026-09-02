@@ -29,9 +29,22 @@ def predict(
     del context
     components = component_outputs or {}
     ensemble_probs = _probabilities_from_components(components)
-    top_prob = max(ensemble_probs.values()) if ensemble_probs else 0.34
-    edge = max(0.0, top_prob - 0.5)
     uncertainty = _uncertainty(components)
+    if not ensemble_probs or uncertainty is None:
+        return {
+            "model_id": MODEL_ID,
+            "is_trained": False,
+            "is_valid": False,
+            "status": "UNAVAILABLE",
+            "reason_code": "ELIGIBLE_ENSEMBLE_OR_UNCERTAINTY_UNAVAILABLE",
+            "reason": "validated ensemble probabilities and measured uncertainty are required",
+            "prediction": None,
+            "recommended_size": None,
+            "q_values": {},
+            "confidence": None,
+        }
+    top_prob = max(ensemble_probs.values())
+    edge = max(0.0, top_prob - 0.5)
     size = clamp(edge * 2.0 * confidence_multiplier * (1.0 - uncertainty) * 0.25, 0.0, 1.0)
     q_values = {
         str(action): round(float(top_prob - uncertainty - abs(action - size)), 6)
@@ -40,28 +53,29 @@ def predict(
     return {
         "model_id": MODEL_ID,
         "is_trained": False,
+        "is_valid": True,
+        "status": "READY_ANALYTICAL",
+        "reason_code": None,
         "prediction": size,
         "recommended_size": round(float(size), 6),
         "q_values": q_values,
         "model_used": "kelly_fallback",
-        "confidence": round(max(0.0, top_prob - uncertainty), 6),
+        "confidence": None,
+        "confidence_formula": None,
         "reason": "DQN policy unavailable; conservative quarter-Kelly fallback used",
     }
 
 
 def _probabilities_from_components(components: dict[str, Any]) -> dict[str, float]:
     for key in ("m10_ensemble", "ensemble"):
-        probs = (components.get(key) or {}).get("composite_probabilities")
-        if isinstance(probs, dict) and probs:
+        output = components.get(key) or {}
+        probs = output.get("composite_probabilities")
+        if output.get("is_valid") is True and isinstance(probs, dict) and probs:
             return {str(name): float(value) for name, value in probs.items()}
-    for key in ("m02_direction", "m11_tft", "m14_wavelet"):
-        probs = (components.get(key) or {}).get("probabilities")
-        if isinstance(probs, dict) and probs:
-            return {str(name): float(value) for name, value in probs.items()}
-    return {"UP": 0.33, "FLAT": 0.34, "DOWN": 0.33}
+    return {}
 
 
-def _uncertainty(components: dict[str, Any]) -> float:
+def _uncertainty(components: dict[str, Any]) -> float | None:
     conformal_width = (components.get("m17_conformal") or {}).get("interval_width")
     bnn = (components.get("m20_bnn") or {}).get("epistemic_uncertainty")
     values = []
@@ -70,4 +84,4 @@ def _uncertainty(components: dict[str, Any]) -> float:
             values.append(max(0.0, min(1.0, float(value) / 4.0)))
         except (TypeError, ValueError):
             pass
-    return sum(values) / len(values) if values else 0.35
+    return sum(values) / len(values) if values else None
