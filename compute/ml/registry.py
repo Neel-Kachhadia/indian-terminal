@@ -68,6 +68,9 @@ def ensure_registry() -> None:
                 calibration_metric_name TEXT,
                 calibration_metric_value REAL,
                 calibration_sample_count INTEGER NOT NULL,
+                dataset_fingerprint TEXT,
+                runtime_versions TEXT,
+                expected_feature_count INTEGER,
                 registered_at TEXT NOT NULL,
                 retired_at TEXT
             );
@@ -86,6 +89,15 @@ def ensure_registry() -> None:
             connection.execute(
                 "ALTER TABLE model_registry ADD COLUMN artifact_format_version INTEGER NOT NULL DEFAULT 0"
             )
+        for name, data_type in (
+            ("dataset_fingerprint", "TEXT"),
+            ("runtime_versions", "TEXT"),
+            ("expected_feature_count", "INTEGER"),
+        ):
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE model_registry ADD COLUMN {name} {data_type}"
+                )
 
 
 def register_artifact(path: Path, artifact: dict[str, Any], saved_root: Path) -> dict[str, Any]:
@@ -130,6 +142,9 @@ def register_artifact(path: Path, artifact: dict[str, Any], saved_root: Path) ->
         "calibration_metric_name": artifact.get("calibration_metric_name"),
         "calibration_metric_value": artifact.get("calibration_metric_value"),
         "calibration_sample_count": int(artifact["calibration_sample_count"]),
+        "dataset_fingerprint": str(artifact["dataset_fingerprint"]),
+        "runtime_versions": json.dumps(artifact["runtime_versions"], sort_keys=True),
+        "expected_feature_count": int(artifact["expected_feature_count"]),
         "registered_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "retired_at": None,
     }
@@ -324,6 +339,7 @@ def _validate_metadata(artifact: dict[str, Any]) -> None:
         "serialization_format", "artifact_format_version",
         "validation_start", "validation_end", "test_start", "test_end", "train_rows",
         "validation_sample_count", "test_sample_count", "calibration_sample_count",
+        "dataset_fingerprint", "runtime_versions", "expected_feature_count",
     }
     missing = sorted(field for field in required if artifact.get(field) in (None, ""))
     if missing:

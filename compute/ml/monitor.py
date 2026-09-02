@@ -9,6 +9,21 @@ from typing import Any
 from db.duckdb_client import DB_WRITE_LOCK, writer_connection
 from db.write_service import ReadOperation, resolve_read
 
+# model_id -> (target_builder, minimum future trading days needed before a
+# prediction can be resolved). Only classifiers with a target definition
+# that is (a) genuinely forward-looking and (b) defined independently of any
+# trained artifact are eligible -- reusing the exact training-time target
+# functions guarantees the resolved "actual" label can never drift from what
+# the model was actually trained/evaluated against, and cannot be lookahead
+# (it only ever reads OHLCV rows dated at or after the prediction's own
+# data_as_of, which by construction have not yet occurred at prediction
+# time and are only available now because real time has since passed).
+_RESOLVABLE_TARGETS: dict[str, tuple[str, int]] = {
+    "m02_direction": ("direction_target", 1),
+    "m06_regime_return": ("direction_target", 1),
+    "m01_vol_regime": ("vol_regime_target", 5),
+}
+
 
 def ensure_ml_tables() -> None:
     with DB_WRITE_LOCK:
@@ -62,6 +77,18 @@ def log_prediction(
     *,
     attribution: dict[str, Any],
 ) -> str:
+    if prediction is None:
+        raise ValueError("unavailable prediction must not be logged")
+    if confidence is None:
+        raise ValueError("prediction confidence is required for OOS tracking")
+    try:
+        numeric_confidence = float(confidence)
+    except (TypeError, ValueError) as error:
+        raise ValueError("prediction confidence must be finite") from error
+    if not (0.0 <= numeric_confidence <= 1.0):
+        raise ValueError("prediction confidence must be within [0, 1]")
+    if not probabilities:
+        raise ValueError("prediction probabilities are required for OOS tracking")
     ensure_ml_tables()
     clean_probs = probabilities or {}
     payload = json.dumps(clean_probs, sort_keys=True)
@@ -86,9 +113,9 @@ def log_prediction(
                     model_id,
                     dt.datetime.now(dt.timezone.utc),
                     feature_hash,
-                    prediction or "UNTRAINED",
+                    prediction,
                     payload,
-                    float(confidence or 0.0),
+                    numeric_confidence,
                     attribution.get("requested_symbol"),
                     attribution.get("data_as_of"),
                     attribution.get("model_version"),
@@ -171,6 +198,9 @@ def accuracy_for_model(model_id: str, n_days: int = 30) -> dict[str, Any]:
         "resolved_predictions": total,
         "sample_count": total,
         "measured": total > 0,
+        "status": "READY" if total >= 30 else "INSUFFICIENT_OOS_HISTORY",
+        "required_sample_count": 30,
+        "actual_sample_count": total,
         "accuracy": round(accuracy, 6) if accuracy is not None else None,
         "classification_error_rate": round(float(rows[2]), 6) if rows[2] is not None else None,
         "brier_score": brier,
@@ -211,6 +241,130 @@ def accuracy_report(n_days: int = 30) -> dict[str, Any]:
         "window_days": n_days,
         "models": {model_id: accuracy_for_model(model_id, n_days) for model_id in model_ids},
     }
+
+
+class _OhlcvOnlyContext:
+    """Minimal stand-in for MLContext -- direction_target/vol_regime_target
+    only ever read `.ohlcv`, never any other MLContext field."""
+
+    def __init__(self, ohlcv: Any) -> None:
+        self.ohlcv = ohlcv
+
+
+def _load_symbol_close_frame(symbol: str) -> Any:
+    import pandas as pd
+
+    from backtest.spot_quality import verified_spot_sources
+    from data.index_aliases import index_symbol_candidates
+
+    candidates = index_symbol_candidates(symbol) or [symbol]
+    sources = sorted(verified_spot_sources(symbol))
+    result = resolve_read(
+        ReadOperation.LOAD_FEATURE_OHLCV,
+        {"candidates": candidates, "sources": sources},
+    )
+    return pd.DataFrame(result["rows"], columns=result["columns"])
+
+
+def resolve_pending_prediction_outcomes(
+    model_ids: list[str] | None = None,
+    *,
+    limit: int = 5000,
+) -> dict[str, Any]:
+    """Canonical outcome resolver for classifier predictions logged via
+    log_prediction()/PREDICT_AND_LOG. There has never been a scheduled task
+    that calls record_prediction_outcome() -- it exists only as a manual
+    POST /ml/predictions/{id}/outcome endpoint with no automated caller, so
+    every classifier prediction ever logged has sat with outcome=NULL
+    forever (verified live: 2,790 rows, 0 resolved, across every model_id).
+
+    This resolves only the 3 model_ids with a target definition that is both
+    genuinely forward-looking and defined independently of any trained
+    artifact (direction_target for m02/m06, vol_regime_target for m01 -- see
+    _RESOLVABLE_TARGETS), by re-deriving the actual label with the exact
+    same training-time target function against OHLCV that has, in real
+    time, since become available. It never rewrites `prediction`,
+    `probabilities`, `confidence`, or any other prediction-time field --
+    only ever fills the previously-NULL outcome/outcome_at/correct/
+    brier_score columns, and only once, per record_prediction_outcome's own
+    idempotency guard (raises "already recorded" on a second attempt, caught
+    and skipped here).
+
+    No lookahead: a row is only resolved once real time has actually passed
+    its target date and that date's OHLCV is present, and the resolved
+    label is derived from data no earlier than the prediction's own
+    data_as_of -- never from data that predates it.
+    """
+    from ml.feature_engineering import direction_target, vol_regime_target
+
+    target_builders = {"direction_target": direction_target, "vol_regime_target": vol_regime_target}
+    eligible = [m for m in (model_ids or list(_RESOLVABLE_TARGETS)) if m in _RESOLVABLE_TARGETS]
+    summary: dict[str, Any] = {
+        "eligible_model_ids": eligible,
+        "candidates": 0,
+        "resolved": 0,
+        "not_yet_resolvable": 0,
+        "already_resolved_skipped": 0,
+        "no_symbol_or_data_as_of": 0,
+        "errors": 0,
+        "by_model": {m: {"resolved": 0, "not_yet_resolvable": 0} for m in eligible},
+    }
+    if not eligible:
+        return summary
+
+    placeholders = ", ".join("?" for _ in eligible)
+    with DB_WRITE_LOCK:
+        con = writer_connection()
+        try:
+            rows = con.execute(
+                f"""
+                SELECT id, model_id, symbol, data_as_of
+                FROM ml_predictions
+                WHERE model_id IN ({placeholders}) AND outcome IS NULL
+                ORDER BY data_as_of ASC
+                LIMIT ?
+                """,
+                [*eligible, int(limit)],
+            ).fetchall()
+        finally:
+            con.close()
+    summary["candidates"] = len(rows)
+
+    labels_cache: dict[tuple[str, str], Any] = {}
+    for prediction_id, model_id, symbol, data_as_of in rows:
+        if not symbol or not data_as_of:
+            summary["no_symbol_or_data_as_of"] += 1
+            continue
+        builder_name, _horizon = _RESOLVABLE_TARGETS[model_id]
+        cache_key = (builder_name, str(symbol))
+        labels = labels_cache.get(cache_key)
+        if labels is None:
+            try:
+                frame = _load_symbol_close_frame(str(symbol))
+                labels = target_builders[builder_name](_OhlcvOnlyContext(frame))
+            except Exception:
+                summary["errors"] += 1
+                continue
+            labels_cache[cache_key] = labels
+        try:
+            anchor = dt.date.fromisoformat(str(data_as_of)[:10])
+        except ValueError:
+            summary["no_symbol_or_data_as_of"] += 1
+            continue
+        actual = labels.get(anchor) if hasattr(labels, "get") else None
+        if actual is None or (isinstance(actual, float) and actual != actual):
+            summary["not_yet_resolvable"] += 1
+            summary["by_model"][model_id]["not_yet_resolvable"] += 1
+            continue
+        try:
+            record_prediction_outcome(str(prediction_id), str(actual))
+            summary["resolved"] += 1
+            summary["by_model"][model_id]["resolved"] += 1
+        except RuntimeError:
+            summary["already_resolved_skipped"] += 1
+        except Exception:
+            summary["errors"] += 1
+    return summary
 
 
 def _multiclass_brier(probabilities: dict[str, float], actual: str) -> float | None:

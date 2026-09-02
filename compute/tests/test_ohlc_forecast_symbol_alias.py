@@ -32,3 +32,18 @@ def test_nifty_symbol_alias_matches_decision_eligible_rows(
     frame = main._load_ohlcv_full_frame("NIFTY")
     assert not frame.empty, "NIFTY must resolve through the same alias table as every other symbol"
     assert len(frame) == 3
+
+
+@pytest.mark.contract
+def test_query_symbols_covers_every_canonical_index_not_just_nifty() -> None:
+    """_query_symbols used to hand-duplicate a candidate table covering only
+    NIFTY <-> "NIFTY 50" -- BANKNIFTY, FINNIFTY and MIDCPNIFTY had no
+    equivalent, so every caller (equity/OHLCV chart range, forecast input
+    frame, /ml/ohlc_forecast/{symbol}) silently saw 0 rows for those symbols
+    the same way NIFTY did before its own fix."""
+    import main
+
+    assert set(main._query_symbols("BANKNIFTY")) == {"BANKNIFTY", "NIFTY BANK"}
+    assert set(main._query_symbols("FINNIFTY")) >= {"FINNIFTY"}
+    assert set(main._query_symbols("MIDCPNIFTY")) >= {"MIDCPNIFTY"}
+    assert main._query_symbols("RELIANCE") == ["RELIANCE"]

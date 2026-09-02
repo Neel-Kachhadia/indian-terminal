@@ -24,9 +24,18 @@ def log_training_result(
     error_msg: str | None = None,
 ) -> None:
     payload = result or {}
-    resolved_status = status or ("success" if payload.get("is_trained") else "failed")
+    resolved_status = status or str(payload.get("status") or "").strip().upper()
+    if not resolved_status:
+        reason = str(payload.get("error") or payload.get("reason") or "")
+        resolved_status = (
+            "READY"
+            if payload.get("artifact_ready") is True or payload.get("is_trained") is True
+            else "INSUFFICIENT_DATA"
+            if "insufficient" in reason.lower() or "empty" in reason.lower()
+            else "FAILED"
+        )
     resolved_error = error_msg
-    if resolved_error is None and resolved_status != "success":
+    if resolved_error is None and resolved_status not in {"READY", "READY_ANALYTICAL"}:
         resolved_error = str(payload.get("error") or payload.get("reason") or "training failed")
 
     n_rows = _int_or_none(payload.get("train_rows"))

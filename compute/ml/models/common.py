@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import datetime as dt
 import io
+import importlib.metadata
 import logging
 import math
+import platform
 import re
 import uuid
 import zipfile
@@ -68,6 +70,7 @@ def untrained_output(
     minimum_rows: int,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    status, reason_code = _unavailable_status(reason)
     output = {
         "model_id": model_id,
         "is_trained": False,
@@ -78,10 +81,25 @@ def untrained_output(
         "available_rows": available_rows,
         "minimum_rows": minimum_rows,
         "reason": reason,
+        "status": status,
+        "reason_code": reason_code,
     }
     if extra:
         output.update(extra)
     return output
+
+
+def _unavailable_status(reason: str) -> tuple[str, str]:
+    text = reason.lower()
+    if "insufficient" in text or "below minimum" in text or "empty" in text:
+        return "INSUFFICIENT_DATA", "INSUFFICIENT_ELIGIBLE_HISTORY"
+    if "quarantin" in text or "corrupt" in text or "hash" in text:
+        return "QUARANTINED", "ARTIFACT_VERIFICATION_FAILED"
+    if "stale" in text:
+        return "STALE", "ARTIFACT_STALE"
+    if "failed" in text or "error" in text or "dependency unavailable" in text:
+        return "FAILED", "TRAINING_OR_DEPENDENCY_FAILED"
+    return "UNTRAINED", "ARTIFACT_NOT_REGISTERED"
 
 
 def train_classifier_artifact(
@@ -145,8 +163,20 @@ def train_classifier_artifact(
     except ValueError as error:
         return None, str(error), len(x_frame)
     train_slice, validation_slice, test_slice = split["slices"]
-    medians = x_frame.iloc[train_slice].median(numeric_only=True).fillna(0.0)
+    train_features = x_frame.iloc[train_slice]
+    usable_columns = [column for column in feature_cols if train_features[column].notna().any()]
+    excluded_features = sorted(set(feature_cols) - set(usable_columns))
+    if not usable_columns:
+        return None, "no finite features in chronological training split", len(x_frame)
+    feature_cols = usable_columns
+    x_frame = x_frame[feature_cols]
+    medians = x_frame.iloc[train_slice].median(numeric_only=True).reindex(feature_cols)
+    if medians.isna().any():
+        missing = ", ".join(str(item) for item in medians[medians.isna()].index[:5])
+        return None, f"training medians unavailable for features: {missing}", len(x_frame)
     x_frame = x_frame.fillna(medians)
+    if not np.isfinite(x_frame.to_numpy(dtype=float)).all():
+        return None, "non-finite values remain after training-split median imputation", len(x_frame)
     y_all = y_labels.map(class_to_index).to_numpy(dtype=int)
     x_all = x_frame.to_numpy(dtype=float)
     x_train, y_train = x_all[train_slice], y_all[train_slice]
@@ -214,6 +244,15 @@ def train_classifier_artifact(
         "calibration_metric_value": calibration["brier_score"],
         "calibration_sample_count": int(len(y_test)),
         "n_features": int(len(feature_cols)),
+        "expected_feature_count": int(len(feature_cols)),
+        "dataset_fingerprint": dataset_fingerprint(
+            pd.concat(
+                [filtered[["date", "target"]].reset_index(drop=True), x_frame],
+                axis=1,
+            )
+        ),
+        "runtime_versions": runtime_versions(model),
+        "excluded_all_null_training_features": excluded_features,
         "train_score": train_score,
         "val_score": validation_score,
         "test_score": test_score,
@@ -241,12 +280,36 @@ def predict_classifier_artifact(
     confidence_multiplier: float = 1.0,
 ) -> dict[str, Any]:
     columns = list(artifact["feature_columns"])
-    vector = context.current_vector.reindex(columns)
+    vector = context.current_vector.reindex(columns).replace([np.inf, -np.inf], np.nan)
+    missing_features = [str(column) for column in columns if pd.isna(vector.get(column))]
     schema_compatible = bool(
         vector.notna().all() and np.isfinite(vector.to_numpy(dtype=float)).all()
     )
-    medians = pd.Series(artifact.get("feature_medians", {}), dtype=float)
-    vector = vector.fillna(medians).fillna(0.0).replace([np.inf, -np.inf], 0.0)
+    medians = pd.Series(artifact.get("feature_medians", {}), dtype=float).reindex(columns)
+    vector = vector.fillna(medians)
+    unresolved = [str(column) for column in columns if pd.isna(vector.get(column))]
+    if unresolved or not np.isfinite(vector.to_numpy(dtype=float)).all():
+        return {
+            "prediction": None,
+            "probabilities": {},
+            "confidence": None,
+            "is_trained": True,
+            "calibrated": bool(artifact.get("calibrated")),
+            "feature_schema_compatible": False,
+            "missing_features": missing_features,
+            "unresolved_features": unresolved,
+            "reason_code": "CURRENT_FEATURE_VECTOR_UNAVAILABLE",
+            "reason": (
+                "current feature vector cannot be completed from stored training medians: "
+                + ", ".join(unresolved[:10])
+            ),
+            "model_attribution": model_attribution(
+                artifact,
+                context.symbol,
+                data_as_of=_data_as_of(context),
+                feature_schema_compatible=False,
+            ),
+        }
     x_current = vector.to_numpy(dtype=float).reshape(1, -1)
     model = artifact["model"]
     classes = list(artifact["classes"])
@@ -276,6 +339,9 @@ def predict_classifier_artifact(
         "calibration_warning": artifact.get("calibration_warning"),
         "feature_importance": artifact.get("feature_importance", {}),
         "feature_schema_compatible": schema_compatible,
+        "missing_features": missing_features,
+        "imputed_feature_count": len(missing_features),
+        "confidence_formula": "maximum calibrated class probability, capped at 0.85",
         "model_attribution": model_attribution(
             artifact,
             context.symbol,
@@ -314,6 +380,32 @@ def save_artifact(
     _keep_last_versions(model_id, target_dir, keep=3, symbol=str(artifact["symbol"]))
     _cache_artifact(path, record, artifact)
     return path, record
+
+
+def dataset_fingerprint(frame: pd.DataFrame) -> str:
+    """Stable SHA-256 over the exact ordered training dataset values."""
+    normalized = frame.copy()
+    for column in normalized.columns:
+        if pd.api.types.is_datetime64_any_dtype(normalized[column]):
+            normalized[column] = normalized[column].astype("datetime64[ns]").astype(str)
+        elif normalized[column].dtype == "object":
+            normalized[column] = normalized[column].astype(str)
+    hashes = pd.util.hash_pandas_object(normalized, index=False).to_numpy(dtype="uint64")
+    return "sha256:" + __import__("hashlib").sha256(hashes.tobytes()).hexdigest()
+
+
+def runtime_versions(model: Any) -> dict[str, str]:
+    packages = {"numpy", "pandas", "scikit-learn", "skops"}
+    root = str(type(model).__module__).split(".", 1)[0]
+    package_alias = {"sklearn": "scikit-learn"}.get(root, root)
+    packages.add(package_alias)
+    versions = {"python": platform.python_version()}
+    for package in sorted(packages):
+        try:
+            versions[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            versions[package] = "UNAVAILABLE"
+    return versions
 
 
 def load_latest_artifact(

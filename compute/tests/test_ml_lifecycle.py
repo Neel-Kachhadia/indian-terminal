@@ -7,6 +7,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import dataclasses
+
 from db import duckdb_client
 from data.market_data_quality import (
     DecisionContext,
@@ -302,5 +304,206 @@ def test_prediction_outcome_has_attribution_error_and_calibration(
                 database=database,
                 queue_path=queue,
             )
+    finally:
+        service.stop()
+
+
+@pytest.mark.contract
+def test_real_training_never_silently_substitutes_proxy_symbols_artifact(
+    isolated_registry: Path,
+) -> None:
+    """Reproduces a live defect: m06_regime_return._train() (and
+    m04_iv_reversion._train()) called train_classifier_artifact() without an
+    explicit allow_proxy argument, so once PROXY_SYMBOL ("NIFTY") had its own
+    validated artifact, train_classifier_artifact's own "already trained?"
+    pre-check (`load_latest_artifact(model_id, context.symbol,
+    allow_proxy=True)` -- proxy allowed by default) silently accepted NIFTY's
+    artifact as the answer for every OTHER symbol's real (force=False)
+    training call: is_trained=True was reported with NIFTY's train_rows, and
+    no artifact was ever registered for the requested symbol.
+
+    Reproduced live in production 2026-09-02: the moment NIFTY got its first
+    real m06_regime_return artifact, the very next symbol trained
+    (FINNIFTY) silently no-opped this way instead of training its own model.
+    Fixed by passing allow_proxy=not train_if_missing at the training call
+    site (proxy fallback remains available at inference/predict time, where
+    it is disclosed via model_attribution.fallback_status -- it must never
+    substitute for real per-symbol training)."""
+    from sklearn.linear_model import LogisticRegression
+
+    def target_builder(ctx: MLContext) -> pd.Series:
+        values = np.where(ctx.feature_frame["feature"].to_numpy() > 100.0, "UP", "DOWN")
+        return pd.Series(values, index=pd.to_datetime(ctx.feature_frame["date"]))
+
+    def train_for(symbol: str, *, allow_proxy: bool) -> dict:
+        context = dataclasses.replace(_context(), symbol=symbol)
+        artifact, reason, _ = common.train_classifier_artifact(
+            context,
+            model_id="test_regime_proxy_guard",
+            classes=["DOWN", "UP"],
+            target_builder=target_builder,
+            estimator_factory=lambda: LogisticRegression(max_iter=500),
+            minimum_rows=100,
+            n_splits=3,
+            gap=1,
+            calibration_method="sigmoid",
+            force=False,
+            train_if_missing=True,
+            allow_proxy=allow_proxy,
+        )
+        assert reason is None and artifact is not None
+        return artifact
+
+    nifty_artifact = train_for("NIFTY", allow_proxy=False)
+    assert nifty_artifact["symbol"] == "NIFTY"
+    assert nifty_artifact.get("fallback_status", "PRIMARY") != "PROXY"
+
+    # The fixed call pattern (allow_proxy=False during real training): a
+    # second symbol with no artifact of its own must get its OWN artifact,
+    # not NIFTY's.
+    other_artifact = train_for("OTHERSTOCK", allow_proxy=False)
+    assert other_artifact["symbol"] == "OTHERSTOCK"
+    assert other_artifact["artifact_hash"] != nifty_artifact["artifact_hash"]
+    registered = common.load_latest_artifact(
+        "test_regime_proxy_guard", "OTHERSTOCK", allow_proxy=False
+    )
+    assert registered is not None, "OTHERSTOCK must have its own registered artifact"
+
+    # Demonstrates the bug this guards against: the vulnerable call pattern
+    # (allow_proxy=True, the old default at every training call site that
+    # didn't override it) silently returns NIFTY's artifact for a symbol
+    # that has never been trained.
+    proxied = train_for("YETANOTHERSTOCK", allow_proxy=True)
+    assert proxied["symbol"] == "NIFTY"
+    assert proxied["fallback_status"] == "PROXY"
+    assert (
+        common.load_latest_artifact(
+            "test_regime_proxy_guard", "YETANOTHERSTOCK", allow_proxy=False
+        )
+        is None
+    ), "allow_proxy=True at a training call site must never be mistaken for real training"
+
+
+@pytest.mark.contract
+def test_resolve_pending_prediction_outcomes_never_looks_ahead_and_is_idempotent(
+    isolated_app_data: Path,
+) -> None:
+    """Reproduces a live defect: there is no scheduled task anywhere in
+    smart_collector.TASK_RUNNERS (or any other caller) that ever invokes
+    record_prediction_outcome() -- it exists only as a manual
+    POST /ml/predictions/{id}/outcome endpoint. Verified live: 2,790
+    ml_predictions rows across every model_id, 0 ever resolved.
+
+    resolve_pending_prediction_outcomes() is the canonical fix: it re-derives
+    the actual label using the exact training-time target function
+    (direction_target/vol_regime_target) against OHLCV that has, in real
+    time, since become available -- never inventing a target definition, and
+    never resolving a row whose target date's OHLCV does not yet exist."""
+    from db.write_service import WriteOperation, WriterService, submit_write
+
+    duckdb_client.DB_PATH = isolated_app_data / "data" / "terminal.db"
+    duckdb_client.init_schema()
+    database = duckdb_client.DB_PATH
+    queue = isolated_app_data / "data" / "writer.sqlite"
+
+    dates = [d.date().isoformat() for d in pd.bdate_range("2026-01-05", periods=6)]
+    # Flat then a clean +2% up move on the final day: resolvable_day's next
+    # close is known (up move); unresolvable_day is the last date in the
+    # frame, so its "next day" does not exist yet.
+    closes = [100.0, 100.0, 100.0, 100.0, 100.0, 102.0]
+
+    service = WriterService(database, queue_path=queue)
+    service.start()
+    try:
+        import duckdb as duckdb_module
+
+        with duckdb_module.connect(str(database)) as connection:
+            with duckdb_client._writer_transaction_scope(connection):
+                for day, close in zip(dates, closes):
+                    connection.execute(
+                        "INSERT INTO ohlcv VALUES ('TESTSTK', CAST(? AS DATE), ?, ?, ?, ?, 1000, 'NSE_EQUITY_BHAVCOPY')",
+                        [day, close, close + 1, close - 1, close],
+                    )
+
+        resolvable_day = dates[3]  # next day (dates[4]) is flat -> "FLAT"
+        unresolvable_day = dates[5]  # last date, no next-day close yet
+
+        resolvable_id = submit_write(
+            WriteOperation.LOG_PREDICTION,
+            {
+                "model_id": "m02_direction",
+                "prediction": "FLAT",
+                "probabilities": {"UP": 0.2, "FLAT": 0.6, "DOWN": 0.2},
+                "confidence": 0.6,
+                "features": {"spot": 1.0},
+                "attribution": {
+                    "requested_symbol": "TESTSTK",
+                    "data_as_of": resolvable_day,
+                    "model_version": "v1",
+                    "artifact_hash": "a" * 64,
+                    "feature_schema_version": "features-v1:test",
+                    "release_version": "0.1.0",
+                    "validation_status": "VALIDATED",
+                    "fallback_status": "PRIMARY",
+                },
+            },
+            database=database,
+            queue_path=queue,
+        )
+        unresolvable_id = submit_write(
+            WriteOperation.LOG_PREDICTION,
+            {
+                "model_id": "m02_direction",
+                "prediction": "UP",
+                "probabilities": {"UP": 0.7, "FLAT": 0.2, "DOWN": 0.1},
+                "confidence": 0.7,
+                "features": {"spot": 1.0},
+                "attribution": {
+                    "requested_symbol": "TESTSTK",
+                    "data_as_of": unresolvable_day,
+                    "model_version": "v1",
+                    "artifact_hash": "a" * 64,
+                    "feature_schema_version": "features-v1:test",
+                    "release_version": "0.1.0",
+                    "validation_status": "VALIDATED",
+                    "fallback_status": "PRIMARY",
+                },
+            },
+            database=database,
+            queue_path=queue,
+        )
+
+        summary = submit_write(
+            WriteOperation.RESOLVE_PENDING_PREDICTION_OUTCOMES,
+            {"model_ids": ["m02_direction"]},
+            database=database,
+            queue_path=queue,
+        )
+        assert summary["candidates"] == 2
+        assert summary["resolved"] == 1
+        assert summary["not_yet_resolvable"] == 1
+
+        with duckdb_module.connect(str(database)) as connection:
+            resolved_row = connection.execute(
+                "SELECT prediction, outcome, correct FROM ml_predictions WHERE id = ?",
+                [resolvable_id],
+            ).fetchone()
+            unresolved_row = connection.execute(
+                "SELECT outcome FROM ml_predictions WHERE id = ?",
+                [unresolvable_id],
+            ).fetchone()
+        assert resolved_row == ("FLAT", "FLAT", 1), "prediction-time value untouched; outcome correctly matches"
+        assert unresolved_row == (None,), "no lookahead: last date's next-day close does not exist yet"
+
+        # Idempotent: re-running must not error or double-resolve.
+        second = submit_write(
+            WriteOperation.RESOLVE_PENDING_PREDICTION_OUTCOMES,
+            {"model_ids": ["m02_direction"]},
+            database=database,
+            queue_path=queue,
+        )
+        assert second["candidates"] == 1  # only the still-unresolvable one
+        assert second["resolved"] == 0
+        assert second["errors"] == 0
     finally:
         service.stop()

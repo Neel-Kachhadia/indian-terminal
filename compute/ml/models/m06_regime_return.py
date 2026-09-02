@@ -25,7 +25,7 @@ def predict(
     confidence_multiplier: float = 1.0,
     regime_output: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    artifact, reason, available_rows = _train(context)
+    artifact, reason, available_rows = _train(context, train_if_missing=False)
     weights = _regime_weights(regime_output)
     active = max(weights, key=weights.get) if weights else None
     if artifact is None:
@@ -56,7 +56,11 @@ def predict(
     return output
 
 
-def _train(context: MLContext, force: bool = False) -> tuple[dict[str, Any] | None, str | None, int]:
+def _train(
+    context: MLContext,
+    force: bool = False,
+    train_if_missing: bool = True,
+) -> tuple[dict[str, Any] | None, str | None, int]:
     return train_classifier_artifact(
         context,
         model_id=MODEL_ID,
@@ -68,6 +72,26 @@ def _train(context: MLContext, force: bool = False) -> tuple[dict[str, Any] | No
         gap=1,
         calibration_method="isotonic",
         force=force,
+        train_if_missing=train_if_missing,
+        # _train() is the shared wrapper for both train_model()
+        # (train_if_missing=True) and predict() (train_if_missing=False), so
+        # this can't be a flat False the way m01_vol_regime's separate
+        # train_model()-only call site uses -- that would also kill this
+        # model's intended proxy fallback at inference time. Without this at
+        # all (the prior state), train_classifier_artifact's default
+        # allow_proxy=True let its own "already trained?" pre-check
+        # (`load_latest_artifact(model_id, context.symbol, allow_proxy=...)`)
+        # silently accept PROXY_SYMBOL's (NIFTY's) artifact as "nothing to
+        # do" during REAL training for every other symbol -- is_trained=True
+        # was then reported with NIFTY's train_rows/artifact, no
+        # fallback_status disclosure, and no artifact was ever registered
+        # for the requested symbol. Reproduced live: the moment NIFTY got
+        # its first real m06 artifact, the very next symbol's (FINNIFTY's)
+        # "training" silently no-opped this way. allow_proxy=not
+        # train_if_missing mirrors m02_direction's identical shared-wrapper
+        # fix: proxy allowed only at inference (train_if_missing=False),
+        # never as a substitute for real per-symbol training.
+        allow_proxy=not train_if_missing,
     )
 
 
@@ -89,4 +113,4 @@ def _regime_weights(regime_output: dict[str, Any] | None) -> dict[str, float]:
     probs = (regime_output or {}).get("probabilities")
     if isinstance(probs, dict) and probs:
         return {key: float(probs.get(key, 0.0)) for key in ["LOW", "MEDIUM", "HIGH"]}
-    return {"LOW": 0.33, "MEDIUM": 0.34, "HIGH": 0.33}
+    return {}

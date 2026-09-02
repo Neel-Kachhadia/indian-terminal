@@ -51,7 +51,13 @@ def predict_all_models(
         "m05_anomaly",
         lambda: m05_anomaly.predict(context),
     )
-    multiplier = float(components["m05_anomaly"].get("confidence_multiplier", 1.0) or 1.0)
+    anomaly = components["m05_anomaly"]
+    multiplier_value = (
+        _as_float(anomaly.get("confidence_multiplier"))
+        if anomaly.get("is_valid") is True
+        else None
+    )
+    multiplier = multiplier_value if multiplier_value is not None else 1.0
 
     components["m01_vol_regime"] = _safe_predict(
         "m01_vol_regime",
@@ -148,6 +154,7 @@ def predict_all_models(
     _extend_apex_output(ensemble, context, components, signal_payload or {})
     data_as_of = _context_data_as_of(context)
     for model_id, output in components.items():
+        _normalise_runtime_status(output)
         output.setdefault(
             "model_attribution",
             _runtime_attribution(model_id, context.symbol, data_as_of=data_as_of),
@@ -164,6 +171,7 @@ def predict_all_models(
             },
         ),
     )
+    _normalise_runtime_status(ensemble)
     decision_evidence = _decision_evidence(context, data_as_of=data_as_of)
     ensemble["decision_input_evidence"] = decision_evidence.to_dict()
     eligibility = _action_eligibility(
@@ -179,6 +187,14 @@ def predict_all_models(
         components.get("m20_bnn", {}),
         eligibility=eligibility.to_dict(),
     )
+    from ml.readiness import build_readiness_matrix
+
+    readiness_outputs = {
+        **components,
+        "m10_ensemble": ensemble,
+        "m21_ohlc": ensemble.get("ohlc_forecast") or {},
+    }
+    ensemble["model_readiness"] = build_readiness_matrix(context, readiness_outputs)
 
     if log:
         for model_id, output in components.items():
@@ -268,10 +284,15 @@ def _uncertainty_level(conformal: dict[str, Any], bnn: dict[str, Any]) -> str:
     width = _as_float((conformal or {}).get("interval_width"))
     epistemic = _as_float((bnn or {}).get("epistemic_uncertainty"))
     score = 0.0
+    observed = 0
     if width is not None:
         score += min(1.0, width / 3.0) * 0.55
+        observed += 1
     if epistemic is not None:
         score += min(1.0, epistemic) * 0.45
+        observed += 1
+    if observed == 0:
+        return "UNAVAILABLE"
     if score >= 0.66:
         return "HIGH"
     if score >= 0.33:
@@ -289,15 +310,17 @@ def _apex_action(
     eligibility: dict[str, Any],
 ) -> dict[str, Any]:
     direction = ensemble.get("composite_direction")
-    confidence = _as_float(ensemble.get("composite_confidence")) or 0.0
+    confidence = _as_float(ensemble.get("composite_confidence"))
     uncertainty = ensemble.get("uncertainty_level")
-    strategy = bandit.get("recommended_strategy") or "STAY_FLAT"
-    size = _as_float(dqn.get("recommended_size")) or 0.0
+    strategy = bandit.get("recommended_strategy")
+    size = _as_float(dqn.get("recommended_size"))
     trade = bool(
         eligibility["eligible"]
         and direction in {"UP", "DOWN"}
+        and confidence is not None
         and confidence >= 0.58
         and uncertainty != "HIGH"
+        and size is not None
         and size > 0
     )
     action = "STAY FLAT"
@@ -310,24 +333,30 @@ def _apex_action(
     if isinstance(interval, list) and len(interval) == 2:
         lower = _as_float(interval[0])
         if lower is not None:
-            max_loss = round(abs(lower) * 0.01 * float(ensemble.get("spot") or 0.0) * 75.0 * max(size, 0.25), 2)
+            spot = _as_float(ensemble.get("spot"))
+            if spot is not None and size is not None:
+                max_loss = round(abs(lower) * 0.01 * spot * 75.0 * max(size, 0.25), 2)
     if not eligibility["eligible"]:
         action = "UNVALIDATED"
     return {
         "trade": trade,
         "action": action,
         "eligibility": eligibility,
-        "strategy": strategy if trade else "STAY_FLAT",
-        "size": size if trade else 0.0,
+        "strategy": strategy if trade else None,
+        "size": size if trade else None,
         "entry_level": ensemble.get("spot"),
         "stop_loss_level": None,
         "target_level": None,
         "risk_reward_ratio": None,
         "maximum_notional_loss": max_loss,
-        "kelly_fraction": size,
-        "recommended_fraction": size if trade else 0.0,
+        "kelly_fraction": size if trade else None,
+        "recommended_fraction": size if trade else None,
         "reasoning": [
-            f"Composite direction {direction} at {confidence * 100:.0f}% confidence.",
+            (
+                f"Composite direction {direction} at {confidence * 100:.0f}% confidence."
+                if confidence is not None
+                else "Composite direction/confidence unavailable."
+            ),
             f"Uncertainty level {uncertainty}.",
             "Action language is decision support only; no automated execution.",
         ],
@@ -398,7 +427,50 @@ def _safe_predict(model_id: str, fn: Any) -> dict[str, Any]:
             "probabilities": {},
             "confidence": None,
             "reason": f"{model_id} crashed: {error}",
+            "status": "FAILED",
+            "reason_code": "INFERENCE_EXCEPTION",
         }
+
+
+def _normalise_runtime_status(output: dict[str, Any]) -> None:
+    if output.get("status"):
+        return
+    prediction = output.get("prediction")
+    if output.get("is_trained") is True and prediction is not None:
+        attribution = output.get("model_attribution")
+        # A component served from PROXY_SYMBOL's artifact (see
+        # ml/models/common.py::load_latest_artifact's allow_proxy candidate
+        # search) must never be indistinguishable from a symbol's own
+        # trained artifact at the top-level status a caller/GUI actually
+        # reads -- model_attribution.fallback_status/trained_symbol already
+        # disclose this, but nothing enforced that a naive consumer reading
+        # only `status`+`prediction`+`confidence` would ever see it
+        # (reproduced live: LTM, with 116 own rows, silently served READY
+        # off NIFTY's model with feature_schema_compatible=False).
+        if isinstance(attribution, dict) and attribution.get("fallback_status") == "PROXY":
+            output["status"] = "READY_PROXY"
+            output.setdefault(
+                "reason_code",
+                f"PROXY_ARTIFACT_FROM_{attribution.get('trained_symbol')}",
+            )
+            return
+        output["status"] = "READY"
+        output.setdefault("reason_code", None)
+        return
+    if prediction is not None:
+        output["status"] = "READY_ANALYTICAL"
+        output.setdefault("reason_code", "NON_ARTIFACT_ANALYTICAL_OUTPUT")
+        return
+    reason = str(output.get("reason") or "").lower()
+    if "insufficient" in reason or "empty" in reason:
+        output["status"] = "INSUFFICIENT_DATA"
+        output.setdefault("reason_code", "INSUFFICIENT_ELIGIBLE_HISTORY")
+    elif "crashed" in reason or "failed" in reason or "error" in reason:
+        output["status"] = "FAILED"
+        output.setdefault("reason_code", "INFERENCE_FAILED")
+    else:
+        output["status"] = "UNAVAILABLE"
+        output.setdefault("reason_code", "OUTPUT_UNAVAILABLE")
 
 
 def _log_output(model_id: str, output: dict[str, Any], features: dict[str, Any]) -> None:
@@ -418,6 +490,9 @@ def _log_output(model_id: str, output: dict[str, Any], features: dict[str, Any])
     confidence = output.get("confidence")
     if confidence is None:
         confidence = output.get("composite_confidence")
+    if prediction is None or _as_float(confidence) is None or not probabilities:
+        output["prediction_tracking_status"] = "SKIPPED_UNAVAILABLE_OUTPUT"
+        return
     try:
         attribution = output.get("model_attribution")
         if not isinstance(attribution, dict):

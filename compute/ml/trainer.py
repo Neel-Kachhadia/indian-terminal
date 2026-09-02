@@ -5,54 +5,22 @@ from typing import Any
 
 from ml.feature_engineering import build_context
 from ml.monitor import accuracy_for_model, accuracy_report
-from ml.models import (
-    m01_vol_regime,
-    m02_direction,
-    m03_strategy_selector,
-    m04_iv_reversion,
-    m05_anomaly,
-    m06_regime_return,
-    m07_iv_forecast,
-    m08_gp_regime,
-    m09_rl_sizer,
-    m10_ensemble,
-    m11_tft,
-    m12_prophet,
-    m13_nbeats,
-    m14_wavelet,
-    m15_kalman,
-    m16_survival,
-    m17_conformal,
-    m18_bandit,
-    m19_dqn,
-    m20_bnn,
-)
 from ml.models.common import SAVED_MODELS_DIR, model_status
+from ml.readiness import discover_model_modules
 from ml.training_log import log_training_result
 
 
-MODEL_MODULES = [
-    ("m01_vol_regime", m01_vol_regime),
-    ("m02_direction", m02_direction),
-    ("m03_strategy", m03_strategy_selector),
-    ("m04_iv_reversion", m04_iv_reversion),
-    ("m05_anomaly", m05_anomaly),
-    ("m06_regime_return", m06_regime_return),
-    ("m07_iv_forecast", m07_iv_forecast),
-    ("m08_gp_regime", m08_gp_regime),
-    ("m09_rl_sizer", m09_rl_sizer),
-    ("m10_ensemble", m10_ensemble),
-    ("m11_tft", m11_tft),
-    ("m12_prophet", m12_prophet),
-    ("m13_nbeats", m13_nbeats),
-    ("m14_wavelet", m14_wavelet),
-    ("m15_kalman", m15_kalman),
-    ("m16_survival", m16_survival),
-    ("m17_conformal", m17_conformal),
-    ("m18_bandit", m18_bandit),
-    ("m19_dqn", m19_dqn),
-    ("m20_bnn", m20_bnn),
-]
+def training_modules() -> list[tuple[str, Any]]:
+    return [
+        (model_id, module)
+        for model_id, module in discover_model_modules().items()
+        if callable(getattr(module, "train_model", None))
+    ]
+
+
+# Backward-compatible exported catalog; its contents are discovered from the
+# source package at import time rather than maintained as a second hardcoded list.
+MODEL_MODULES = training_modules()
 
 
 def train_all_models(force: bool = False, symbol: str = "NIFTY") -> dict[str, Any]:
@@ -64,7 +32,7 @@ def train_all_models(force: bool = False, symbol: str = "NIFTY") -> dict[str, An
         "feature_rows": context.available_rows,
         "models": {},
     }
-    for model_id, module in MODEL_MODULES:
+    for model_id, module in training_modules():
         try:
             result = module.train_model(context, force=force)
         except Exception as error:
@@ -73,6 +41,23 @@ def train_all_models(force: bool = False, symbol: str = "NIFTY") -> dict[str, An
                 "is_trained": False,
                 "reason": str(error),
             }
+        artifact_status = model_status(model_id, context.symbol)
+        result["artifact_ready"] = bool(artifact_status.get("is_trained"))
+        if result["artifact_ready"]:
+            result["status"] = "READY"
+            result["reason_code"] = None
+        elif not result.get("status"):
+            reason = str(result.get("reason") or "")
+            result["status"] = (
+                "INSUFFICIENT_DATA"
+                if "insufficient" in reason.lower() or "empty" in reason.lower()
+                else "FAILED"
+            )
+            result["reason_code"] = (
+                "INSUFFICIENT_ELIGIBLE_HISTORY"
+                if result["status"] == "INSUFFICIENT_DATA"
+                else "TRAINING_DID_NOT_PRODUCE_ARTIFACT"
+            )
         report["models"][model_id] = result
         log_training_result(context.symbol, model_id, result, context=context)
     report["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -80,7 +65,10 @@ def train_all_models(force: bool = False, symbol: str = "NIFTY") -> dict[str, An
 
 
 def load_all_models() -> dict[str, Any]:
-    return {model_id: model_status(model_id, "NIFTY") for model_id, _ in MODEL_MODULES}
+    return {
+        model_id: model_status(model_id, "NIFTY")
+        for model_id in discover_model_modules()
+    }
 
 
 def evaluate_model(model_id: str, n_days: int = 30) -> dict[str, Any]:

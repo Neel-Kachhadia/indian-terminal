@@ -541,7 +541,9 @@ def _stage_frozen_probe_artifacts() -> None:
     from lightgbm import LGBMClassifier  # noqa: PLC0415
     from xgboost import XGBClassifier  # noqa: PLC0415
 
-    from ml.models.common import save_artifact  # noqa: PLC0415
+    import pandas as pd  # noqa: PLC0415
+
+    from ml.models.common import dataset_fingerprint, runtime_versions, save_artifact  # noqa: PLC0415
     from ml.registry import feature_schema_version  # noqa: PLC0415
 
     features = np.asarray(
@@ -586,6 +588,7 @@ def _stage_frozen_probe_artifacts() -> None:
             ),
         ),
     )
+    feature_frame = pd.DataFrame(features, columns=["feature_a", "feature_b"])
     for index, (model_id, estimator) in enumerate(estimators, start=1):
         estimator.fit(features, labels)
         timestamp = f"2026-08-30T00:00:0{index}+00:00"
@@ -621,6 +624,9 @@ def _stage_frozen_probe_artifacts() -> None:
             "calibration_metric_value": 0.0,
             "calibration_sample_count": 3,
             "calibrated": False,
+            "dataset_fingerprint": dataset_fingerprint(feature_frame),
+            "expected_feature_count": feature_frame.shape[1],
+            "runtime_versions": runtime_versions(estimator),
         }
         save_artifact(model_id, artifact, "FROZEN_PROBE")
 

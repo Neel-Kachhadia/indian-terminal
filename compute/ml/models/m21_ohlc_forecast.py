@@ -11,14 +11,17 @@ from typing import Any
 import pandas as pd
 
 from data.exchange_calendar import next_trading_day, today_ist
+from data.index_aliases import index_symbol_candidates
 from db.duckdb_client import DB_WRITE_LOCK, writer_connection
 from ml.models.common import (
     artifact_directory,
     direct_artifact_path,
+    dataset_fingerprint,
     load_latest_artifact,
     model_attribution,
     safe_symbol,
     save_artifact,
+    runtime_versions,
     temporal_train_validation_test_split,
 )
 from ml.registry import feature_schema_version
@@ -26,6 +29,8 @@ from release_identity import load_release_identity
 
 
 MODEL_ID = "m21_ohlc"
+INPUT_DATASET = "ohlcv"
+REQUIRED_INPUTS = ("decision_eligible_ohlcv", "decision_eligible_spot")
 MIN_ROWS = 80
 MIN_ARTIFACT_BYTES = 1000
 
@@ -76,6 +81,7 @@ class OHLCForecaster:
         gap_pct = round((gap_bias / close) * 100.0, 4) if close > 0 else 0.0
         close_mae = self.compute_accuracy(df, n_days=10) if include_accuracy else None
         confidence = self._confidence(len(df), close_mae, close)
+        mae_pct = round((close_mae / close) * 100.0, 6) if close_mae is not None and close > 0 else None
         last = df.tail(1).iloc[0] if not df.empty else None
         prev_high = float(last["high"]) if last is not None else combined["high"]
         prev_low = float(last["low"]) if last is not None else combined["low"]
@@ -101,6 +107,17 @@ class OHLCForecaster:
             "expected_range": expected_range,
             "expected_range_pct": expected_range_pct,
             "confidence": confidence,
+            "confidence_formula": (
+                "categorical(rows, measured_close_mae_10d/current_close): "
+                "HIGH if rows>=200 and mae_pct<=0.35; MEDIUM if rows>=60 and "
+                "mae_pct<=0.8; otherwise LOW"
+            ),
+            "confidence_inputs": {
+                "eligible_rows": len(df),
+                "close_mae_last_10d": close_mae,
+                "current_close": close,
+                "mae_pct": mae_pct,
+            },
             "method_outputs": methods,
             "method_weights": weights,
             "key_levels": key_levels,
@@ -212,6 +229,11 @@ class OHLCForecaster:
             "calibration_metric_value": test_metrics["range_coverage"],
             "calibration_sample_count": len(test_frame),
             "n_features": len(methods),
+            "expected_feature_count": len(methods),
+            "dataset_fingerprint": dataset_fingerprint(
+                df[["date", "open", "high", "low", "close", "volume"]]
+            ),
+            "runtime_versions": runtime_versions(self),
             "train_score": val_score,
             "val_score": val_score,
             "feature_importance": weights,
@@ -643,6 +665,21 @@ class OHLCForecaster:
         with DB_WRITE_LOCK:
             con = writer_connection()
             try:
+                # ohlc_forecasts has no UNIQUE(symbol, forecast_date)
+                # constraint, and this always did a bare INSERT with a
+                # random id -- every scheduled forecast run for a symbol
+                # already covered for that target date silently added
+                # another full duplicate row (observed live: some symbols
+                # had 9+ duplicate rows for the same forecast_date). The
+                # earliest forecast for a given target date is also the
+                # most genuinely blind one; skip rather than re-insert once
+                # any row for this (symbol, forecast_date) exists.
+                existing = con.execute(
+                    "SELECT COUNT(*) FROM ohlc_forecasts WHERE symbol = ? AND forecast_date = CAST(? AS DATE)",
+                    [str(forecast["symbol"]), str(forecast["date"])],
+                ).fetchone()[0]
+                if existing:
+                    return
                 con.execute(
                     """
                     INSERT INTO ohlc_forecasts
@@ -673,9 +710,16 @@ class OHLCForecaster:
                 con.close()
 
     def _update_actuals(self, symbol: str) -> None:
-        candidates = [symbol]
-        if symbol == "NIFTY":
-            candidates.append("NIFTY 50")
+        # Single source of truth for index long-form/short-form aliases (see
+        # data/index_aliases.py). This used to hand-duplicate its own partial
+        # candidate table -- only NIFTY -> "NIFTY 50", never BANKNIFTY ->
+        # "NIFTY BANK" -- the same bug class as ml/stock_trainer.py's
+        # _load_ohlcv (see its fix for the full incident writeup). Verified
+        # actual OHLCV for the index is stored under "NIFTY BANK", so
+        # forecast.actual_close could never be resolved for BANKNIFTY: every
+        # forecast stayed permanently unresolved and kept re-triggering new
+        # duplicate rows on each subsequent collector run.
+        candidates = index_symbol_candidates(symbol) or [symbol]
         placeholders = ", ".join("?" for _ in candidates)
         with DB_WRITE_LOCK:
             con = writer_connection()

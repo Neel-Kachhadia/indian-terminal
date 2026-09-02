@@ -465,8 +465,25 @@ def run_weekly_retrain(_: date) -> str:
 
     report = train_all_models(force=False, symbol="NIFTY")
     models = report.get("models", {})
-    trained = sum(1 for item in models.values() if isinstance(item, dict) and item.get("is_trained"))
-    return f"models={trained} feature_rows={report.get('feature_rows')}"
+    ready = sum(
+        1
+        for item in models.values()
+        if isinstance(item, dict) and item.get("artifact_ready") is True
+    )
+    insufficient = sum(
+        1
+        for item in models.values()
+        if isinstance(item, dict) and item.get("status") == "INSUFFICIENT_DATA"
+    )
+    failed = sum(
+        1
+        for item in models.values()
+        if isinstance(item, dict) and item.get("status") == "FAILED"
+    )
+    return (
+        f"artifacts_ready={ready} insufficient={insufficient} "
+        f"failed={failed} feature_rows={report.get('feature_rows')}"
+    )
 
 
 def run_stock_training(_: date) -> str:

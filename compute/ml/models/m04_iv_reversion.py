@@ -9,6 +9,8 @@ from .common import predict_classifier_artifact, train_classifier_artifact, untr
 
 
 MODEL_ID = "m04_iv_reversion"
+INPUT_DATASET = "iv_history"
+REQUIRED_INPUTS = ("iv_history.atm_iv", "feature_frame")
 CLASSES = ["EXPANDING", "CONTRACTING", "STABLE"]
 MINIMUM_ROWS = 100
 
@@ -21,18 +23,17 @@ def train_model(context: MLContext, force: bool = False) -> dict[str, Any]:
 
 
 def predict(context: MLContext, confidence_multiplier: float = 1.0) -> dict[str, Any]:
-    artifact, reason, available_rows = _train(context)
+    artifact, reason, available_rows = _train(context, train_if_missing=False)
     if artifact is None:
-        fallback = _heuristic_iv_direction(context)
         return untrained_output(
             MODEL_ID,
             reason or "model not trained",
             available_rows=available_rows,
             minimum_rows=MINIMUM_ROWS,
             extra={
-                "iv_direction": fallback,
-                "probabilities": _fallback_probabilities(fallback),
-                "confidence": 0.0,
+                "iv_direction": None,
+                "probabilities": {},
+                "confidence": None,
                 "feature_importance": {},
                 "accuracy_30d": accuracy_for_model(MODEL_ID)["accuracy"],
             },
@@ -48,7 +49,11 @@ def predict(context: MLContext, confidence_multiplier: float = 1.0) -> dict[str,
     return output
 
 
-def _train(context: MLContext, force: bool = False) -> tuple[dict[str, Any] | None, str | None, int]:
+def _train(
+    context: MLContext,
+    force: bool = False,
+    train_if_missing: bool = True,
+) -> tuple[dict[str, Any] | None, str | None, int]:
     if context.iv_history.empty:
         return None, "iv_history empty; cannot build 3-day IV target", 0
     return train_classifier_artifact(
@@ -62,6 +67,11 @@ def _train(context: MLContext, force: bool = False) -> tuple[dict[str, Any] | No
         gap=3,
         calibration_method="sigmoid",
         force=force,
+        train_if_missing=train_if_missing,
+        # See m06_regime_return._train's identical fix: without this, real
+        # training silently no-ops via train_classifier_artifact's default
+        # allow_proxy=True once PROXY_SYMBOL (NIFTY) has its own artifact.
+        allow_proxy=not train_if_missing,
     )
 
 

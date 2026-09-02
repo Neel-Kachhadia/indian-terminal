@@ -173,6 +173,7 @@ class WriteOperation(StrEnum):
     LOG_PREDICTION = "LOG_PREDICTION"
     PREDICT_AND_LOG = "PREDICT_AND_LOG"
     RECORD_PREDICTION_OUTCOME = "RECORD_PREDICTION_OUTCOME"
+    RESOLVE_PENDING_PREDICTION_OUTCOMES = "RESOLVE_PENDING_PREDICTION_OUTCOMES"
     SAVE_BACKTEST_STARTED = "SAVE_BACKTEST_STARTED"
     RUN_BACKTEST_JOB = "RUN_BACKTEST_JOB"
     RUN_FULL_BACKFILL = "RUN_FULL_BACKFILL"
@@ -2172,6 +2173,16 @@ def _dispatch_operation(operation: WriteOperation, payload: dict[str, Any], data
         if set(payload) != {"prediction_id", "actual"}:
             raise ValueError("invalid prediction-outcome payload")
         return record_prediction_outcome(str(payload["prediction_id"]), str(payload["actual"]))
+    if operation is WriteOperation.RESOLVE_PENDING_PREDICTION_OUTCOMES:
+        from ml.monitor import resolve_pending_prediction_outcomes
+
+        if set(payload) - {"model_ids", "limit"}:
+            raise ValueError("invalid outcome-resolution payload")
+        model_ids = payload.get("model_ids")
+        return resolve_pending_prediction_outcomes(
+            list(model_ids) if model_ids is not None else None,
+            limit=int(payload.get("limit", 5000)),
+        )
     if operation is WriteOperation.SAVE_BACKTEST_STARTED:
         from backtest.engine import save_run_started
 

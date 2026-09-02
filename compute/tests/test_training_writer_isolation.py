@@ -18,7 +18,7 @@ def test_collector_model_training_runs_outside_duckdb_writer(
     monkeypatch.setattr(
         trainer,
         "train_all_models",
-        lambda **_kwargs: {"feature_rows": 250, "models": {"m01": {"is_trained": True}}},
+        lambda **_kwargs: {"feature_rows": 250, "models": {"m01": {"artifact_ready": True}}},
     )
     monkeypatch.setattr(
         stock_trainer.StockModelTrainer,
@@ -29,7 +29,7 @@ def test_collector_model_training_runs_outside_duckdb_writer(
     weekly = smart_collector.run_weekly_retrain(date(2026, 8, 30))
     stocks = smart_collector.run_stock_training(date(2026, 8, 30))
 
-    assert "models=1" in weekly
+    assert "artifacts_ready=1" in weekly
     assert "feature_rows=250" in weekly
     assert "trained=3" in stocks
 
@@ -92,4 +92,4 @@ def test_training_audit_uses_short_typed_writer_request(monkeypatch) -> None:
 
     assert calls[0][0] is training_log.WriteOperation.RECORD_ML_TRAINING_LOG
     assert calls[0][1]["symbol"] == "NIFTY"
-    assert calls[0][1]["status"] == "success"
+    assert calls[0][1]["status"] == "READY"

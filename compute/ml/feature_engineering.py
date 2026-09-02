@@ -33,7 +33,7 @@ class MLContext:
     iv_history: pd.DataFrame
     bif_history: pd.DataFrame
     fo_eod_rows: int
-    current_spot: float
+    current_spot: float | None
     spot_provenance: dict[str, Any]
     market_data_eligibility: MarketDataEligibility
     decision_requested_at: dt.datetime
@@ -400,10 +400,6 @@ def _apply_bif_availability(frame: pd.DataFrame) -> pd.DataFrame:
     all_missing = output[list(BIF_FEATURE_COLUMNS)].isna().all(axis=1)
     available = ~all_missing
     output["bif_available"] = available.astype(int)
-    medians = output.loc[available, list(BIF_FEATURE_COLUMNS)].median(numeric_only=True)
-    medians = medians.reindex(BIF_FEATURE_COLUMNS).fillna(0.0)
-    for column in BIF_FEATURE_COLUMNS:
-        output[column] = output[column].fillna(float(medians[column]))
     return output
 
 
@@ -472,15 +468,18 @@ def _close_series(ohlcv: pd.DataFrame) -> pd.Series:
     return pd.Series(pd.to_numeric(ohlcv["close"], errors="coerce").to_numpy(), index=dates)
 
 
-def _extract_spot(payload: dict[str, Any], ohlcv: pd.DataFrame) -> float:
+def _extract_spot(payload: dict[str, Any], ohlcv: pd.DataFrame) -> float | None:
+    del ohlcv
     spot = _as_float(payload.get("spot"))
-    if spot is not None and spot > 0:
+    provenance = payload.get("spot_provenance")
+    if (
+        spot is not None
+        and spot > 0
+        and isinstance(provenance, dict)
+        and provenance.get("decision_eligible") is True
+    ):
         return spot
-    if not ohlcv.empty:
-        value = _as_float(ohlcv["close"].iloc[-1])
-        if value is not None:
-            return value
-    return 0.0
+    return None
 
 
 def _as_float(value: Any) -> float | None:
@@ -506,7 +505,7 @@ def _rsi(close: pd.Series, period: int) -> pd.Series:
     avg_gain = gain.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
     avg_loss = loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
     rs = avg_gain / avg_loss.replace(0.0, np.nan)
-    return (100.0 - (100.0 / (1.0 + rs))).fillna(50.0)
+    return 100.0 - (100.0 / (1.0 + rs))
 
 
 def _atr_pct(frame: pd.DataFrame, period: int) -> pd.Series:

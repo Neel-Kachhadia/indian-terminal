@@ -249,6 +249,11 @@ _parser_test_report: dict[str, Any] = {}
 _parser_test_report_lock = Lock()
 _ml_training_state: dict[str, Any] = {
     "running": False,
+    "status": "IDLE",
+    "reason_code": None,
+    "attempt": 0,
+    "started_at": None,
+    "finished_at": None,
     "last_report": None,
     "last_error": None,
 }
@@ -1371,6 +1376,11 @@ def _queue_ml_training(background_tasks: BackgroundTasks, force: bool = False) -
                 "last_report": _ml_training_state["last_report"],
             }
         _ml_training_state["running"] = True
+        _ml_training_state["status"] = "TRAINING"
+        _ml_training_state["reason_code"] = None
+        _ml_training_state["attempt"] = int(_ml_training_state.get("attempt", 0)) + 1
+        _ml_training_state["started_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        _ml_training_state["finished_at"] = None
         _ml_training_state["last_error"] = None
 
     background_tasks.add_task(_run_ml_training, force)
@@ -1644,9 +1654,15 @@ def _run_ml_training(force: bool = False) -> None:
         with _ml_training_lock:
             _ml_training_state["last_report"] = report
             _ml_training_state["last_error"] = None
+            _ml_training_state["status"] = "READY"
+            _ml_training_state["reason_code"] = None
+            _ml_training_state["finished_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     except Exception as error:
         with _ml_training_lock:
             _ml_training_state["last_error"] = str(error)
+            _ml_training_state["status"] = "FAILED"
+            _ml_training_state["reason_code"] = "TRAINING_JOB_EXCEPTION"
+            _ml_training_state["finished_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     finally:
         with _ml_training_lock:
             _ml_training_state["running"] = False
