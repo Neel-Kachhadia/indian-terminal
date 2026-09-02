@@ -8,6 +8,11 @@ type ModelOutput = {
   probabilities?: Record<string, number>;
   confidence?: number | null;
   reason?: string | null;
+  reason_code?: string | null;
+  status?: string | null;
+  is_valid?: boolean;
+  available_rows?: number | null;
+  minimum_rows?: number | null;
   regime?: string | null;
   direction?: string | null;
   strategy?: string | null;
@@ -52,6 +57,11 @@ type MLPrediction = {
   model_source?: "symbol_specific" | "nifty_proxy" | string;
   ohlc_forecast?: OHLCForecast | null;
   error?: string;
+  is_trained?: boolean;
+  is_valid?: boolean;
+  status?: string | null;
+  reason?: string | null;
+  reason_code?: string | null;
 };
 
 type OHLCForecast = {
@@ -104,6 +114,9 @@ type ModelRow = {
   accuracy: number | null;
   trained?: boolean;
   warning?: string | null;
+  status?: string | null;
+  availableRows?: number | null;
+  minimumRows?: number | null;
 };
 
 const percentFormatter = new Intl.NumberFormat("en-IN", {
@@ -270,7 +283,7 @@ export function MLPanel({ symbol = "NIFTY" }: MLPanelProps) {
               ML Ensemble {prediction?.model_source === "nifty_proxy" ? "(NIFTY proxy)" : ""}
             </span>
             <span style={timestampStyle}>
-              {loading && prediction === null ? "Training..." : lastUpdated}
+              {loading && prediction === null ? "Loading..." : lastUpdated}
             </span>
           </div>
 
@@ -334,8 +347,8 @@ export function MLPanel({ symbol = "NIFTY" }: MLPanelProps) {
               <div key={row.key} style={tableRowStyle} title={row.warning ?? undefined}>
                 <span style={modelNameStyle}>{row.model}</span>
                 <span style={{ ...predictionCellStyle, color: predictionColor(row.prediction) }}>
-                  {row.trained === false && row.prediction === "--"
-                    ? statusText(row.warning)
+                  {row.prediction === "--"
+                    ? statusText(row)
                     : row.prediction}
                 </span>
                 <span style={{ color: confidenceColor(row.confidence) }}>
@@ -540,7 +553,10 @@ function buildRows(prediction: MLPrediction | null): ModelRow[] {
     confidence: confidence ?? asNumber(output?.confidence),
     accuracy: accuracy ?? asNumber(output?.accuracy_30d),
     trained: output?.is_trained,
-    warning: output?.reason ?? null,
+    warning: output?.reason ?? output?.reason_code ?? null,
+    status: output?.status ?? null,
+    availableRows: asNumber(output?.available_rows),
+    minimumRows: asNumber(output?.minimum_rows),
   });
 
   return [
@@ -548,10 +564,12 @@ function buildRows(prediction: MLPrediction | null): ModelRow[] {
     row("m02", "Direction", components.m02_direction, (item) => item?.direction ?? textValue(item?.prediction)),
     row("m03", "Strategy", components.m03_strategy, (item) => item?.strategy ?? textValue(item?.prediction)),
     row("m04", "IV Reversion", components.m04_iv_reversion, (item) => item?.iv_direction ?? textValue(item?.prediction)),
-    row("m05", "Anomaly", components.m05_anomaly, (item) => (item?.is_anomalous ? "Anomalous" : "Normal"), asNumber(components.m05_anomaly?.anomaly_score), null),
+    row("m05", "Anomaly", components.m05_anomaly, (item) => (
+      item?.is_valid === true ? (item.is_anomalous ? "Anomalous" : "Normal") : "--"
+    ), asNumber(components.m05_anomaly?.anomaly_score), null),
     row("m06", "Regime Return", components.m06_regime_return, (item) => item?.direction ?? textValue(item?.prediction)),
     row("m07", "IV Forecast", components.m07_iv_forecast, (item) => formatForecast(item), null, asNumber(components.m07_iv_forecast?.mape_30d)),
-    row("m08", "GP Regime", components.m08_gp_regime, (item) => textValue(item?.prediction), qualityAsConfidence(components.m08_gp_regime), null),
+    row("m08", "GP Regime", components.m08_gp_regime, (item) => textValue(item?.prediction), null, null),
     row("m09", "RL Sizer", components.m09_rl_sizer, (item) => formatSize(item?.recommended_size), asNumber(components.m09_rl_sizer?.confidence), null),
     {
       key: "m10",
@@ -559,8 +577,11 @@ function buildRows(prediction: MLPrediction | null): ModelRow[] {
       prediction: prediction?.composite_direction ?? "--",
       confidence: asNumber(prediction?.composite_confidence),
       accuracy: asNumber(prediction?.accuracy_tracking?.ensemble_accuracy_30d),
-      trained: true,
-      warning: null,
+      trained: prediction?.is_trained,
+      warning: prediction?.reason ?? prediction?.reason_code ?? null,
+      status: prediction?.status ?? null,
+      availableRows: null,
+      minimumRows: null,
     },
   ];
 }
@@ -643,18 +664,27 @@ function formatPctPoints(value: number | null | undefined) {
   return `${number.toFixed(2)}%`;
 }
 
-function qualityAsConfidence(output: ModelOutput | undefined) {
-  const quality = asNumber(output?.data_quality_score);
-  return quality === null ? null : quality / 100;
-}
-
-function statusText(reason: string | null | undefined) {
-  if (!reason) {
-    return "Training...";
+function statusText(row: ModelRow) {
+  if (row.status === "TRAINING") {
+    return "Training";
   }
-  return reason.toLowerCase().includes("insufficient") || reason.toLowerCase().includes("empty")
-    ? "Insufficient data"
-    : "Training...";
+  if (row.availableRows !== null && row.minimumRows !== null) {
+    return `${row.status ?? "INSUFFICIENT_DATA"} ${row.availableRows}/${row.minimumRows}`;
+  }
+  if (row.status) {
+    return row.status.replace(/_/g, " ");
+  }
+  const reason = row.warning?.toLowerCase() ?? "";
+  if (reason.includes("insufficient") || reason.includes("empty")) {
+    return "Insufficient data";
+  }
+  if (reason.includes("not trained") || reason.includes("artifact")) {
+    return "Untrained";
+  }
+  if (reason.includes("failed") || reason.includes("crashed")) {
+    return "Failed";
+  }
+  return "Unavailable";
 }
 
 function predictionColor(value: string | null | undefined) {

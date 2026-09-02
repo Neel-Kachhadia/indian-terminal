@@ -124,7 +124,9 @@ function RiskPanel({
 
     const load = async () => {
       try {
-        const result = await invoke<RiskPayload>("get_risk_var");
+        const result = await invoke<RiskPayload>("get_risk_var", {
+          symbol: selectedSymbol,
+        });
         if (!active) {
           return;
         }
@@ -143,7 +145,7 @@ function RiskPanel({
       active = false;
       window.clearInterval(timer);
     };
-  }, []);
+  }, [selectedSymbol]);
 
   return (
     <div style={riskStyle}>

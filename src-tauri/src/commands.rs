@@ -759,8 +759,12 @@ pub async fn get_intelligence_regime(
 }
 
 #[tauri::command]
-pub async fn get_risk_var(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
-    get_python_json("risk/var", 15, &state).await
+pub async fn get_risk_var(
+    symbol: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let encoded_symbol = symbol.replace(' ', "%20");
+    get_python_json(&format!("risk/var?symbol={encoded_symbol}"), 15, &state).await
 }
 
 #[tauri::command]
