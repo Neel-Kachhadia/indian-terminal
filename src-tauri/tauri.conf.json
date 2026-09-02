@@ -5,7 +5,7 @@
   "identifier": "com.indian-market-terminal.app",
   "build": {
     "beforeDevCommand": "pnpm dev",
-    "beforeBuildCommand": "pnpm build",
+    "beforeBuildCommand": "",
     "devUrl": "http://localhost:5173",
     "frontendDist": "../dist"
   },
