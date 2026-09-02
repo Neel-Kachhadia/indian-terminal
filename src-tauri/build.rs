@@ -116,6 +116,28 @@ fn verify_manifest_signature(root: &Path, manifest: &serde_json::Value) {
         .expect("release manifest signature verification failed");
 }
 
+// Must stay byte-for-byte equivalent to canonicalize_source_bytes() in
+// scripts/release_gate.py: the signed source fingerprint must depend only on
+// committed source CONTENT, never on which line-ending bytes a given
+// checkout happens to carry on disk. This repo's own .gitattributes already
+// declares `* text=auto eol=lf`, but that attribute only governs what git
+// WRITES on checkout/checkin -- it does not retroactively rewrite bytes
+// already sitting in a working tree, so raw fs::read() bytes can still carry
+// CRLF on a Windows checkout even for files git considers LF-normalized.
+fn canonicalize_source_bytes(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] == b'\r' && data.get(i + 1) == Some(&b'\n') {
+            i += 1;
+            continue;
+        }
+        out.push(data[i]);
+        i += 1;
+    }
+    out
+}
+
 fn source_fingerprint(root: &Path) -> String {
     let excluded = [
         ".pytest_cache",
@@ -210,9 +232,8 @@ fn source_fingerprint(root: &Path) -> String {
         let path_bytes = relative.as_bytes();
         digest.update((path_bytes.len() as u32).to_be_bytes());
         digest.update(path_bytes);
-        digest.update(Sha256::digest(
-            fs::read(root.join(&relative)).expect("source file unreadable"),
-        ));
+        let raw = fs::read(root.join(&relative)).expect("source file unreadable");
+        digest.update(Sha256::digest(canonicalize_source_bytes(&raw)));
     }
     format!("{:x}", digest.finalize())
 }

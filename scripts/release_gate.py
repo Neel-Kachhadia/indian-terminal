@@ -119,6 +119,28 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+# The signed release source fingerprint must depend only on committed source
+# CONTENT, never on which line-ending bytes a given checkout happens to carry
+# on disk. .gitattributes already declares `* text=auto eol=lf` for this repo,
+# but that attribute only governs what git WRITES on checkout/checkin -- it
+# does not retroactively rewrite bytes already sitting in a working tree
+# (reproduced live: core.autocrlf=true on Windows left six already-checked-out
+# files holding CRLF bytes even after the eol=lf attribute was added, so
+# raw-byte hashing of the worktree diverged from a clean `git archive HEAD`
+# hash of the exact same committed content). Canonicalizing CRLF -> LF at hash
+# time -- mirroring the repo's own blanket eol=lf policy -- makes the
+# fingerprint identical for the same committed content regardless of the
+# checkout's incidental EOL representation, on any platform, with or without
+# git even installed. Must stay byte-for-byte equivalent to the matching
+# canonicalize_source_bytes() in src-tauri/build.rs.
+def canonicalize_source_bytes(data: bytes) -> bytes:
+    return data.replace(b"\r\n", b"\n")
+
+
+def sha256_source_file(path: Path) -> str:
+    return hashlib.sha256(canonicalize_source_bytes(path.read_bytes())).hexdigest()
+
+
 # `cargo tauri bundle` embeds a placeholder `__TAURI_BUNDLE_TYPE_VAR_UNK` at
 # link time, then patches those trailing 3 bytes in place to identify the
 # bundle format actually produced ("NSS" for NSIS here -- confirmed by
@@ -246,7 +268,7 @@ def source_fingerprint() -> str:
         relative = path.relative_to(ROOT).as_posix().encode("utf-8")
         digest.update(len(relative).to_bytes(4, "big"))
         digest.update(relative)
-        digest.update(bytes.fromhex(sha256_file(path)))
+        digest.update(bytes.fromhex(sha256_source_file(path)))
     return digest.hexdigest()
 
 

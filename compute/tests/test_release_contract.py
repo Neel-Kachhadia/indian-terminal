@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import importlib
 import inspect
 import json
+import subprocess
 import sys
+import tarfile
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -16,8 +20,11 @@ if str(SCRIPTS) not in sys.path:
 
 from release_gate import (  # noqa: E402
     _normalize_tauri_bundle_type_marker,
+    canonicalize_source_bytes,
     read_json,
+    sha256_source_file,
     sha256_tauri_executable,
+    source_fingerprint,
     source_files,
     validate_openapi,
     validate_versions,
@@ -499,3 +506,269 @@ def test_sidecar_build_copies_pandas_ta_openbb_package_metadata() -> None:
     build_compute = importlib.import_module("build_compute")
     source = inspect.getsource(build_compute.main)
     assert '"--copy-metadata", "pandas-ta-openbb"' in source
+
+
+# --- release source fingerprint: checkout-EOL independence -----------------
+#
+# Reproduces a real forensic finding: core.autocrlf=true on Windows left six
+# already-tracked compute/ files (duckdb_client.py, write_service.py, and
+# four compute/tests/*.py files) holding CRLF bytes on disk even though
+# .gitattributes declares `* text=auto eol=lf` and the committed git blobs
+# are LF-normalized -- adding the attribute does not retroactively rewrite
+# bytes already sitting in a working tree. source_fingerprint() used to hash
+# those raw worktree bytes directly, so the signed release source fingerprint
+# diverged from a clean `git archive HEAD` hash of the exact same committed
+# content. The fix canonicalizes CRLF -> LF at hash time for every file in
+# the fingerprint's scope, so the same committed content produces the same
+# fingerprint regardless of which EOL bytes a given checkout carries.
+
+_REQUIRED_EXPLICIT_SOURCE_FILES = (
+    "package.json",
+    "pnpm-lock.yaml",
+    ".gitignore",
+    "index.html",
+    "tailwind.config.ts",
+    "tsconfig.json",
+    "vite.config.ts",
+    "src-tauri/Cargo.toml",
+    "src-tauri/Cargo.lock",
+    "src-tauri/tauri.conf.json",
+    "src-tauri/build.rs",
+    "src-tauri/installer-hooks.nsh",
+    "build_release.ps1",
+    "release/release-spec.json",
+    "release/required-api.json",
+)
+
+
+def _write_minimal_fake_repo(root: Path, *, compute_main_content: bytes) -> None:
+    for relative in _REQUIRED_EXPLICIT_SOURCE_FILES:
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"x")
+    compute_main = root / "compute" / "main.py"
+    compute_main.parent.mkdir(parents=True, exist_ok=True)
+    compute_main.write_bytes(compute_main_content)
+
+
+@pytest.mark.release
+def test_canonicalize_source_bytes_normalizes_crlf_only() -> None:
+    # CRLF collapses to LF ...
+    assert canonicalize_source_bytes(b"line one\r\nline two\r\n") == b"line one\nline two\n"
+    # ... a bare LF is left untouched ...
+    assert canonicalize_source_bytes(b"line one\nline two\n") == b"line one\nline two\n"
+    # ... and a lone CR (not followed by LF) is NOT stripped -- this is a
+    # narrow CRLF->LF transform, not a blanket "delete all \r" pass.
+    assert canonicalize_source_bytes(b"a\rb") == b"a\rb"
+
+
+@pytest.mark.release
+def test_source_file_hash_identical_for_crlf_and_lf_checkout(tmp_path: Path) -> None:
+    lf_file = tmp_path / "lf.py"
+    crlf_file = tmp_path / "crlf.py"
+    content = b"def handler():\n    return 1\n\nclass Foo:\n    pass\n"
+    lf_file.write_bytes(content)
+    crlf_file.write_bytes(content.replace(b"\n", b"\r\n"))
+    assert sha256_source_file(lf_file) == sha256_source_file(crlf_file)
+
+
+@pytest.mark.release
+def test_source_fingerprint_stable_across_eol_representation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import release_gate
+
+    content = b"import os\n\n\ndef run():\n    return os.getcwd()\n"
+
+    lf_root = tmp_path / "lf-checkout"
+    crlf_root = tmp_path / "crlf-checkout"
+    _write_minimal_fake_repo(lf_root, compute_main_content=content)
+    _write_minimal_fake_repo(crlf_root, compute_main_content=content.replace(b"\n", b"\r\n"))
+
+    monkeypatch.setattr(release_gate, "ROOT", lf_root)
+    lf_fingerprint = release_gate.source_fingerprint()
+    monkeypatch.setattr(release_gate, "ROOT", crlf_root)
+    crlf_fingerprint = release_gate.source_fingerprint()
+
+    assert lf_fingerprint == crlf_fingerprint
+
+
+@pytest.mark.release
+def test_source_fingerprint_reacts_to_real_content_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import release_gate
+
+    root = tmp_path / "repo"
+    _write_minimal_fake_repo(root, compute_main_content=b"def run():\n    return 1\n")
+    monkeypatch.setattr(release_gate, "ROOT", root)
+    baseline = release_gate.source_fingerprint()
+
+    (root / "compute" / "main.py").write_bytes(b"def run():\n    return 2\n")
+    changed = release_gate.source_fingerprint()
+
+    assert baseline != changed
+
+
+@pytest.mark.release
+def test_source_fingerprint_changes_when_scoped_file_is_added_or_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import release_gate
+
+    root = tmp_path / "repo"
+    _write_minimal_fake_repo(root, compute_main_content=b"def run():\n    return 1\n")
+    monkeypatch.setattr(release_gate, "ROOT", root)
+    baseline = release_gate.source_fingerprint()
+
+    (root / "compute" / "extra_module.py").write_bytes(b"VALUE = 1\n")
+    with_extra_file = release_gate.source_fingerprint()
+    assert with_extra_file != baseline
+
+    (root / "compute" / "extra_module.py").unlink()
+    back_to_baseline = release_gate.source_fingerprint()
+    assert back_to_baseline == baseline
+
+
+@pytest.mark.release
+def test_source_fingerprint_is_deterministic_across_repeated_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import release_gate
+
+    root = tmp_path / "repo"
+    _write_minimal_fake_repo(root, compute_main_content=b"def run():\n    return 1\n")
+    (root / "compute" / "aaa.py").write_bytes(b"A = 1\n")
+    (root / "compute" / "zzz.py").write_bytes(b"Z = 1\n")
+    monkeypatch.setattr(release_gate, "ROOT", root)
+
+    fingerprints = {release_gate.source_fingerprint() for _ in range(5)}
+    assert len(fingerprints) == 1
+
+
+@pytest.mark.release
+def test_source_fingerprint_fails_closed_when_required_file_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import release_gate
+
+    root = tmp_path / "repo"
+    _write_minimal_fake_repo(root, compute_main_content=b"def run():\n    return 1\n")
+    (root / "package.json").unlink()
+    monkeypatch.setattr(release_gate, "ROOT", root)
+
+    with pytest.raises(FileNotFoundError):
+        release_gate.source_fingerprint()
+
+
+@pytest.mark.release
+def test_untracked_root_scratch_files_are_outside_source_fingerprint_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Local acceptance-evidence scratch files (.playwright-cli/, output/,
+    f0_snapshot.json) live at repo root, outside every base directory
+    source_files() walks and outside its explicit file list, so they must
+    never affect the signed release source fingerprint."""
+    import release_gate
+
+    root = tmp_path / "repo"
+    _write_minimal_fake_repo(root, compute_main_content=b"def run():\n    return 1\n")
+    monkeypatch.setattr(release_gate, "ROOT", root)
+    baseline = release_gate.source_fingerprint()
+
+    (root / "f0_snapshot.json").write_bytes(b'{"scratch": true}')
+    (root / "output").mkdir()
+    (root / "output" / "evidence.json").write_bytes(b"{}")
+    (root / ".playwright-cli").mkdir()
+    (root / ".playwright-cli" / "trace.zip").write_bytes(b"binary")
+
+    assert release_gate.source_fingerprint() == baseline
+
+
+@pytest.mark.release
+def test_six_previously_observed_crlf_files_hash_stable_regardless_of_checkout_eol() -> None:
+    """Directly verifies the six files the forensic pass observed holding
+    CRLF worktree bytes (compute/db/duckdb_client.py,
+    compute/db/write_service.py, compute/tests/test_instrument_contract.py,
+    compute/tests/test_signals_backfill.py, compute/tests/test_spot_provenance.py,
+    compute/tests/test_write_service.py): whatever EOL bytes these files
+    physically carry on THIS checkout, canonicalizing before hashing must
+    make their fingerprint contribution identical to a synthetic pure-LF
+    copy of the same content -- no source rewrite required to satisfy this."""
+    observed_files = (
+        ROOT / "compute" / "db" / "duckdb_client.py",
+        ROOT / "compute" / "db" / "write_service.py",
+        ROOT / "compute" / "tests" / "test_instrument_contract.py",
+        ROOT / "compute" / "tests" / "test_signals_backfill.py",
+        ROOT / "compute" / "tests" / "test_spot_provenance.py",
+        ROOT / "compute" / "tests" / "test_write_service.py",
+    )
+    for path in observed_files:
+        assert path.is_file(), f"expected fingerprint-scope file missing: {path}"
+        raw = path.read_bytes()
+        synthetic_lf = raw.replace(b"\r\n", b"\n")
+        assert canonicalize_source_bytes(raw) == canonicalize_source_bytes(synthetic_lf)
+        assert hashlib.sha256(canonicalize_source_bytes(raw)).hexdigest() == hashlib.sha256(
+            synthetic_lf
+        ).hexdigest()
+
+
+@pytest.mark.release
+def test_release_identity_fingerprint_matches_git_archive_of_head() -> None:
+    """The ultimate reproduction of the original defect: a clean `git archive
+    HEAD` materialization (pure LF, no local checkout artifacts) must hash to
+    the exact same canonical source fingerprint as this working checkout,
+    proving the fingerprint no longer depends on incidental Windows CRLF
+    checkout bytes. Skips gracefully if git/archive tooling is unavailable in
+    the sandbox running this test."""
+    git_dir = ROOT / ".git"
+    if not git_dir.exists():
+        pytest.skip("not running inside a git checkout")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        archive_path = tmp_path / "head.tar"
+        result = subprocess.run(
+            ["git", "archive", "-o", str(archive_path), "HEAD"],
+            cwd=ROOT,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            pytest.skip(f"git archive unavailable: {result.stderr.decode(errors='replace')}")
+
+        extract_root = tmp_path / "extracted"
+        extract_root.mkdir()
+        with tarfile.open(archive_path) as archive:
+            archive.extractall(extract_root, filter="data")  # trusted local git archive of our own HEAD
+
+        import release_gate
+
+        original_root = release_gate.ROOT
+        try:
+            release_gate.ROOT = extract_root
+            archive_fingerprint = release_gate.source_fingerprint()
+        finally:
+            release_gate.ROOT = original_root
+
+        assert archive_fingerprint == source_fingerprint()
+
+
+@pytest.mark.release
+def test_rust_build_script_canonicalizes_source_bytes_before_hashing() -> None:
+    """Cross-language contract check, matching this file's existing pattern
+    of re-verifying build.rs's independent reimplementation of
+    source_fingerprint() stays in lockstep with release_gate.py's: both must
+    canonicalize CRLF -> LF before hashing each source file, using the exact
+    same transform, or the two independently-computed fingerprints (Python
+    signs it, Rust re-verifies it at PREBUNDLE compile time) would
+    permanently disagree on any checkout carrying CRLF bytes."""
+    build_rs = (ROOT / "src-tauri" / "build.rs").read_text(encoding="utf-8")
+    assert "fn canonicalize_source_bytes(" in build_rs
+    canonicalize_pos = build_rs.index("fn canonicalize_source_bytes(")
+    fingerprint_pos = build_rs.index("fn source_fingerprint(")
+    assert canonicalize_pos < fingerprint_pos, (
+        "canonicalize_source_bytes must be defined before source_fingerprint uses it"
+    )
+    assert "canonicalize_source_bytes(&raw)" in build_rs
+    digest_call = build_rs.index("digest.update(Sha256::digest(canonicalize_source_bytes(&raw)))")
+    assert digest_call > fingerprint_pos
