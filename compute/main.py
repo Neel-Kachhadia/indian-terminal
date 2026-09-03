@@ -34,7 +34,13 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from data.error_logger import _logger as elog
-from data.exchange_calendar import exchange_calendar, is_trading_day_candidate, next_expiry_labels, today_ist
+from data.exchange_calendar import (
+    exchange_calendar,
+    is_trading_day_candidate,
+    next_expiry_labels,
+    next_expiry_labels_for_symbol,
+    today_ist,
+)
 from data.index_aliases import INDEX_CANONICAL_NAME, index_symbol_candidates
 from data.instrument_master import master as instrument_master
 from data.instrument_schema import InstrumentSchemaError, read_instrument_frame
@@ -1012,7 +1018,7 @@ def get_signals(symbol: str) -> Any:
     from signals.options_signals import compute_options_signals
 
     symbol = http_symbol(symbol)
-    expiries = get_next_expiries(1)
+    expiries = get_next_expiries(1, symbol)
     expiry = expiries[0] if expiries else ""
     legs = get_chain_from_redis(symbol, expiry)
     if not legs:
@@ -1056,7 +1062,7 @@ def get_all_signals(symbol: str) -> Any:
         if cached and now - cached_at < _ALL_SIGNALS_CACHE_TTL:
             return copy.deepcopy(cached)
 
-    expiry = get_next_expiries(1)[0]
+    expiry = get_next_expiries(1, normalized_symbol)[0]
     legs = get_chain_from_redis(normalized_symbol, expiry)
     if not legs:
         legs = _read_chain_legs_from_redis(normalized_symbol, [expiry])
@@ -1730,7 +1736,7 @@ def _get_bif_engine() -> Any:
 
 
 def _bif_chain_provider(symbol: str) -> dict[str, Any]:
-    expiries = get_next_expiries(4)
+    expiries = get_next_expiries(4, symbol)
     expiry = expiries[0]
     legs = get_chain_from_redis(symbol, expiry)
     if not legs:
@@ -2070,7 +2076,7 @@ def _build_correlations(symbol: str) -> dict[str, Any]:
 
 def _apex_inputs(symbol: str) -> dict[str, Any]:
     normalized = symbol.strip().upper()
-    expiry = get_next_expiries(1)[0]
+    expiry = get_next_expiries(1, normalized)[0]
     legs = get_chain_from_redis(normalized, expiry)
     if not legs:
         legs = _read_chain_legs_from_redis(normalized, [expiry])
@@ -2444,7 +2450,7 @@ def _nonnegative_source_integer(record: dict[str, Any], *names: str) -> int | No
 def get_expiries(symbol: str) -> list[str]:
     symbol = http_symbol(symbol)
     _query_symbols(symbol)
-    return get_next_expiries()
+    return get_next_expiries(4, symbol)
 
 
 @app.get("/iv_surface/{symbol}")
@@ -2452,7 +2458,7 @@ def get_iv_surface(symbol: str) -> Any:
     from options.iv_surface import compute_iv_surface
 
     symbol = http_symbol(symbol)
-    expiries = get_next_expiries()
+    expiries = get_next_expiries(4, symbol)
     legs = _read_chain_legs_from_redis(symbol, expiries)
     legs_with_iv = [leg for leg in legs if leg.get("iv") is not None]
 
@@ -3780,7 +3786,7 @@ def _size_kb(record: dict[str, Any]) -> int | None:
 def _read_atm_iv_from_redis(symbol: str, spot: float) -> float:
     if spot <= 0:
         return 0.0
-    legs = _read_chain_legs_from_redis(symbol, get_next_expiries(2))
+    legs = _read_chain_legs_from_redis(symbol, get_next_expiries(2, symbol))
     best_iv = 0.0
     best_distance: float | None = None
     for leg in legs:
@@ -4297,8 +4303,10 @@ def _normalise_expiry_text(value: str) -> str:
     return value.strip().lower()
 
 
-def get_next_expiries(n: int = 4) -> list[str]:
-    return next_expiry_labels(n)
+def get_next_expiries(n: int = 4, symbol: str | None = None) -> list[str]:
+    if symbol is None:
+        return next_expiry_labels(n)
+    return next_expiry_labels_for_symbol(symbol, n)
 
 
 def _backfill_snapshot() -> dict[str, Any]:

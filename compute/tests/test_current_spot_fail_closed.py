@@ -19,7 +19,7 @@ def test_apex_inputs_preserves_unavailable_live_spot_as_none(monkeypatch) -> Non
         as_provenance=lambda: {"decision_eligible": False, "reason": "stale"},
     )
     eligibility = SimpleNamespace(decision_eligible=False, to_dict=lambda: {"decision_eligible": False})
-    monkeypatch.setattr(main, "get_next_expiries", lambda _count: ["2026-09-01"])
+    monkeypatch.setattr(main, "get_next_expiries", lambda _count, _symbol=None: ["2026-09-01"])
     monkeypatch.setattr(main, "get_chain_from_redis", lambda *_args: [])
     monkeypatch.setattr(main, "_read_chain_legs_from_redis", lambda *_args: [])
     monkeypatch.setattr(main, "_read_spot_observation_from_redis", lambda _symbol: observation)

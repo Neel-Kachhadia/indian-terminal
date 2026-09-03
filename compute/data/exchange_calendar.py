@@ -250,6 +250,38 @@ class ExchangeCalendar:
             candidate -= dt.timedelta(days=1)
         return self.adjusted_expiry(candidate)
 
+    def next_monthly_expiries(
+        self,
+        count: int = 4,
+        instant: dt.datetime | None = None,
+    ) -> list[dt.date]:
+        if count < 1 or count > 52:
+            raise ValueError("expiry count must be between 1 and 52")
+        local = self.as_ist(instant)
+        today = local.date()
+        self.ensure_covered(today)
+        results: list[dt.date] = []
+        year, month = today.year, today.month
+        while len(results) < count:
+            expiry = self.monthly_expiry(year, month)
+            expiry_session = self.session(expiry)
+            if expiry_session.close_time is None:
+                raise CalendarCoverageError(
+                    f"NSE expiry cutoff pending for {expiry.isoformat()}"
+                )
+            before_cutoff = local.time().replace(tzinfo=None) < expiry_session.close_time
+            if expiry > today or (expiry == today and before_cutoff):
+                if not results or results[-1] != expiry:
+                    results.append(expiry)
+            if month == 12:
+                month = 1
+                year += 1
+            else:
+                month += 1
+            if len(results) < count:
+                self.ensure_covered(dt.date(year, month, 1))
+        return results
+
 
 def _parse_time(value: str) -> dt.time:
     return dt.datetime.strptime(value, "%H:%M").time()
@@ -330,3 +362,37 @@ def next_expiry_labels(
     instant: dt.datetime | None = None,
 ) -> list[str]:
     return [value.strftime("%d-%b-%Y") for value in next_weekly_expiries(count, instant)]
+
+
+# NSE permits exactly one true-weekly index-options contract per exchange (SEBI's
+# "rationalisation of expiry days" framework); NIFTY holds that slot on NSE.
+# BANKNIFTY/FINNIFTY/MIDCPNIFTY and all single-stock F&O are monthly-only, so
+# resolving their nearest expiry via the weekly cadence looks up a contract date
+# that was never listed (see get_lot_size/get_chain exact-expiry lookups).
+_WEEKLY_EXPIRY_SYMBOLS = frozenset({"NIFTY"})
+
+
+def is_weekly_expiry_symbol(symbol: str) -> bool:
+    return symbol.strip().upper() in _WEEKLY_EXPIRY_SYMBOLS
+
+
+def next_expiries_for_symbol(
+    symbol: str,
+    count: int = 4,
+    instant: dt.datetime | None = None,
+) -> list[dt.date]:
+    calendar = exchange_calendar()
+    if is_weekly_expiry_symbol(symbol):
+        return calendar.next_weekly_expiries(count, instant)
+    return calendar.next_monthly_expiries(count, instant)
+
+
+def next_expiry_labels_for_symbol(
+    symbol: str,
+    count: int = 4,
+    instant: dt.datetime | None = None,
+) -> list[str]:
+    return [
+        value.strftime("%d-%b-%Y")
+        for value in next_expiries_for_symbol(symbol, count, instant)
+    ]

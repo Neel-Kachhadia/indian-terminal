@@ -13,6 +13,8 @@ from data.exchange_calendar import (
     SessionMetadata,
     SessionType,
     exchange_calendar,
+    next_expiries_for_symbol,
+    next_expiry_labels_for_symbol,
 )
 
 
@@ -34,6 +36,36 @@ def test_monthly_expiry_handles_month_and_year_end() -> None:
     calendar = exchange_calendar()
     assert calendar.monthly_expiry(2026, 3) == dt.date(2026, 3, 30)
     assert calendar.monthly_expiry(2026, 12) == dt.date(2026, 12, 29)
+
+
+def test_non_nifty_symbols_resolve_monthly_expiry_not_weekly() -> None:
+    """NSE permits one true-weekly index contract per exchange; NIFTY holds that
+    slot. BANKNIFTY/FINNIFTY/MIDCPNIFTY and single-stock F&O are monthly-only, so
+    resolving their nearest expiry off the weekly cadence looks up a contract date
+    that was never listed (regression for lot-size/chain/signal 503s on non-NIFTY
+    symbols while NIFTY resolved fine)."""
+    instant = dt.datetime(2026, 9, 3, 6, 0, tzinfo=dt.timezone.utc)
+    nifty_expiry = next_expiries_for_symbol("NIFTY", 1, instant)[0]
+    assert nifty_expiry == dt.date(2026, 9, 8)
+
+    for symbol in ("BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "RELIANCE", "SWIGGY"):
+        expiry = next_expiries_for_symbol(symbol, 1, instant)[0]
+        assert expiry == dt.date(2026, 9, 29), symbol
+        assert expiry != nifty_expiry, symbol
+
+
+def test_next_expiry_labels_for_symbol_formats_monthly_cadence() -> None:
+    instant = dt.datetime(2026, 9, 3, 6, 0, tzinfo=dt.timezone.utc)
+    assert next_expiry_labels_for_symbol("BANKNIFTY", 1, instant) == ["29-Sep-2026"]
+    assert next_expiry_labels_for_symbol("NIFTY", 1, instant) == ["08-Sep-2026"]
+
+
+def test_monthly_only_symbol_rolls_to_next_month_after_expiry_cutoff() -> None:
+    instant = dt.datetime(2026, 9, 29, 12, 0, tzinfo=dt.timezone.utc)
+    expiries = next_expiries_for_symbol("BANKNIFTY", 2, instant)
+    assert expiries[0] == dt.date(2026, 10, 27)
+    # 24-Nov-2026 is an NSE holiday; expiry rolls back to the previous trading day.
+    assert expiries[1] == dt.date(2026, 11, 23)
 
 
 def test_timezone_awareness_is_mandatory() -> None:

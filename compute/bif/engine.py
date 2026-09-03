@@ -10,7 +10,7 @@ from typing import Any, Callable
 
 from db.duckdb_client import DB_WRITE_LOCK, writer_connection
 from db.write_service import ReadOperation, resolve_read
-from data.exchange_calendar import next_expiry_labels, today_ist
+from data.exchange_calendar import next_expiry_labels_for_symbol, today_ist
 from data.index_aliases import index_symbol_candidates
 from data.market_data_quality import (
     DecisionContext,
@@ -272,19 +272,19 @@ class BIFEngine:
         if isinstance(provided, tuple) and len(provided) >= 2:
             provenance = provided[2] if len(provided) >= 3 else {}
             legs = _as_leg_list(provided[0])
-            expiry = str(provided[1] or _next_expiries(1)[0])
+            expiry = str(provided[1] or _next_expiries(symbol, 1)[0])
             return _validated_chain(legs, expiry, provenance, requested_at)
         if isinstance(provided, dict):
             return _validated_chain(
                 _as_leg_list(provided.get("legs") or provided.get("chain_legs")),
-                str(provided.get("expiry") or _next_expiries(1)[0]),
+                str(provided.get("expiry") or _next_expiries(symbol, 1)[0]),
                 provided.get("provenance"),
                 requested_at,
             )
         if isinstance(provided, list):
             return _validated_chain(
                 _as_leg_list(provided),
-                _next_expiries(1)[0],
+                _next_expiries(symbol, 1)[0],
                 None,
                 requested_at,
             )
@@ -474,7 +474,7 @@ def _read_chain_from_redis(
     symbol: str,
     requested_at: _dt.datetime,
 ) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
-    expiries = _next_expiries(4)
+    expiries = _next_expiries(symbol, 4)
     redis_symbol = _redis_symbol(symbol)
     try:
         import redis
@@ -908,8 +908,8 @@ def _persist_iv_observations(con: Any, observations: Any) -> None:
         )
 
 
-def _next_expiries(n: int) -> list[str]:
-    return next_expiry_labels(n)
+def _next_expiries(symbol: str, n: int) -> list[str]:
+    return next_expiry_labels_for_symbol(symbol, n)
 
 
 def _symbol_candidates(symbol: str) -> list[str]:
