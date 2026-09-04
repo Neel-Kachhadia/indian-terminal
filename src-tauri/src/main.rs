@@ -766,10 +766,10 @@ fn ensure_release_resources(app: &AppHandle) -> Result<(), String> {
             .map_err(|error| format!("resource dir unavailable: {error}"))?;
         let resource_root = resolve_resource_root(&resource_dir);
         indian_terminal::release_integrity::verify_release_resources(&resource_root)?;
-        let appdata = env::var("APPDATA")
-            .map(PathBuf::from)
-            .map_err(|error| format!("APPDATA unavailable: {error}"))?
-            .join("BharatTerminal");
+        let appdata = resolve_bootstrap_data_root(
+            env::var_os("BHARATTERMINAL_APP_DATA").map(PathBuf::from),
+            env::var_os("APPDATA").map(PathBuf::from),
+        )?;
         let data_dir = appdata.join("data");
         let models_dir = appdata.join("models");
         fs::create_dir_all(&data_dir).map_err(|error| error.to_string())?;
@@ -831,6 +831,144 @@ fn resolve_resource_root(resource_dir: &Path) -> PathBuf {
 #[cfg(debug_assertions)]
 fn resolve_resource_root(resource_dir: &Path) -> PathBuf {
     resource_dir.to_path_buf()
+}
+
+/// Resolves the release-build bootstrap data root the same way every other
+/// subsystem does (alert_engine::config_db_path, structured_log::log_path):
+/// an explicit BHARATTERMINAL_APP_DATA override is used as-is (it already
+/// names the root, not a `BharatTerminal` subfolder to append it to);
+/// otherwise fall back to `%APPDATA%\BharatTerminal`. Pulled out as a pure
+/// function -- no direct env::var calls -- so the override-wins behavior is
+/// unit-testable without mutating process-global env vars, which would race
+/// across parallel `cargo test` threads.
+#[cfg(any(not(debug_assertions), test))]
+fn resolve_bootstrap_data_root(
+    app_data_override: Option<PathBuf>,
+    appdata_env: Option<PathBuf>,
+) -> Result<PathBuf, String> {
+    match app_data_override {
+        Some(base) => Ok(base),
+        None => appdata_env
+            .map(|base| base.join("BharatTerminal"))
+            .ok_or_else(|| String::from("APPDATA unavailable")),
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_data_root_tests {
+    use super::resolve_bootstrap_data_root;
+    use std::path::PathBuf;
+
+    #[test]
+    fn explicit_override_wins_over_appdata() {
+        let root = resolve_bootstrap_data_root(
+            Some(PathBuf::from(r"D:\BharatTerminal\data")),
+            Some(PathBuf::from(r"C:\Users\test\AppData\Roaming")),
+        )
+        .expect("override branch never fails");
+        assert_eq!(root, PathBuf::from(r"D:\BharatTerminal\data"));
+    }
+
+    #[test]
+    fn override_wins_even_when_appdata_absent() {
+        let root =
+            resolve_bootstrap_data_root(Some(PathBuf::from(r"D:\BharatTerminal\data")), None)
+                .expect("override branch never fails");
+        assert_eq!(root, PathBuf::from(r"D:\BharatTerminal\data"));
+    }
+
+    #[test]
+    fn falls_back_to_appdata_bharatterminal_when_no_override() {
+        let root = resolve_bootstrap_data_root(
+            None,
+            Some(PathBuf::from(r"C:\Users\test\AppData\Roaming")),
+        )
+        .expect("fallback branch has a value");
+        assert_eq!(
+            root,
+            PathBuf::from(r"C:\Users\test\AppData\Roaming\BharatTerminal")
+        );
+    }
+
+    #[test]
+    fn errors_explicitly_when_neither_is_set() {
+        let result = resolve_bootstrap_data_root(None, None);
+        assert!(
+            result.is_err(),
+            "must fail explicitly, never silently pick a path"
+        );
+    }
+
+    #[test]
+    fn override_value_used_verbatim_even_if_path_does_not_exist_yet() {
+        // Directory creation (fs::create_dir_all) happens after this
+        // resolves -- a not-yet-existing configured root is the normal
+        // first-run case, not an error condition for the resolver itself.
+        let root =
+            resolve_bootstrap_data_root(Some(PathBuf::from(r"D:\does-not-exist-yet\data")), None)
+                .expect("resolver does not stat the path");
+        assert_eq!(root, PathBuf::from(r"D:\does-not-exist-yet\data"));
+    }
+
+    /// End-to-end reproduction of the actual bug, on real temp directories
+    /// standing in for "D:\...\data" (configured override) and
+    /// "C:\...\AppData\Roaming" (the old default) -- this exercises the same
+    /// resolve-then-create_dir_all sequence ensure_release_resources runs,
+    /// not just the resolver in isolation. Before the fix this test's C-side
+    /// fake path would gain a BharatTerminal\data + \models pair on every
+    /// run; after the fix it must stay completely empty.
+    #[test]
+    fn cold_start_never_recreates_state_under_fake_c_when_override_points_at_fake_d() {
+        use std::fs;
+
+        let unique = format!(
+            "bharatterminal_recreation_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let sandbox = std::env::temp_dir().join(unique);
+        let fake_d_configured_root = sandbox.join("fake-d").join("BharatTerminal").join("data");
+        let fake_c_appdata_roaming = sandbox.join("fake-c").join("AppData").join("Roaming");
+        fs::create_dir_all(&fake_d_configured_root).expect("set up fake D sandbox");
+        fs::create_dir_all(&fake_c_appdata_roaming).expect("set up fake C sandbox");
+
+        // Exactly the call ensure_release_resources makes: an explicit
+        // override is configured (fake D), and APPDATA (fake C) is also
+        // present in the environment, as it always is on Windows.
+        let resolved = resolve_bootstrap_data_root(
+            Some(fake_d_configured_root.clone()),
+            Some(fake_c_appdata_roaming.clone()),
+        )
+        .expect("override branch never fails");
+
+        // Same side effects ensure_release_resources performs on the
+        // resolved root.
+        fs::create_dir_all(resolved.join("data")).expect("create data dir");
+        fs::create_dir_all(resolved.join("models")).expect("create models dir");
+
+        let fake_c_bharatterminal = fake_c_appdata_roaming.join("BharatTerminal");
+        assert!(
+            !fake_c_bharatterminal.exists(),
+            "recreation-trap regression: a BharatTerminal dir was created under the fake C:\\...\\AppData\\Roaming even though an explicit D-style override was configured"
+        );
+        assert!(
+            resolved.join("data").is_dir(),
+            "data dir must exist under the configured D-style root"
+        );
+        assert!(
+            resolved.join("models").is_dir(),
+            "models dir must exist under the configured D-style root"
+        );
+        assert_eq!(
+            resolved, fake_d_configured_root,
+            "mutable state must resolve to the configured root, not a derived/second path"
+        );
+
+        let _ = fs::remove_dir_all(&sandbox);
+    }
 }
 
 #[cfg(not(debug_assertions))]
