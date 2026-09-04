@@ -71,7 +71,13 @@ wal = database.with_name(database.name + ".wal")
 if wal.exists() and wal.stat().st_size:
     raise RuntimeError(f"DuckDB WAL remained non-empty after CHECKPOINT: {wal}")
 "@
-  Invoke-Native $Python -c $checkpointScript
+  $checkpointScriptPath = Join-Path $env:TEMP "bharatterminal_checkpoint_$([guid]::NewGuid().ToString('N')).py"
+  Set-Content -LiteralPath $checkpointScriptPath -Value $checkpointScript -Encoding utf8
+  try {
+    Invoke-Native $Python $checkpointScriptPath
+  } finally {
+    Remove-Item -LiteralPath $checkpointScriptPath -Force -ErrorAction SilentlyContinue
+  }
   Write-Host "Checkpointed terminal.db before release snapshot"
 }
 
