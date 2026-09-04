@@ -457,6 +457,54 @@ def run_ohlc_forecasts(_: date) -> str:
     return f"symbols={completed} errors={errors}"
 
 
+def run_ml_prediction_snapshot(_: date) -> str:
+    """Canonical production prediction-observation event for the OOS
+    lifecycle (m01/m02/m04/m06 -- any model predict_all_models can attribute
+    a registry artifact to). Deliberately NOT the GET /ml/predict path: that
+    stays log=False regardless of GUI refresh/poll count, so an attributed
+    observation is logged exactly once per (model, symbol, data_as_of) no
+    matter how many times a user's screen re-fetches it today. Idempotency
+    against re-running this same task twice for one day's data_as_of is
+    enforced inside ml.monitor.log_prediction's natural-key check, not here.
+
+    Dispatched through the writer queue (submit_write), like every other
+    task in this module: this standalone collector process does not own the
+    live DuckDB writer connection, so predict_all_models's log=True path
+    (which writes via ml.monitor.log_prediction) can only run inside the
+    process that does -- WriteOperation.PREDICT_AND_LOG already exists for
+    exactly this (used today by the manual prediction path); this task is
+    the first *scheduled* caller of it with log=True."""
+    symbols = forecast_symbols(limit=250)
+    logged = 0
+    errors = 0
+    for symbol in symbols:
+        try:
+            submit_write(WriteOperation.PREDICT_AND_LOG, {"symbol": symbol, "signals": {}})
+            logged += 1
+        except Exception as error:
+            errors += 1
+            log.warning("ml prediction snapshot failed for %s: %s", symbol, error)
+    if symbols and logged == 0:
+        return f"not_available_yet symbols={logged} errors={errors}"
+    return f"symbols={logged} errors={errors}"
+
+
+def run_ml_outcome_resolution(_: date) -> str:
+    """Resolves previously-logged predictions (run_ml_prediction_snapshot)
+    whose target date has genuinely passed and whose actual OHLCV is now
+    available, using the same training-time target functions -- see
+    ml.monitor.resolve_pending_prediction_outcomes's own docstring for the
+    no-lookahead/idempotency contract. Safe to run with zero mature rows:
+    that is the correct, expected result until a future session's data
+    lands, not an error. Dispatched through the writer queue -- see
+    run_ml_prediction_snapshot's docstring for why."""
+    summary = submit_write(WriteOperation.RESOLVE_PENDING_PREDICTION_OUTCOMES, {})
+    return (
+        f"candidates={summary['candidates']} resolved={summary['resolved']} "
+        f"pending={summary['not_yet_resolvable']} errors={summary['errors']}"
+    )
+
+
 def run_weekly_retrain(_: date) -> str:
     # Training is CPU/file work which performs small typed DB reads/writes as
     # needed.  Running the whole job as one WriterService operation held the
@@ -503,6 +551,8 @@ TASK_RUNNERS: dict[str, TaskRunner] = {
     "signals": run_signals,
     "bif": run_bif,
     "ohlc_forecasts": run_ohlc_forecasts,
+    "ml_prediction_snapshot": run_ml_prediction_snapshot,
+    "ml_outcome_resolution": run_ml_outcome_resolution,
     "weekly_retrain": run_weekly_retrain,
     "stock_training": run_stock_training,
 }
@@ -651,6 +701,34 @@ def get_pending_tasks() -> list[dict[str, Any]]:
             }
         )
 
+    # Same after-close gate as ohlc_forecasts: today's EOD data_as_of must be
+    # the one actually reflected in the logged observation, not an
+    # intraday/incomplete session.
+    if now_hour >= 16.0 and not task_done("ml_prediction_snapshot", today):
+        tasks.append(
+            {
+                "task": "ml_prediction_snapshot",
+                "date": today,
+                "reason": "daily attributed prediction snapshot for OOS tracking",
+                "priority": 6,
+            }
+        )
+
+    # Runs after bhavcopy_equity's own >=16.25 gate so today's actual EOD
+    # data is already present before checking which past predictions have
+    # now matured -- resolution itself only ever touches earlier target
+    # dates, never today's, so this ordering is a freshness nicety, not a
+    # correctness requirement.
+    if now_hour >= 16.5 and not task_done("ml_outcome_resolution", today):
+        tasks.append(
+            {
+                "task": "ml_outcome_resolution",
+                "date": today,
+                "reason": "resolve matured prediction outcomes",
+                "priority": 6,
+            }
+        )
+
     is_sunday = today.weekday() == 6
     retrain_age_days = days_since_last_success("weekly_retrain")
     # `days_since_last_success` (the collector's own run ledger for this exact
@@ -714,6 +792,8 @@ _TASK_CATEGORY = {
     "fii_dii": "FII/DII",
     "signals": "SIGNALS",
     "ohlc_forecasts": "FORECAST",
+    "ml_prediction_snapshot": "OOS",
+    "ml_outcome_resolution": "OOS",
     "weekly_retrain": "TRAIN",
     "stock_training": "TRAIN",
 }

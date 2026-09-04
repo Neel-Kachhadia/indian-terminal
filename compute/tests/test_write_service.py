@@ -267,6 +267,74 @@ def test_writer_failure_is_acknowledged_and_transaction_does_not_partially_apply
         service.stop()
 
 
+@pytest.mark.integration
+def test_upsert_equity_sectors_persists_and_updates_without_fabricating_defaults(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "terminal.db"
+    queue = tmp_path / "writer.sqlite"
+    duckdb.connect(database).close()
+    service = WriterService(database, queue_path=queue)
+    service.start()
+    try:
+        result = submit_write(
+            WriteOperation.UPSERT_EQUITY_SECTORS,
+            {
+                "rows": [
+                    {"symbol": "reliance", "name": "Reliance Industries", "lot_size": 500, "sector": "ENERGY"},
+                    {"symbol": "TCS", "name": "Tata Consultancy Services", "lot_size": 175, "sector": "IT"},
+                ]
+            },
+            database=database,
+            queue_path=queue,
+        )
+        assert result == {"upserted": 2}
+        verify = connect_observational(database)
+        try:
+            fetched = verify.execute(
+                "SELECT symbol, sector, lot_size FROM fo_universe ORDER BY symbol"
+            ).fetchall()
+            assert {row[0]: (row[1], row[2]) for row in fetched} == {
+                "RELIANCE": ("ENERGY", 500),
+                "TCS": ("IT", 175),
+            }
+        finally:
+            verify.close()
+
+        # A later refresh re-upserting the same symbol with a corrected
+        # sector must UPDATE in place, not create a second row or silently
+        # keep the stale value.
+        submit_write(
+            WriteOperation.UPSERT_EQUITY_SECTORS,
+            {"rows": [{"symbol": "TCS", "name": "Tata Consultancy Services", "lot_size": 175, "sector": "IT SERVICES"}]},
+            database=database,
+            queue_path=queue,
+        )
+        verify = connect_observational(database)
+        try:
+            assert verify.execute("SELECT COUNT(*) FROM fo_universe").fetchone()[0] == 2
+            assert verify.execute("SELECT sector FROM fo_universe WHERE symbol = 'TCS'").fetchone()[0] == "IT SERVICES"
+        finally:
+            verify.close()
+
+        # No sector, no lot size, and empty-row payloads must all be refused
+        # rather than silently persisting a fabricated/blank classification.
+        for bad_rows in (
+            [{"symbol": "INFY", "name": "Infosys", "lot_size": 400, "sector": ""}],
+            [{"symbol": "INFY", "name": "Infosys", "lot_size": 0, "sector": "IT"}],
+            [],
+        ):
+            with pytest.raises(WriterRequestFailed):
+                submit_write(
+                    WriteOperation.UPSERT_EQUITY_SECTORS,
+                    {"rows": bad_rows},
+                    database=database,
+                    queue_path=queue,
+                )
+    finally:
+        service.stop()
+
+
 @pytest.mark.recovery
 def test_writer_crash_detection_rejects_new_requests(tmp_path: Path) -> None:
     database = tmp_path / "terminal.db"
@@ -595,7 +663,7 @@ def test_ml_training_audit_is_a_short_typed_writer_operation(tmp_path: Path) -> 
                 "feature_importance_top5": "{}",
                 "bif_rows_used": 0,
                 "ohlcv_rows_used": 250,
-                "status": "success",
+                "status": "READY",
                 "error_msg": None,
             },
             database=database,
@@ -605,7 +673,7 @@ def test_ml_training_audit_is_a_short_typed_writer_operation(tmp_path: Path) -> 
         assert result == {
             "symbol": "NIFTY",
             "model_id": "m01_vol_regime",
-            "status": "success",
+            "status": "READY",
         }
     finally:
         service.stop()
@@ -614,7 +682,7 @@ def test_ml_training_audit_is_a_short_typed_writer_operation(tmp_path: Path) -> 
     try:
         assert connection.execute(
             "SELECT symbol, model_id, status, n_rows FROM ml_training_log"
-        ).fetchall() == [("NIFTY", "m01_vol_regime", "success", 250)]
+        ).fetchall() == [("NIFTY", "m01_vol_regime", "READY", 250)]
     finally:
         connection.close()
 

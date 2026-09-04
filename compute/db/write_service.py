@@ -153,6 +153,7 @@ class WriteOperation(StrEnum):
     LOAD_FO_BHAVCOPY = "LOAD_FO_BHAVCOPY"
     REFRESH_INSTRUMENT_MASTER = "REFRESH_INSTRUMENT_MASTER"
     UPSERT_FII_DII = "UPSERT_FII_DII"
+    UPSERT_EQUITY_SECTORS = "UPSERT_EQUITY_SECTORS"
     BACKFILL_SIGNALS = "BACKFILL_SIGNALS"
     COMPUTE_BIF = "COMPUTE_BIF"
     RUN_OHLC_FORECASTS = "RUN_OHLC_FORECASTS"
@@ -191,6 +192,7 @@ class ReadOperation(StrEnum):
     FORECAST_SYMBOLS = "FORECAST_SYMBOLS"
     LOAD_OHLCV_FULL_FRAME = "LOAD_OHLCV_FULL_FRAME"
     RESOLVE_INDEX_INSTRUMENT = "RESOLVE_INDEX_INSTRUMENT"
+    RESOLVE_LIVE_FEED_UNIVERSE = "RESOLVE_LIVE_FEED_UNIVERSE"
     GET_FNO_UNDERLYINGS = "GET_FNO_UNDERLYINGS"
     GET_INSTRUMENT_TOKEN = "GET_INSTRUMENT_TOKEN"
     GET_LOT_SIZE = "GET_LOT_SIZE"
@@ -204,10 +206,12 @@ class ReadOperation(StrEnum):
     LOAD_UNIVERSE_SNAPSHOT = "LOAD_UNIVERSE_SNAPSHOT"
     RUN_SCREENER_QUERY_ROWS = "RUN_SCREENER_QUERY_ROWS"
     LOAD_FNO_UNIVERSE_SYMBOLS = "LOAD_FNO_UNIVERSE_SYMBOLS"
+    LOAD_VALUATION_UNIVERSE = "LOAD_VALUATION_UNIVERSE"
     LOAD_IV_RANK_HISTORY = "LOAD_IV_RANK_HISTORY"
     LOAD_SYMBOL_OHLCV_FOR_BACKFILL = "LOAD_SYMBOL_OHLCV_FOR_BACKFILL"
     LOAD_EXISTING_SIGNAL_DATES = "LOAD_EXISTING_SIGNAL_DATES"
     LOAD_MODEL_ACCURACY_STATS = "LOAD_MODEL_ACCURACY_STATS"
+    LOAD_ML_TRAINING_LOG = "LOAD_ML_TRAINING_LOG"
     LOAD_BACKTEST_RUN = "LOAD_BACKTEST_RUN"
     LOAD_BACKTEST_HISTORY = "LOAD_BACKTEST_HISTORY"
     LOAD_STOCK_TRAINER_FNO_SYMBOLS = "LOAD_STOCK_TRAINER_FNO_SYMBOLS"
@@ -1063,14 +1067,118 @@ def _dispatch_read(
     if operation is ReadOperation.GET_FNO_UNDERLYINGS:
         rows = connection.execute(
             """
-            SELECT DISTINCT COALESCE(NULLIF(name, ''), symbol) AS underlying
-            FROM instruments
-            WHERE exchange = 'NFO'
-              AND instrument_type IN ('FUTSTK', 'OPTSTK')
+            SELECT DISTINCT COALESCE(NULLIF(nfo.name, ''), nfo.symbol) AS underlying
+            FROM instruments nfo
+            WHERE nfo.exchange = 'NFO'
+              AND nfo.instrument_type IN ('FUTSTK', 'OPTSTK')
+              AND UPPER(COALESCE(NULLIF(nfo.name, ''), nfo.symbol)) NOT LIKE '%NSETEST%'
+              AND EXISTS (
+                  SELECT 1 FROM instruments cash
+                  WHERE cash.exchange = 'NSE'
+                    AND cash.instrument_type = ''
+                    AND cash.symbol = COALESCE(NULLIF(nfo.name, ''), nfo.symbol) || '-EQ'
+              )
             ORDER BY underlying
             """
         ).fetchall()
         return {"underlyings": [str(row[0]) for row in rows if row[0]]}
+    if operation is ReadOperation.RESOLVE_LIVE_FEED_UNIVERSE:
+        from data.index_aliases import CANONICAL_INDEX_SYMBOLS, INDEX_FEED_ALIASES
+        from data.instrument_schema import INSTRUMENT_SCHEMA_VERSION
+
+        equity_rows = connection.execute(
+            """
+            WITH underlyings AS (
+                SELECT DISTINCT COALESCE(NULLIF(nfo.name, ''), nfo.symbol) AS underlying
+                FROM instruments nfo
+                WHERE nfo.exchange = 'NFO'
+                  AND nfo.instrument_type IN ('FUTSTK', 'OPTSTK')
+                  AND UPPER(COALESCE(NULLIF(nfo.name, ''), nfo.symbol)) NOT LIKE '%NSETEST%'
+            ), candidates AS (
+                SELECT
+                    cash.schema_version,
+                    cash.token,
+                    underlyings.underlying AS symbol,
+                    cash.symbol AS canonical_symbol,
+                    cash.name,
+                    cash.exchange,
+                    cash.instrument_type,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY underlyings.underlying
+                        ORDER BY
+                            CASE
+                                WHEN cash.symbol = underlyings.underlying || '-EQ' THEN 0
+                                WHEN cash.symbol = underlyings.underlying THEN 1
+                                WHEN cash.name = underlyings.underlying THEN 2
+                                ELSE 3
+                            END,
+                            cash.token
+                    ) AS preference
+                FROM underlyings
+                JOIN instruments cash
+                  ON cash.exchange = 'NSE'
+                 AND cash.instrument_type = ''
+                 AND (
+                     cash.symbol = underlyings.underlying || '-EQ'
+                     OR cash.symbol = underlyings.underlying
+                     OR cash.name = underlyings.underlying
+                 )
+            )
+            SELECT schema_version, token, symbol, canonical_symbol, name, exchange,
+                   instrument_type
+            FROM candidates
+            WHERE preference = 1
+            ORDER BY symbol
+            """
+        ).fetchall()
+        rows = [
+            {
+                "schema_version": int(row[0]),
+                "token": str(row[1]),
+                "symbol": str(row[2]).strip().upper(),
+                "canonical_symbol": str(row[3]).strip().upper(),
+                "name": str(row[4] or ""),
+                "exchange": str(row[5]),
+                "instrument_type": str(row[6]),
+                "asset_class": "EQUITY",
+            }
+            for row in equity_rows
+        ]
+        for canonical in CANONICAL_INDEX_SYMBOLS:
+            aliases = sorted(INDEX_FEED_ALIASES[canonical])
+            index_rows = connection.execute(
+                """
+                SELECT schema_version, token, symbol, name, exchange, instrument_type
+                FROM instruments
+                WHERE schema_version = ?
+                  AND exchange = 'NSE'
+                  AND instrument_type = 'AMXIDX'
+                  AND (
+                      list_contains(?, upper(replace(symbol, ' ', '')))
+                      OR list_contains(?, upper(replace(name, ' ', '')))
+                  )
+                ORDER BY token
+                """,
+                [INSTRUMENT_SCHEMA_VERSION, aliases, aliases],
+            ).fetchall()
+            tokens = {str(row[1]).strip() for row in index_rows if str(row[1]).strip()}
+            if len(tokens) != 1:
+                raise ValueError(f"{canonical} index token is missing or ambiguous")
+            row = index_rows[0]
+            rows.append(
+                {
+                    "schema_version": int(row[0]),
+                    "token": str(row[1]),
+                    "symbol": canonical,
+                    "canonical_symbol": str(row[2]).strip().upper(),
+                    "name": str(row[3] or ""),
+                    "exchange": str(row[4]),
+                    "instrument_type": str(row[5]),
+                    "asset_class": "INDEX",
+                }
+            )
+        rows.sort(key=lambda item: (item["asset_class"], item["symbol"]))
+        return {"instruments": rows}
     if operation is ReadOperation.GET_INSTRUMENT_TOKEN:
         normalized = str(payload["symbol"]).strip().upper()
         normalized_exchange = str(payload.get("exchange", "NSE")).strip().upper()
@@ -1574,6 +1682,40 @@ def _dispatch_read(
             """
         ).fetchall()
         return {"symbols": [str(row[0]).upper() for row in rows]}
+    if operation is ReadOperation.LOAD_VALUATION_UNIVERSE:
+        rows = connection.execute(
+            f"""
+            WITH universe AS (
+                SELECT DISTINCT symbol
+                FROM fo_eod
+                WHERE date = (SELECT MAX(date) FROM fo_eod)
+                  AND {_FNO_EQUITY_UNDERLYING_FILTER_SQL}
+            ), latest AS (
+                SELECT symbol, CAST(date AS VARCHAR) AS price_date, close,
+                       ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY date DESC) AS recency
+                FROM decision_eligible_ohlcv
+                WHERE symbol IN (SELECT symbol FROM universe)
+                  AND close IS NOT NULL
+            )
+            SELECT universe.symbol, NULLIF(TRIM(fo_universe.sector), ''),
+                   latest.price_date, latest.close
+            FROM universe
+            LEFT JOIN fo_universe ON upper(fo_universe.symbol) = upper(universe.symbol)
+            LEFT JOIN latest ON latest.symbol = universe.symbol AND latest.recency = 1
+            ORDER BY universe.symbol
+            """
+        ).fetchall()
+        return {
+            "rows": [
+                {
+                    "symbol": str(row[0]).strip().upper(),
+                    "sector": str(row[1]).strip() if row[1] is not None else None,
+                    "price_date": str(row[2]) if row[2] is not None else None,
+                    "previous_close": float(row[3]) if row[3] is not None else None,
+                }
+                for row in rows
+            ]
+        }
     if operation is ReadOperation.LOAD_IV_RANK_HISTORY:
         symbols = [str(item) for item in payload["symbols"]]
         from_date = str(payload["from_date"])
@@ -1630,6 +1772,55 @@ def _dispatch_read(
             [model_id, n_days],
         ).fetchone()
         return {"row": list(row)}
+    if operation is ReadOperation.LOAD_ML_TRAINING_LOG:
+        # Bounded, typed observability read over the training-rejection log
+        # (Phase 15): NOT arbitrary SQL -- fixed columns, fixed ordering,
+        # optional equality filters on model_id/symbol/status only, hard
+        # LIMIT. model_registry.db never stores a rejected attempt at all
+        # (only VALIDATED/RETIRED rows), so this table is the only place
+        # rejection/insufficient-data training history exists.
+        model_id = payload.get("model_id")
+        symbol = payload.get("symbol")
+        status = payload.get("status")
+        raw_limit = payload.get("limit")
+        limit = 500 if raw_limit is None else int(raw_limit)
+        if limit <= 0 or limit > 5000:
+            raise ValueError("limit must be between 1 and 5000")
+        # A read must never create schema (that's _ensure_ml_training_log's/
+        # _record_ml_training_log's job, both write-side) -- if no training
+        # has ever run yet, the table simply doesn't exist, and that is
+        # reported as zero rows, not silently swallowed with a bare except.
+        clauses: list[str] = []
+        params: list[Any] = []
+        if model_id:
+            clauses.append("model_id = ?")
+            params.append(str(model_id))
+        if symbol:
+            clauses.append("symbol = ?")
+            params.append(str(symbol).strip().upper())
+        if status:
+            clauses.append("status = ?")
+            params.append(str(status).strip().upper())
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        try:
+            rows = connection.execute(
+                f"""
+                SELECT symbol, model_id, CAST(trained_at AS VARCHAR), n_rows, n_features,
+                       train_score, val_score, status, error_msg
+                FROM ml_training_log
+                {where}
+                ORDER BY trained_at DESC
+                LIMIT ?
+                """,
+                [*params, limit],
+            ).fetchall()
+        except duckdb.CatalogException:
+            rows = []
+        columns = [
+            "symbol", "model_id", "trained_at", "n_rows", "n_features",
+            "train_score", "val_score", "status", "error_msg",
+        ]
+        return {"columns": columns, "rows": [list(row) for row in rows]}
     if operation is ReadOperation.LOAD_BACKTEST_RUN:
         job_id = str(payload["job_id"])
         row = connection.execute(
@@ -2069,6 +2260,8 @@ def _dispatch_read(
 def _dispatch_operation(operation: WriteOperation, payload: dict[str, Any], database: Path) -> Any:
     if operation is WriteOperation.UPSERT_FII_DII:
         return _upsert_fii_dii(database, payload)
+    if operation is WriteOperation.UPSERT_EQUITY_SECTORS:
+        return _upsert_equity_sectors(database, payload)
     if operation is WriteOperation.RECORD_INGESTION_MANIFEST:
         return _record_ingestion_manifest(database, payload)
     if operation is WriteOperation.LOAD_EQUITY_BHAVCOPY:
@@ -2218,6 +2411,27 @@ def _dispatch_operation(operation: WriteOperation, payload: dict[str, Any], data
     raise ValueError(f"unsupported typed writer operation: {operation.value}")
 
 
+ML_TRAINING_LOG_STATUSES = frozenset(
+    {
+        # Traced live from real code, not assumed (2026-09-03):
+        # trainer.py's train_all_models sets "READY" on a successful
+        # artifact and derives "INSUFFICIENT_DATA"/"FAILED" otherwise
+        # (compute/ml/trainer.py:44-60); ml/models/common.py's
+        # _unavailable_status is the shared vocabulary a model's own
+        # train_model() result can carry through unchanged when
+        # trainer.py doesn't overwrite it (INSUFFICIENT_DATA, QUARANTINED,
+        # STALE, FAILED, UNTRAINED); READY_ANALYTICAL covers a model whose
+        # own train_model() reports readiness without a persisted artifact.
+        "READY",
+        "READY_ANALYTICAL",
+        "INSUFFICIENT_DATA",
+        "QUARANTINED",
+        "STALE",
+        "UNTRAINED",
+        "FAILED",
+    }
+)
+
 _ML_TRAINING_LOG_CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS ml_training_log (
     symbol                  TEXT        NOT NULL,
@@ -2264,11 +2478,21 @@ def _record_ml_training_log(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("invalid ML training-log payload schema")
     symbol = _required_symbol(payload)
     model_id = str(payload["model_id"]).strip()
-    status = str(payload["status"]).strip().lower()
+    status = str(payload["status"]).strip().upper()
     if not model_id or len(model_id) > 100:
         raise ValueError("invalid ML training-log model_id")
-    if status not in {"success", "failed"}:
-        raise ValueError("invalid ML training-log status")
+    if status not in ML_TRAINING_LOG_STATUSES:
+        # Fail closed on an unrecognized status rather than silently
+        # dropping/renaming it -- this table exists to be trustworthy
+        # observability, and this exact bug (validating a narrower
+        # "success"/"failed" pair against the real, wider vocabulary
+        # trainer.py/stock_trainer.py/models/common.py actually emit --
+        # READY, READY_ANALYTICAL, INSUFFICIENT_DATA, QUARANTINED, STALE,
+        # UNTRAINED, FAILED -- verified live 2026-09-03, submit_write with
+        # status="READY" raised ValueError) has been silently discarding
+        # most non-failure training log rows in production. Extend
+        # ML_TRAINING_LOG_STATUSES, with evidence, rather than loosen this.
+        raise ValueError(f"invalid ML training-log status: {status!r}")
     connection = writer_connection()
     try:
         connection.execute(_ML_TRAINING_LOG_CREATE_SQL)
@@ -2298,6 +2522,64 @@ def _record_ml_training_log(payload: dict[str, Any]) -> dict[str, Any]:
     finally:
         connection.close()
     return {"symbol": symbol, "model_id": model_id, "status": status}
+
+
+def _upsert_equity_sectors(database: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    """Bulk-upsert `fo_universe.sector` (and the required NOT NULL name/lot_size
+    columns) for equities the caller has already resolved a real sector for.
+    No sector is invented here -- rows with no resolved sector are simply
+    omitted by the caller, which is why `insufficient` reflects the honest
+    count of equities valuation still cannot classify."""
+    rows = payload.get("rows")
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("equity sector payload requires a non-empty rows list")
+    required = {"symbol", "name", "lot_size", "sector"}
+    parsed: list[tuple[str, str, int, str]] = []
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != required:
+            raise ValueError("invalid equity sector row schema")
+        symbol = str(row["symbol"]).strip().upper()
+        sector = str(row["sector"]).strip()
+        lot_size = int(row["lot_size"])
+        if not symbol or not sector or lot_size <= 0:
+            raise ValueError(f"invalid equity sector row for {row.get('symbol')!r}")
+        parsed.append((symbol, str(row["name"]).strip() or symbol, lot_size, sector))
+
+    connection = writer_connection()
+    try:
+        connection.execute("BEGIN TRANSACTION")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fo_universe (
+                symbol      TEXT        PRIMARY KEY,
+                name        TEXT,
+                lot_size    INTEGER     NOT NULL,
+                sector      TEXT,
+                is_active   INTEGER     DEFAULT 1,
+                updated_at  TIMESTAMP   NOT NULL
+            )
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO fo_universe (symbol, name, lot_size, sector, is_active, updated_at)
+            VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+            ON CONFLICT (symbol) DO UPDATE SET
+                name = excluded.name,
+                lot_size = excluded.lot_size,
+                sector = excluded.sector,
+                is_active = 1,
+                updated_at = excluded.updated_at
+            """,
+            [(symbol, name, lot_size, sector) for symbol, name, lot_size, sector in parsed],
+        )
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.close()
+    return {"upserted": len(parsed)}
 
 
 def _upsert_fii_dii(database: Path, payload: dict[str, Any]) -> dict[str, Any]:

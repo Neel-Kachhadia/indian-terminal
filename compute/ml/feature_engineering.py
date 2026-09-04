@@ -203,17 +203,32 @@ def training_frame_with_target(
     return features.sort_values("date")
 
 
+VOL_REGIME_HORIZON_SESSIONS = 5
+
+
 def vol_regime_target(context: MLContext) -> pd.Series:
     close = _close_series(context.ohlcv)
     if close.empty:
         return pd.Series(dtype="object")
-    returns = close.pct_change()
-    future = pd.concat([returns.shift(-i) for i in range(1, 6)], axis=1)
+    # fill_method="pad" (pandas' historical default) forward-fills a NaN
+    # close before computing the change, which would silently turn a
+    # non-finite/missing session into a fabricated 0% return instead of
+    # leaving it non-finite -- must stay explicitly disabled.
+    returns = close.pct_change(fill_method=None)
+    future = pd.concat(
+        [returns.shift(-i) for i in range(1, VOL_REGIME_HORIZON_SESSIONS + 1)], axis=1
+    )
+    # std(skipna=True) is finite even with a single non-NaN future column, so
+    # a row must be gated on all VOL_REGIME_HORIZON_SESSIONS future sessions
+    # being present and finite before it may be labelled -- otherwise a
+    # prediction resolves after 1 elapsed session instead of 5 (lookahead/
+    # premature-maturity defect).
+    mature = pd.Series(np.isfinite(future.to_numpy()).all(axis=1), index=future.index)
     realised = future.std(axis=1, ddof=0) * math.sqrt(TRADING_DAYS) * 100.0
     labels = pd.Series(index=realised.index, dtype="object")
-    labels[realised < 10.0] = "LOW"
-    labels[(realised >= 10.0) & (realised <= 18.0)] = "MEDIUM"
-    labels[realised > 18.0] = "HIGH"
+    labels[mature & (realised < 10.0)] = "LOW"
+    labels[mature & (realised >= 10.0) & (realised <= 18.0)] = "MEDIUM"
+    labels[mature & (realised > 18.0)] = "HIGH"
     return labels
 
 
@@ -464,8 +479,19 @@ def _find_column(frame: pd.DataFrame, name: str) -> str | None:
 def _close_series(ohlcv: pd.DataFrame) -> pd.Series:
     if ohlcv.empty or "close" not in ohlcv.columns:
         return pd.Series(dtype="float64")
-    dates = pd.to_datetime(ohlcv["date"]).dt.date
-    return pd.Series(pd.to_numeric(ohlcv["close"], errors="coerce").to_numpy(), index=dates)
+    frame = pd.DataFrame(
+        {
+            "date": pd.to_datetime(ohlcv["date"]).dt.date,
+            "close": pd.to_numeric(ohlcv["close"], errors="coerce"),
+        }
+    )
+    # Target/resolver correctness requires strict chronological order and one
+    # row per session: callers (notably the OOS outcome resolver, which reads
+    # rows straight off a DB query) must not be able to shift a future
+    # session's horizon by handing rows out of order or with a duplicated
+    # date. Keep the first observation of any duplicated date.
+    frame = frame.sort_values("date", kind="stable").drop_duplicates(subset="date", keep="first")
+    return pd.Series(frame["close"].to_numpy(), index=frame["date"])
 
 
 def _extract_spot(payload: dict[str, Any], ohlcv: pd.DataFrame) -> float | None:

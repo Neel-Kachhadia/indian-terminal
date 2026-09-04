@@ -25,6 +25,8 @@ from auto_collector.smart_collector import (
     _collector_read_dataset,
     missing_trading_days,
     run_logged_task,
+    run_ml_outcome_resolution,
+    run_ml_prediction_snapshot,
     run_ohlc_forecasts,
     run_task,
 )
@@ -231,6 +233,70 @@ def test_ohlc_forecasts_total_failure_is_not_reported_as_success(monkeypatch) ->
 
     success, _ = run_task("ohlc_forecasts", date(2026, 8, 25))
     assert success is False
+
+
+def test_ml_prediction_snapshot_total_failure_is_not_reported_as_success(monkeypatch) -> None:
+    """Same defect class already fixed once for run_ohlc_forecasts (see
+    test_ohlc_forecasts_total_failure_is_not_reported_as_success): every
+    symbol failing must not be logged as a completed day."""
+    monkeypatch.setattr(smart_collector, "forecast_symbols", lambda limit=250: ["NIFTY", "BANKNIFTY"])
+
+    def _always_fails(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("Connection Error: Can't open a connection to same database file")
+
+    monkeypatch.setattr(smart_collector, "submit_write", _always_fails)
+
+    details = run_ml_prediction_snapshot(date(2026, 8, 25))
+    assert "not_available_yet" in details
+
+    success, _ = run_task("ml_prediction_snapshot", date(2026, 8, 25))
+    assert success is False
+
+
+def test_ml_prediction_snapshot_partial_success_still_reports_success(monkeypatch) -> None:
+    monkeypatch.setattr(smart_collector, "forecast_symbols", lambda limit=250: ["NIFTY", "BANKNIFTY"])
+
+    calls: list[tuple[object, dict]] = []
+
+    def _fake_submit_write(operation, payload, **_kwargs):
+        calls.append((operation, payload))
+        if payload.get("symbol") == "BANKNIFTY":
+            raise RuntimeError("insufficient data")
+        return {"status": "READY"}
+
+    monkeypatch.setattr(smart_collector, "submit_write", _fake_submit_write)
+
+    details = run_ml_prediction_snapshot(date(2026, 8, 25))
+    assert "not_available_yet" not in details
+    assert "symbols=1" in details
+    assert "errors=1" in details
+    assert [payload["symbol"] for _op, payload in calls] == ["NIFTY", "BANKNIFTY"]
+    assert all(op is smart_collector.WriteOperation.PREDICT_AND_LOG for op, _payload in calls)
+    assert all(payload["signals"] == {} for _op, payload in calls)
+
+    success, _ = run_task("ml_prediction_snapshot", date(2026, 8, 25))
+    assert success is True
+
+
+def test_ml_outcome_resolution_reports_zero_resolved_as_success_when_nothing_pending(
+    monkeypatch,
+) -> None:
+    """Zero candidates/zero resolved is the correct, expected result when no
+    prediction has matured yet -- must not be treated as failure."""
+
+    def _fake_submit_write(operation, payload, **_kwargs):
+        assert operation is smart_collector.WriteOperation.RESOLVE_PENDING_PREDICTION_OUTCOMES
+        assert payload == {}
+        return {"candidates": 0, "resolved": 0, "not_yet_resolvable": 0, "errors": 0}
+
+    monkeypatch.setattr(smart_collector, "submit_write", _fake_submit_write)
+
+    details = run_ml_outcome_resolution(date(2026, 8, 25))
+    assert "candidates=0" in details
+    assert "resolved=0" in details
+
+    success, _ = run_task("ml_outcome_resolution", date(2026, 8, 25))
+    assert success is True
 
 
 def _weekday_is_trading_day(day: date) -> bool:

@@ -56,12 +56,28 @@ def ensure_ml_tables() -> None:
                 ("validation_status", "TEXT"),
                 ("fallback_status", "TEXT"),
                 ("outcome_error", "REAL"),
+                ("trained_symbol", "TEXT"),
             ):
                 con.execute(f"ALTER TABLE ml_predictions ADD COLUMN IF NOT EXISTS {name} {data_type}")
             con.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_ml_model
                 ON ml_predictions(model_id, predicted_at)
+                """
+            )
+            # Same duplicate-row class already found and fixed once in
+            # ohlc_forecasts (m21_ohlc_forecast.py's _insert_forecast): a
+            # bare INSERT with no natural-key guard means every re-run of a
+            # scheduled snapshot for a (model_id, symbol, data_as_of) already
+            # logged would silently add another full duplicate observation.
+            # This index doesn't enforce uniqueness itself (DuckDB has no
+            # partial/expression uniqueness here across nullable columns),
+            # so log_prediction below does the existing-row check explicitly
+            # -- this index just makes that check cheap.
+            con.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_ml_natural_key
+                ON ml_predictions(model_id, symbol, data_as_of)
                 """
             )
         finally:
@@ -76,7 +92,14 @@ def log_prediction(
     features: dict[str, Any],
     *,
     attribution: dict[str, Any],
-) -> str:
+) -> str | None:
+    """Persist one attributed prediction observation. Idempotent on
+    (model_id, symbol, data_as_of): a scheduled snapshot re-run for a
+    combination already logged returns the existing row's id rather than
+    inserting a duplicate -- see idx_ml_natural_key's comment for the prior
+    incident (ohlc_forecasts) this mirrors. Returns None if a required
+    attribution field is missing for the natural key, so a snapshot caller
+    can skip counting it as newly logged."""
     if prediction is None:
         raise ValueError("unavailable prediction must not be logged")
     if confidence is None:
@@ -89,6 +112,10 @@ def log_prediction(
         raise ValueError("prediction confidence must be within [0, 1]")
     if not probabilities:
         raise ValueError("prediction probabilities are required for OOS tracking")
+    symbol = attribution.get("requested_symbol")
+    data_as_of = attribution.get("data_as_of")
+    if not symbol or not data_as_of:
+        raise ValueError("attribution.requested_symbol and data_as_of are required for OOS tracking")
     ensure_ml_tables()
     clean_probs = probabilities or {}
     payload = json.dumps(clean_probs, sort_keys=True)
@@ -99,14 +126,20 @@ def log_prediction(
     with DB_WRITE_LOCK:
         con = writer_connection()
         try:
+            existing = con.execute(
+                "SELECT id FROM ml_predictions WHERE model_id = ? AND symbol = ? AND data_as_of = ?",
+                [model_id, symbol, data_as_of],
+            ).fetchone()
+            if existing:
+                return str(existing[0])
             con.execute(
                 """
                 INSERT INTO ml_predictions
                     (id, model_id, predicted_at, features_hash, prediction,
                      probabilities, confidence, symbol, data_as_of, model_version,
                      artifact_hash, feature_schema_version, release_version,
-                     validation_status, fallback_status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     validation_status, fallback_status, trained_symbol)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     prediction_id,
@@ -116,14 +149,15 @@ def log_prediction(
                     prediction,
                     payload,
                     numeric_confidence,
-                    attribution.get("requested_symbol"),
-                    attribution.get("data_as_of"),
+                    symbol,
+                    data_as_of,
                     attribution.get("model_version"),
                     attribution.get("artifact_hash"),
                     attribution.get("feature_schema_version"),
                     attribution.get("release_version"),
                     attribution.get("validation_status"),
                     attribution.get("fallback_status"),
+                    attribution.get("trained_symbol"),
                 ],
             )
         finally:
