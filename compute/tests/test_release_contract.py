@@ -346,6 +346,7 @@ def test_release_source_fingerprint_excludes_volatile_build_state() -> None:
         ".venv-release",
         "__pycache__",
         "build",
+        "catboost_info",
         "dist",
         "node_modules",
         "target",
@@ -391,6 +392,7 @@ def test_rust_source_fingerprint_excludes_any_dot_or_underscore_directory() -> N
         ".venv-release",
         "__pycache__",
         "build",
+        "catboost_info",
         "dist",
         "logs",
         "node_modules",
@@ -443,6 +445,72 @@ def test_release_source_fingerprint_excludes_arbitrary_dot_or_underscore_scratch
     files = set(release_gate.source_files())
     assert real_file in files
     assert not any(".route-audit" in path.parts for path in files)
+
+
+@pytest.mark.release
+def test_release_source_fingerprint_ignores_catboost_training_side_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reproduces a live defect: CatBoost's default train_dir writes
+    compute/catboost_info/ into the process cwd as a side effect of any real
+    training run, including test_determinism_source_freeze.py's in-suite
+    CatBoost training. That directory does not start with "." or "_", so
+    (unlike .route-audit above) it was NOT covered by source_files()'s
+    blanket dot/underscore-prefix skip -- it needed its own explicit
+    exclusion, exactly like build/dist/logs/__pycache__ below it.
+
+    Reproduced live: `build_release.ps1` -> generate-identity (runs BEFORE
+    pytest, catboost_info/ does not exist yet) -> pytest, in which
+    test_determinism_source_freeze.py trains a real CatBoost model partway
+    through the suite, leaving compute/catboost_info/ behind -> by the time
+    test_release_identity_binds_canonical_source_fingerprint ran later in
+    the SAME pytest invocation, source_fingerprint() picked up the new
+    directory and produced a different hash than the one already baked into
+    release-identity.json -- a real, deterministic release-pipeline defect,
+    not test flakiness or drift."""
+    import release_gate
+
+    fake_root = tmp_path / "repo"
+    catboost_dir = fake_root / "compute" / "catboost_info" / "learn"
+    catboost_dir.mkdir(parents=True)
+    (catboost_dir / "events.out.tfevents").write_bytes(b"\x00")
+    (fake_root / "compute" / "catboost_info" / "learn_error.tsv").write_text("", encoding="utf-8")
+    real_file = fake_root / "compute" / "main.py"
+    real_file.parent.mkdir(parents=True, exist_ok=True)
+    real_file.write_text("# real source\n", encoding="utf-8")
+    for relative in (
+        "package.json",
+        "pnpm-lock.yaml",
+        ".gitignore",
+        "index.html",
+        "tailwind.config.ts",
+        "tsconfig.json",
+        "vite.config.ts",
+        "src-tauri/Cargo.toml",
+        "src-tauri/Cargo.lock",
+        "src-tauri/tauri.conf.json",
+        "src-tauri/build.rs",
+        "src-tauri/installer-hooks.nsh",
+        "build_release.ps1",
+        "release/release-spec.json",
+        "release/required-api.json",
+    ):
+        target = fake_root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("x", encoding="utf-8")
+
+    monkeypatch.setattr(release_gate, "ROOT", fake_root)
+    before = set(release_gate.source_files())
+    assert real_file in before
+    assert not any("catboost_info" in path.parts for path in before)
+
+    # The determinism property the original bug violated: adding the
+    # catboost_info/ directory after computing a first fingerprint must not
+    # change source_fingerprint()'s result.
+    fingerprint_before = release_gate.source_fingerprint()
+    (catboost_dir / "another_run_output.tsv").write_text("late", encoding="utf-8")
+    fingerprint_after = release_gate.source_fingerprint()
+    assert fingerprint_before == fingerprint_after
 
 
 @pytest.mark.release

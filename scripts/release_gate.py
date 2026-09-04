@@ -214,6 +214,17 @@ def source_files() -> list[Path]:
         ".venv-release",
         "__pycache__",
         "build",
+        # CatBoost's default train_dir: written into the process cwd (compute/)
+        # as a side effect of any real training run, including the
+        # determinism/regression tests that train a real CatBoost model
+        # in-suite. Undetected, this makes source_fingerprint() sensitive to
+        # test-execution order/timing rather than being a pure function of
+        # committed source -- generate-identity runs before pytest (no
+        # catboost_info/ yet) while a fingerprint self-check test later in
+        # the same pytest run sees it, producing two different hashes for the
+        # same commit. Must be excluded exactly like the other
+        # generated-artifact directories below (build/dist/logs/__pycache__).
+        "catboost_info",
         "dist",
         "logs",
         "node_modules",

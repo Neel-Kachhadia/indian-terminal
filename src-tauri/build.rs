@@ -148,6 +148,7 @@ fn source_fingerprint(root: &Path) -> String {
         ".venv-release",
         "__pycache__",
         "build",
+        "catboost_info",
         "dist",
         "logs",
         "target",
