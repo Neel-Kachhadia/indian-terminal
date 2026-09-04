@@ -1,0 +1,27 @@
+{
+  "reliance_consolidated_jun2026.html": {
+    "source_url": "https://www.bseindia.com/XBRLFILES/IFIndasDuplicateUploadDocument/Integrated_Finance_Ind_As_500325_177202619498_IFIndAs.html",
+    "bytes": 157141
+  },
+  "reliance_standalone_jun2026.html": {
+    "source_url": "https://www.bseindia.com/XBRLFILES/IFIndasDuplicateUploadDocument/Integrated_Finance_Ind_As_500325_1772026194850_IFIndAs.html",
+    "bytes": 160289
+  },
+  "hdfcbank_consolidated_jun2026.html": {
+    "source_url": "https://www.bseindia.com/XBRLFILES/IFBankingDuplicateUploadDocument/IFBanking_500180_187202616055_IFBanking.html",
+    "bytes": 143369
+  },
+  "reliance_integratedfinancedata_index.json": {
+    "source_url": "https://api.bseindia.com/BseIndiaAPI/api/Integratedfinancedata/w?scripcode=500325",
+    "bytes": 10361
+  },
+  "lt_integratedfinancedata_index.json": {
+    "source_url": "https://api.bseindia.com/BseIndiaAPI/api/Integratedfinancedata/w?scripcode=500510",
+    "bytes": 12841
+  },
+  "reliance_consolidated_q4_and_annual_mar2026.html": {
+    "source_url": "https://www.bseindia.com/XBRLFILES/IFIndasDuplicateUploadDocument/Integrated_Finance_Ind_As_500325_2442026225329_IFIndAs.html",
+    "bytes": 326443,
+    "note": "Q4 filing carries both quarter (OneD, Jan-Mar) and full-year (FourD, Apr-Mar) contexts"
+  }
+}

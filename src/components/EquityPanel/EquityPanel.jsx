@@ -4,9 +4,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { FilingsTab } from "./FilingsTab";
 import { FinancialsTab } from "./FinancialsTab";
 import { NewsTab } from "./NewsTab";
+import { ValuationTab } from "./ValuationTab";
 import { ContentViewer } from "./ContentViewer";
 
 const tabs = [
+  { label: "VALUATION", value: "valuation" },
   { label: "NEWS", value: "news" },
   { label: "FINANCIALS", value: "financials" },
   { label: "FILINGS", value: "filings" },
@@ -24,43 +26,100 @@ const keyframes = `
   100% { transform: scale(0.8); opacity: 0; }
 }`;
 
+export function classifySummaryError(error) {
+  const text = error instanceof Error ? error.message : String(error);
+  return /\(404\b/.test(text) ? "UNAVAILABLE" : "ERROR";
+}
+
+export function classifyValuationError(error) {
+  const text = error instanceof Error ? error.message : String(error);
+  return /\(404\b/.test(text) ? "INSUFFICIENT_DATA" : "ERROR";
+}
+
 export function EquityPanel({ symbol, processToken = null }) {
-  const [activeTab, setActiveTab] = useState("news");
+  const [activeTab, setActiveTab] = useState("valuation");
   const [collapsed, setCollapsed] = useState(false);
   const [data, setData] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [message, setMessage] = useState("");
+  const [summaryStatus, setSummaryStatus] = useState("LOADING");
+  const [summaryMessage, setSummaryMessage] = useState("");
+  const [valuation, setValuation] = useState(null);
+  const [valuationStatus, setValuationStatus] = useState("LOADING");
+  const [valuationMessage, setValuationMessage] = useState("");
   const [viewer, setViewer] = useState(null);
   const [height, setHeight] = useState(280);
   const dragRef = useRef(null);
 
+  const loading = summaryStatus === "LOADING";
+  const message = summaryStatus === "ERROR" || summaryStatus === "UNAVAILABLE" ? summaryMessage : "";
+
+  // Summary and valuation are independently sourced and independently fail --
+  // a summary outage (e.g. no news/filings row) must never blank an otherwise
+  // valid valuation, and vice versa. Each gets its own settled state.
   useEffect(() => {
     if (!symbol) {
       setData(null);
+      setSummaryStatus("LOADING");
       return;
     }
 
     let active = true;
     const load = async (showSkeleton) => {
       if (showSkeleton) {
-        setLoading(true);
+        setSummaryStatus("LOADING");
       }
-      setMessage("");
       try {
         const result = await invoke("get_equity_summary", { symbol });
         if (!active) {
           return;
         }
         setData(result);
+        setSummaryStatus("READY");
+        setSummaryMessage("");
       } catch (error) {
-        if (active) {
-          setMessage(error instanceof Error ? error.message : String(error));
-          setData(null);
+        if (!active) {
+          return;
         }
-      } finally {
-        if (active) {
-          setLoading(false);
+        setData(null);
+        setSummaryStatus(classifySummaryError(error));
+        setSummaryMessage(error instanceof Error ? error.message : String(error));
+      }
+    };
+
+    load(true);
+    const timer = window.setInterval(() => load(false), 180_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [symbol, processToken]);
+
+  useEffect(() => {
+    if (!symbol) {
+      setValuation(null);
+      setValuationStatus("LOADING");
+      return;
+    }
+
+    let active = true;
+    const load = async (showSkeleton) => {
+      if (showSkeleton) {
+        setValuationStatus("LOADING");
+      }
+      try {
+        const result = await invoke("get_equity_valuation", { symbol });
+        if (!active) {
+          return;
         }
+        setValuation(result);
+        setValuationStatus(result?.status === "VALID" ? "READY" : "INSUFFICIENT_DATA");
+        setValuationMessage("");
+      } catch (error) {
+        if (!active) {
+          return;
+        }
+        setValuation(null);
+        setValuationStatus(classifyValuationError(error));
+        setValuationMessage(error instanceof Error ? error.message : String(error));
       }
     };
 
@@ -144,15 +203,22 @@ export function EquityPanel({ symbol, processToken = null }) {
         ))}
       </div>
       <div style={bodyStyle}>
-        {loading ? <Skeleton /> : null}
-        {!loading && message ? <div style={messageStyle}>{message}</div> : null}
-        {!loading && !message && activeTab === "news" ? (
+        {activeTab === "valuation" ? (
+          valuationStatus === "LOADING" ? (
+            <Skeleton />
+          ) : (
+            <ValuationTab valuation={valuation ?? {}} status={valuationStatus} message={valuationMessage} symbol={symbol} />
+          )
+        ) : null}
+        {activeTab !== "valuation" && loading ? <Skeleton /> : null}
+        {activeTab !== "valuation" && !loading && message ? <div style={messageStyle}>{message}</div> : null}
+        {activeTab === "news" && !loading && !message ? (
           <NewsTab news={data?.news ?? []} onItemClick={setViewer} symbol={symbol} />
         ) : null}
-        {!loading && !message && activeTab === "financials" ? (
+        {activeTab === "financials" && !loading && !message ? (
           <FinancialsTab financials={data?.financials ?? {}} symbol={symbol} />
         ) : null}
-        {!loading && !message && activeTab === "filings" ? (
+        {activeTab === "filings" && !loading && !message ? (
           <FilingsTab filings={data?.filings ?? []} onItemClick={setViewer} symbol={symbol} />
         ) : null}
       </div>
@@ -235,7 +301,7 @@ const tabBarStyle = {
   background: "#0d0d0d",
   borderBottom: "1px solid #171717",
   display: "grid",
-  gridTemplateColumns: "repeat(3, minmax(0, 120px)) minmax(0, 1fr)",
+  gridTemplateColumns: "repeat(4, minmax(0, 120px)) minmax(0, 1fr)",
 };
 
 function tabButtonStyle(active) {

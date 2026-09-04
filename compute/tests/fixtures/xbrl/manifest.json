@@ -1,0 +1,23 @@
+{
+  "Third Quarter": {
+    "file": "reliance_q3_fy25.xml",
+    "fromDate": "01-Oct-2024",
+    "toDate": "31-Dec-2024",
+    "symbol": "RELIANCE",
+    "xbrl_source": "https://nsearchives.nseindia.com/corporate/xbrl/INDAS_117298_1348254_16012025082021.xml"
+  },
+  "First Quarter": {
+    "file": "reliance_q1_fy25.xml",
+    "fromDate": "01-Apr-2024",
+    "toDate": "30-Jun-2024",
+    "symbol": "RELIANCE",
+    "xbrl_source": "https://nsearchives.nseindia.com/corporate/xbrl/INDAS_109173_1196029_19072024073334.xml"
+  },
+  "Fourth Quarter": {
+    "file": "reliance_q4_fy24.xml",
+    "fromDate": "01-Jan-2024",
+    "toDate": "31-Mar-2024",
+    "symbol": "RELIANCE",
+    "xbrl_source": "https://nsearchives.nseindia.com/corporate/xbrl/INDAS_104633_1106029_22042024074028.xml"
+  }
+}

@@ -2,9 +2,11 @@ from contextlib import asynccontextmanager, suppress
 import asyncio
 from collections import deque
 import copy
+import csv
 import datetime
 from email.utils import parsedate_to_datetime
 import hashlib
+import io
 import json
 import logging
 import math
@@ -281,6 +283,27 @@ _ohlc_forecast_cache: dict[str, dict[str, Any]] = {}
 _ohlc_forecast_cache_time: dict[str, float] = {}
 _ohlc_forecast_cache_lock = Lock()
 _OHLC_FORECAST_CACHE_TTL = 60
+_valuation_refresh_lock = Lock()
+_valuation_refresh_state: dict[str, Any] = {
+    "running": False,
+    "stage": "IDLE",
+    "done": 0,
+    "total": 0,
+    "valid": 0,
+    "insufficient": 0,
+    "fetch_failed": 0,
+    "started_at": None,
+    "finished_at": None,
+    "last_error": None,
+    "symbol_errors": {},
+}
+_VALUATION_FINANCIAL_CACHE_TTL = 6 * 60 * 60
+_VALUATION_RESULT_CACHE_TTL = 30 * 60
+# Sector classification changes essentially never (an NSE re-classification is
+# a rare, deliberate event) -- cache far longer than fundamentals to avoid
+# re-fetching it every refresh cycle.
+_VALUATION_SECTOR_CACHE_TTL = 30 * 24 * 60 * 60
+_VALUATION_REQUEST_INTERVAL_SECONDS = 0.5
 _bif_engine: Any | None = None
 _bif_engine_lock = Lock()
 _backtest_jobs: dict[str, dict[str, Any]] = {}
@@ -441,6 +464,8 @@ async def lifespan(app: FastAPI):
     owns_writer = _writer_service is not None
     await _run_writer_owner_startup_maintenance(owns_writer=owns_writer)
     SYMBOL_TO_NAME = _load_symbol_to_name()
+    if getattr(sys, "frozen", False):
+        _start_valuation_refresh()
     await seed_nifty_if_empty()
     _start_instrument_refresh_if_owner(owns_writer=owns_writer)
     _start_sentiment_refresh()
@@ -690,6 +715,11 @@ def live_feed_status() -> Any:
         }
 
 
+@app.get("/live/coverage")
+def live_quote_coverage() -> Any:
+    return live_feed_status()
+
+
 @app.get("/broker/auth/status")
 def broker_auth_status() -> dict[str, str]:
     with _broker_auth_status_lock:
@@ -711,6 +741,25 @@ def resolve_feed_instrument(symbol: str) -> Any:
             status_code=503,
             detail=f"CONFIGURATION / INSTRUMENT RESOLUTION ERROR: {error}",
         ) from error
+
+
+@app.get("/instruments/feed-universe")
+def resolve_live_feed_universe() -> Any:
+    try:
+        instruments = instrument_master.resolve_live_feed_universe()
+    except InstrumentSchemaError as error:
+        raise HTTPException(
+            status_code=503,
+            detail=f"CONFIGURATION / INSTRUMENT RESOLUTION ERROR: {error}",
+        ) from error
+    return {
+        "schema_version": 1,
+        "provider": "ANGEL_ONE_SMART_STREAM_V2",
+        "subscription_mode": "QUOTE",
+        "provider_token_limit": 1000,
+        "expected_count": len(instruments),
+        "instruments": instruments,
+    }
 
 
 @app.get("/instruments/lot/{symbol}")
@@ -934,8 +983,7 @@ def equity_financials(symbol: str) -> Any:
     if cached is not None:
         return cached
 
-    payload = _fetch_equity_financials(normalized)
-    return payload
+    return _fetch_equity_financials(normalized)
 
 
 @app.get("/equity/filings/{symbol}")
@@ -978,6 +1026,109 @@ def equity_summary(symbol: str) -> Any:
 def equity_company(symbol: str) -> Any:
     normalized = http_symbol(symbol)
     return {"symbol": normalized, "name": _company_name(normalized)}
+
+
+@app.get("/valuation/symbol/{symbol}")
+def equity_valuation(symbol: str) -> Any:
+    from valuation.engine import insufficient_valuation
+
+    normalized = http_symbol(symbol)
+    cached = _equity_cache_get(f"valuation:{normalized}")
+    if isinstance(cached, dict):
+        return cached
+    rows = _valuation_universe_rows()
+    row = next((item for item in rows if item["symbol"] == normalized), None)
+    if row is None:
+        return insufficient_valuation(
+            normalized,
+            market_price=None,
+            market_price_as_of=None,
+            quote_quality="UNAVAILABLE",
+            reason="NOT_IN_CANONICAL_EQUITY_UNIVERSE",
+        )
+    market = _valuation_market_observation(row)
+    return insufficient_valuation(
+        normalized,
+        market_price=market["market_price"],
+        market_price_as_of=market["market_price_as_of"],
+        quote_quality=market["quote_quality"],
+        reason="VALUATION_REFRESH_PENDING",
+        sector=row.get("sector"),
+        warnings=["Bounded valuation refresh has not produced this symbol yet."],
+    )
+
+
+@app.get("/valuation/universe")
+def valuation_universe(
+    classification: str = "ALL",
+    sort: str = "discount",
+    limit: int = 250,
+) -> Any:
+    requested = classification.strip().upper()
+    allowed = {
+        "ALL",
+        "UNDERVALUED",
+        "FAIRLY_VALUED",
+        "OVERVALUED",
+        "INDETERMINATE",
+        "INSUFFICIENT_DATA",
+    }
+    if requested not in allowed:
+        raise HTTPException(status_code=422, detail="unsupported valuation classification")
+    if sort not in {"discount", "premium", "evidence"}:
+        raise HTTPException(status_code=422, detail="unsupported valuation sort")
+    rows = [equity_valuation(row["symbol"]) for row in _valuation_universe_rows()]
+    if requested != "ALL":
+        rows = [
+            row
+            for row in rows
+            if row.get("classification") == requested
+            or (requested == "INSUFFICIENT_DATA" and row.get("status") == "INSUFFICIENT_DATA")
+        ]
+    evidence_rank = {
+        "HIGH_EVIDENCE": 3,
+        "MODERATE_EVIDENCE": 2,
+        "LOW_EVIDENCE": 1,
+        "INSUFFICIENT_EVIDENCE": 0,
+    }
+    if sort == "evidence":
+        rows.sort(
+            key=lambda row: (
+                evidence_rank.get(str(row.get("evidence_quality")), 0),
+                _finite_sort_value(row.get("discount_premium_pct"), -math.inf),
+            ),
+            reverse=True,
+        )
+    elif sort == "premium":
+        rows.sort(key=lambda row: _finite_sort_value(row.get("discount_premium_pct"), math.inf))
+    else:
+        rows.sort(
+            key=lambda row: _finite_sort_value(row.get("discount_premium_pct"), -math.inf),
+            reverse=True,
+        )
+    bounded_limit = max(1, min(int(limit), 500))
+    with _valuation_refresh_lock:
+        refresh = dict(_valuation_refresh_state)
+    return {
+        "results": rows[:bounded_limit],
+        "total": len(rows),
+        "classification": requested,
+        "sort": sort,
+        "refresh": refresh,
+    }
+
+
+@app.get("/valuation/status")
+def valuation_status() -> Any:
+    with _valuation_refresh_lock:
+        return dict(_valuation_refresh_state)
+
+
+@app.post("/valuation/refresh")
+def refresh_valuation_universe() -> Any:
+    started = _start_valuation_refresh()
+    with _valuation_refresh_lock:
+        return {"started": started, **_valuation_refresh_state}
 
 
 @app.post("/payoff")
@@ -3142,6 +3293,203 @@ def _equity_cache_set(key: str, payload: Any, ttl_seconds: int) -> None:
         print(f"equity: redis SETEX {key} failed: {error}")
 
 
+def _valuation_universe_rows() -> list[dict[str, Any]]:
+    result = resolve_read(ReadOperation.LOAD_VALUATION_UNIVERSE, {})
+    return [dict(row) for row in result.get("rows") or []]
+
+
+def _valuation_market_observation(row: dict[str, Any]) -> dict[str, Any]:
+    symbol = str(row.get("symbol") or "").strip().upper()
+    session = exchange_calendar().session_snapshot()
+    if session.get("current_state") == "OPEN":
+        try:
+            payload = _redis_client.get(f"tick:{symbol}")
+        except _redis.RedisError:
+            payload = None
+        if payload is not None:
+            tick = _decode_live_tick(payload, symbol, f"tick:{symbol}")
+            if isinstance(tick, dict) and tick.get("decision_eligible") is True:
+                return {
+                    "market_price": tick.get("ltp"),
+                    "market_price_as_of": datetime.datetime.fromtimestamp(
+                        int(tick["observed_at_ms"]) / 1000,
+                        tz=datetime.timezone.utc,
+                    ).isoformat(),
+                    "quote_quality": "LIVE",
+                }
+    return {
+        "market_price": row.get("previous_close"),
+        "market_price_as_of": row.get("price_date"),
+        "quote_quality": "PREVIOUS_CLOSE" if row.get("previous_close") is not None else "NO_DATA",
+    }
+
+
+def _start_valuation_refresh() -> bool:
+    with _valuation_refresh_lock:
+        if _valuation_refresh_state["running"]:
+            return False
+        _valuation_refresh_state.update(
+            {
+                "running": True,
+                "stage": "LOADING_UNIVERSE",
+                "done": 0,
+                "total": 0,
+                "valid": 0,
+                "insufficient": 0,
+                "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "finished_at": None,
+                "last_error": None,
+            }
+        )
+    Thread(target=_run_valuation_refresh, name="valuation-universe-refresh", daemon=True).start()
+    return True
+
+
+def _run_valuation_refresh() -> None:
+    from valuation.engine import build_valuation
+
+    try:
+        rows = _valuation_universe_rows()
+        with _valuation_refresh_lock:
+            _valuation_refresh_state.update(
+                stage="FETCHING_FUNDAMENTALS", total=len(rows), fetch_failed=0, symbol_errors={}
+            )
+        fundamentals: dict[str, dict[str, Any]] = {}
+        fetch_failed = 0
+        symbol_errors: dict[str, str] = {}
+        sector_upserts: list[dict[str, Any]] = []
+        try:
+            sector_membership = _fetch_sector_index_membership()
+        except Exception as error:
+            logger.warning("sector index membership fetch failed: %s", error)
+            sector_membership = {}
+        for index, row in enumerate(rows, start=1):
+            symbol = str(row["symbol"])
+            if not row.get("sector"):
+                # fo_universe has no row for this symbol yet (or it's stale).
+                # A symbol NSE doesn't place in any of the fetched sectoral
+                # indices simply stays unresolved -- never fabricated.
+                sector = sector_membership.get(symbol)
+                if sector is not None:
+                    row["sector"] = sector
+                    lot_size_result = resolve_read(ReadOperation.GET_LOT_SIZE, {"symbol": symbol})
+                    lot_size = lot_size_result.get("lot_size")
+                    if isinstance(lot_size, int) and lot_size > 0:
+                        sector_upserts.append(
+                            {
+                                "symbol": symbol,
+                                "name": _company_name(symbol),
+                                "lot_size": lot_size,
+                                "sector": sector,
+                            }
+                        )
+            payload = _equity_cache_get(f"financials:{symbol}")
+            fetched = False
+            if not isinstance(payload, dict):
+                try:
+                    payload = _fetch_equity_financials(symbol)
+                except Exception as error:
+                    # A parsing/shape bug on one symbol's NSE payload must not
+                    # abort fundamental retrieval for the other ~209 equities;
+                    # network-level failures already fail closed to None
+                    # inside nse.get(), so anything reaching here is a real
+                    # per-symbol defect worth recording, not a transient blip.
+                    fetch_failed += 1
+                    symbol_errors[symbol] = f"{type(error).__name__}: {error}"
+                    logger.warning("fundamental fetch failed for %s: %s", symbol, error)
+                    payload = {
+                        "symbol": symbol,
+                        "quarters": [],
+                        "annual": [],
+                        "ratios": {},
+                        "source": "NSE_CORPORATE_FINANCIAL_RESULTS",
+                        "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                        "data_as_of": None,
+                        "error": symbol_errors[symbol],
+                    }
+                else:
+                    _equity_cache_set(
+                        f"financials:{symbol}", payload, _VALUATION_FINANCIAL_CACHE_TTL
+                    )
+                fetched = True
+            fundamentals[symbol] = payload
+            with _valuation_refresh_lock:
+                _valuation_refresh_state["done"] = index
+                _valuation_refresh_state["fetch_failed"] = fetch_failed
+                _valuation_refresh_state["symbol_errors"] = dict(symbol_errors)
+            if fetched and index < len(rows):
+                _time.sleep(_VALUATION_REQUEST_INTERVAL_SECONDS)
+
+        if sector_upserts:
+            try:
+                submit_write(WriteOperation.UPSERT_EQUITY_SECTORS, {"rows": sector_upserts})
+            except Exception as error:
+                # Durable persistence failing must not discard the sectors
+                # already resolved in-memory for this run's own valuations
+                # below -- only next refresh's re-fetch is at stake here.
+                logger.warning("equity sector upsert failed: %s", error)
+
+        observations = [
+            {
+                **row,
+                **_valuation_market_observation(row),
+                "financials": fundamentals.get(str(row["symbol"])),
+            }
+            for row in rows
+        ]
+        valid = 0
+        insufficient = 0
+        with _valuation_refresh_lock:
+            _valuation_refresh_state.update(stage="VALUING", done=0)
+        for index, target in enumerate(observations, start=1):
+            valuation = build_valuation(
+                symbol=str(target["symbol"]),
+                sector=target.get("sector"),
+                market_price=target.get("market_price"),
+                market_price_as_of=target.get("market_price_as_of"),
+                quote_quality=str(target.get("quote_quality") or "UNAVAILABLE"),
+                financials=target.get("financials"),
+                peers=observations,
+                evaluated_on=today_ist(),
+            )
+            _equity_cache_set(
+                f"valuation:{target['symbol']}", valuation, _VALUATION_RESULT_CACHE_TTL
+            )
+            if valuation.get("status") == "VALID":
+                valid += 1
+            else:
+                insufficient += 1
+            with _valuation_refresh_lock:
+                _valuation_refresh_state.update(
+                    done=index,
+                    valid=valid,
+                    insufficient=insufficient,
+                )
+        with _valuation_refresh_lock:
+            _valuation_refresh_state.update(
+                running=False,
+                stage="COMPLETE",
+                finished_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            )
+    except Exception as error:
+        logger.exception("valuation universe refresh failed")
+        with _valuation_refresh_lock:
+            _valuation_refresh_state.update(
+                running=False,
+                stage="FAILED",
+                finished_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                last_error=type(error).__name__,
+            )
+
+
+def _finite_sort_value(value: Any, default: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
 def _fetch_equity_news(symbol: str) -> list[dict[str, Any]]:
     announcements = _fetch_nse_announcements(symbol)
     et_items = _fetch_et_news(symbol)
@@ -3252,107 +3600,477 @@ def _fetch_et_news(symbol: str) -> list[dict[str, Any]]:
     return _sort_dedupe_news(items)[:10]
 
 
-def _fetch_equity_financials(symbol: str) -> dict[str, Any]:
+# NSE's own official sectoral-index constituent files (niftyindices.com,
+# NOT the nseindia.com API domain -- that domain's per-symbol quote-equity
+# endpoint is behind Akamai bot-mitigation that reliably 403s even with a
+# real cookie/Referer, confirmed live 2026-09-03; this bulk CSV path hits
+# only ~15 requests total for the whole 210-equity universe instead of one
+# per symbol, and is the real source NSE itself publishes each index's
+# constituents from). Each row is "Company Name,Industry,Symbol,Series,ISIN
+# Code" -- the "Industry" column is what we persist as sector.
+_SECTOR_INDEX_SLUGS = (
+    "niftyautolist",
+    "niftybanklist",
+    "niftyfmcglist",
+    "niftyhealthcarelist",
+    "niftyitlist",
+    "niftymedialist",
+    "niftymetallist",
+    "niftypharmalist",
+    "niftypsubanklist",
+    "niftyrealtylist",
+    "niftyoilgaslist",
+    "niftyconsumerdurableslist",
+    "niftycommoditieslist",
+    "niftycpselist",
+    "niftyinfralist",
+)
+_SECTOR_INDEX_CACHE_KEY = "sector_index_membership:v1"
+
+
+def _fetch_sector_index_membership() -> dict[str, str]:
+    """Real symbol -> NSE "Industry" classification for every symbol NSE
+    places in one of the official sectoral indices above. Never guesses or
+    fabricates a sector for a symbol NSE doesn't classify -- such symbols
+    are simply absent from the returned map, and callers must leave their
+    `sector` unresolved (None) rather than invent one."""
+    cached = _equity_cache_get(_SECTOR_INDEX_CACHE_KEY)
+    if isinstance(cached, dict) and cached:
+        return cached
+    membership: dict[str, str] = {}
+    for slug in _SECTOR_INDEX_SLUGS:
+        try:
+            response = _requests.get(
+                f"https://niftyindices.com/IndexConstituent/ind_{slug}.csv",
+                timeout=10,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+        except Exception as error:
+            logger.warning("sector index fetch failed for %s: %s", slug, error)
+            continue
+        if response.status_code != 200:
+            continue
+        reader = csv.DictReader(io.StringIO(response.text))
+        if reader.fieldnames is None or "Symbol" not in reader.fieldnames or "Industry" not in reader.fieldnames:
+            continue
+        rows = list(reader)
+        # A constituent list realistically has a few dozen rows; a response
+        # this large is not a genuine per-index list (an unexpected fallback
+        # page NSE served instead) -- skip it rather than trust bad data.
+        if not (1 <= len(rows) <= 100):
+            continue
+        for row in rows:
+            symbol = str(row.get("Symbol") or "").strip().upper()
+            industry = str(row.get("Industry") or "").strip()
+            if symbol and industry:
+                membership.setdefault(symbol, industry)
+        _time.sleep(_VALUATION_REQUEST_INTERVAL_SECONDS)
+    if membership:
+        _equity_cache_set(_SECTOR_INDEX_CACHE_KEY, membership, _VALUATION_SECTOR_CACHE_TTL)
+    return membership
+
+
+_FUNDAMENTAL_SCOPE_PREFERENCE = ("Consolidated", "Non-Consolidated")
+_MAX_FILINGS_PER_SCOPE_ATTEMPT = 8
+_MIN_TTM_QUARTERS = 4
+
+
+def _newest_quarter_is_stale(quarters: list[dict[str, Any]]) -> bool:
+    """Same staleness threshold the valuation engine itself enforces
+    (MAX_FUNDAMENTAL_AGE_DAYS) applied here, one layer earlier, purely to
+    decide NSE-vs-BSE source preference -- the engine independently
+    re-checks this at valuation time regardless, so this can only make the
+    source choice more conservative, never looser."""
+    from valuation.engine import MAX_FUNDAMENTAL_AGE_DAYS
+
+    newest = max((q.get("report_date") for q in quarters if q.get("report_date")), default=None)
+    if newest is None:
+        return True
+    try:
+        newest_date = datetime.date.fromisoformat(newest)
+    except ValueError:
+        return True
+    age_days = (datetime.date.today() - newest_date).days
+    return age_days > MAX_FUNDAMENTAL_AGE_DAYS
+
+
+def _fetch_equity_financials(symbol: str, diagnostics: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Real TTM-eligible quarterly financials, preferring NSE's structured
+    XBRL filings and falling back to BSE's Integrated Filing (Finance)
+    filings when NSE can't supply four same-scope quarters.
+
+    NSE's `corporates-financial-results` metadata carries no revenue/PAT/EPS
+    fields itself (see valuation.xbrl_facts docstring) and, independently,
+    its backing structured/XBRL dataset was verified live (2026-09-03) to
+    have stopped updating after the 31-Dec-2024 quarter across 9 large-cap
+    issuers -- root cause: SEBI's "Integrated Filing (Finance)" regime took
+    effect from the Mar-2025 quarter and NSE's legacy structured endpoints
+    were never migrated to it. BSE's `Integratedfinancedata` API *was*
+    migrated and verified live current through Jun-2026 for the same 9
+    issuers (see valuation.bse_ixbrl_facts docstring) -- so it is the
+    fallback, never the silent preference, and every quarter carries which
+    exchange actually supplied it.
+
+    A symbol with fewer than four resolvable same-scope quarters from
+    either source returns an empty `quarters` list rather than a
+    partially-fabricated one; the valuation engine already fails closed on
+    that (and independently on staleness, via MAX_FUNDAMENTAL_AGE_DAYS)."""
     url = (
         "https://www.nseindia.com/api/corporates-financial-results"
         f"?index=equities&symbol={quote(symbol)}&period=Quarterly"
     )
     payload = _nse_json(url)
-    quarters = [
-        item
-        for item in (
-            _normalise_financial_record(symbol, record)
-            for record in _extract_records(payload)
-        )
-        if item is not None
-    ]
-    quarters.sort(
-        key=lambda item: _sort_datetime(item.get("report_date")),
-        reverse=True,
-    )
-    quarters = quarters[:8]
+    filings = _extract_records(payload)
+    retrieved_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    isin = next((str(f.get("isin")) for f in filings if f.get("isin")), None)
+
+    if diagnostics is not None:
+        diagnostics["isin"] = isin
+        diagnostics["nse_filings_count"] = len(filings)
+
+    quarters = _resolve_quarters_from_filings(symbol, filings) if filings else []
+    nse_quarter_count = len(quarters)
+    nse_stale = _newest_quarter_is_stale(quarters)
+    source = "NSE_XBRL_QUARTERLY_RESULTS"
+    if len(quarters) < _MIN_TTM_QUARTERS or nse_stale:
+        bse_diag: dict[str, Any] = {}
+        bse_quarters = _fetch_bse_quarters(symbol, isin, bse_diag)
+        if diagnostics is not None:
+            diagnostics.update({f"bse_{k}" if not k.startswith("bse_") else k: v for k, v in bse_diag.items()})
+        if len(bse_quarters) >= _MIN_TTM_QUARTERS and not _newest_quarter_is_stale(bse_quarters):
+            quarters = bse_quarters
+            source = "BSE_INTEGRATED_FILING_FINANCE"
+    if diagnostics is not None:
+        diagnostics["nse_quarter_count"] = nse_quarter_count
+        diagnostics["nse_stale"] = nse_stale
+        diagnostics["final_source"] = source if quarters else None
+
     _fill_yoy_growth(quarters)
     if not quarters:
-        return {"symbol": symbol, "quarters": [], "error": "no data"}
+        return {
+            "symbol": symbol,
+            "quarters": [],
+            "annual": [],
+            "ratios": {},
+            "source": None,
+            "retrieved_at": retrieved_at,
+            "data_as_of": None,
+            "error": "no data",
+        }
     return {
         "symbol": symbol,
         "quarters": quarters,
         "annual": [],
-        "ratios": _extract_ratios(payload),
+        "ratios": _extract_ratios(payload) if source == "NSE_XBRL_QUARTERLY_RESULTS" else {},
+        "source": source,
+        "retrieved_at": retrieved_at,
+        "data_as_of": quarters[0].get("report_date"),
+        "units": {"eps": "INR_PER_SHARE", "revenue": "INR", "pat": "INR"},
     }
 
 
-def _normalise_financial_record(
-    symbol: str,
-    record: dict[str, Any],
-) -> dict[str, Any] | None:
-    report_date = _iso_date(
-        _field(
-            record,
-            "report_date",
-            "reportDate",
-            "date",
-            "toDate",
-            "periodEnded",
-            "periodEndDate",
-            "broadCastDate",
-            "broadcastDate",
-            "xbrlFilingDate",
+def _resolve_quarters_from_filings(
+    symbol: str, filings: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    by_scope: dict[str, list[dict[str, Any]]] = {}
+    for record in filings:
+        scope = str(record.get("consolidated") or "").strip()
+        if scope in _FUNDAMENTAL_SCOPE_PREFERENCE:
+            by_scope.setdefault(scope, []).append(record)
+
+    for scope in _FUNDAMENTAL_SCOPE_PREFERENCE:
+        records = by_scope.get(scope) or []
+        # Never mix standalone and consolidated quarters into one TTM: this
+        # scope is only attempted if it alone can plausibly supply four.
+        if len(records) < _MIN_TTM_QUARTERS:
+            continue
+        records = sorted(
+            records,
+            key=lambda record: _sort_datetime(record.get("toDate")),
+            reverse=True,
         )
-    )
-    revenue = _number_field(
-        record,
-        "revenue",
-        "totalRevenue",
-        "revenueFromOperations",
-        "revenueFromOperation",
-        "totalIncome",
-        "income",
-        "sales",
-    )
-    pat = _number_field(
-        record,
-        "pat",
-        "profitAfterTax",
-        "profitLossForPeriod",
-        "netProfit",
-        "netProfitLoss",
-        "profitAfterTaxAfterMI",
-    )
-    eps = _number_field(
-        record,
-        "eps",
-        "basicEPS",
-        "dilutedEPS",
-        "earningsPerShare",
-        "basicEps",
-        "dilutedEps",
-    )
-    if report_date is None and revenue is None and pat is None and eps is None:
+        quarters: list[dict[str, Any]] = []
+        for record in records[:_MAX_FILINGS_PER_SCOPE_ATTEMPT]:
+            quarter = _resolve_one_filing_quarter(symbol, record, scope)
+            _time.sleep(_VALUATION_REQUEST_INTERVAL_SECONDS)
+            if quarter is not None:
+                quarters.append(quarter)
+                if len(quarters) >= _MIN_TTM_QUARTERS:
+                    break
+        if len(quarters) >= _MIN_TTM_QUARTERS:
+            return quarters
+    return []
+
+
+def _resolve_one_filing_quarter(
+    symbol: str, record: dict[str, Any], scope: str
+) -> dict[str, Any] | None:
+    from valuation.xbrl_facts import resolve_quarter
+
+    xbrl_url = _normalise_url(_text_field(record, "xbrl"))
+    if not xbrl_url or not xbrl_url.lower().startswith("https://"):
         return None
-    period = _text_field(
-        record,
-        "period",
-        "quarter",
-        "quarterEnded",
-        "periodEnded",
-        "financialYear",
-    )
-    if not period:
-        period = _quarter_label(report_date)
+    from_date_iso = _iso_date(record.get("fromDate"))
+    to_date_iso = _iso_date(record.get("toDate"))
+    if not from_date_iso or not to_date_iso:
+        return None
+    response = nse.get(xbrl_url)
+    if response is None or response.status_code != 200:
+        return None
+    content_type = response.headers.get("Content-Type", "")
+    if "xml" not in content_type.lower() and not response.text.lstrip().startswith("<?xml"):
+        return None
+    try:
+        resolved = resolve_quarter(
+            response.content,
+            symbol=symbol,
+            source_url=xbrl_url,
+            quarter_start=datetime.date.fromisoformat(from_date_iso),
+            quarter_end=datetime.date.fromisoformat(to_date_iso),
+        )
+    except Exception as error:
+        logger.warning("XBRL resolve failed for %s %s: %s", symbol, xbrl_url, error)
+        return None
+    if resolved is None:
+        return None
+    if resolved.get("eps") is None and resolved.get("pat") is None and resolved.get("revenue") is None:
+        return None
     return {
-        "period": period or symbol,
-        "revenue": revenue,
-        "pat": pat,
-        "eps": eps,
-        "yoy_growth_pct": _number_field(
-            record,
-            "yoy_growth_pct",
-            "yoyGrowth",
-            "yoy",
-            "growthPct",
-        ),
-        "report_date": report_date,
+        "period": _text_field(record, "relatingTo") or _quarter_label(to_date_iso),
+        "revenue": resolved.get("revenue"),
+        "pat": resolved.get("pat"),
+        "eps": resolved.get("eps"),
+        "yoy_growth_pct": None,
+        "report_date": to_date_iso,
+        "provenance": {
+            "symbol": symbol,
+            "filing_id": record.get("seqNumber"),
+            "source_url": xbrl_url,
+            "retrieval_timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "filing_date": _iso_datetime(record.get("filingDate")),
+            "period_start": from_date_iso,
+            "period_end": to_date_iso,
+            "scope": scope,
+            "audited": record.get("audited"),
+            "context_id": resolved.get("context_id"),
+            "facts": resolved.get("facts"),
+        },
+    }
+
+
+_BSE_SCRIPCODE_CACHE_TTL = 90 * 24 * 60 * 60
+
+
+def _resolve_bse_scripcode(symbol: str, isin: str | None) -> str | None:
+    """ISIN-verified NSE symbol -> BSE scrip code. Never trusts a name/text
+    search match alone: the candidate's own ISIN (from BSE's response) must
+    equal the ISIN already observed for this symbol on NSE, or this returns
+    None (ambiguity fails closed) rather than guessing."""
+    if not isin:
+        return None
+    # Keyed by (symbol, isin), not symbol alone: a cached scripcode found
+    # for one ISIN must never be handed back for a different one -- that
+    # would silently bypass the identity check this function exists to
+    # enforce.
+    cache_key = f"bse_scripcode:{symbol}:{isin.strip().upper()}"
+    cached = _equity_cache_get(cache_key)
+    if isinstance(cached, str) and cached:
+        return cached
+    from data.bse_session import bse
+
+    response = bse.get(
+        f"https://api.bseindia.com/BseIndiaAPI/api/PeerSmartSearch/w?Type=SS&text={quote(symbol)}"
+    )
+    if response is None or response.status_code != 200:
+        return None
+    match = re.search(
+        r"<strong>%s</strong>&nbsp;&nbsp;&nbsp;([A-Z0-9]+)&nbsp;&nbsp;&nbsp;(\d+)" % re.escape(symbol),
+        response.text,
+    )
+    if not match:
+        return None
+    found_isin, scripcode = match.group(1), match.group(2)
+    if found_isin.strip().upper() != isin.strip().upper():
+        return None
+    _equity_cache_set(cache_key, scripcode, _BSE_SCRIPCODE_CACHE_TTL)
+    return scripcode
+
+
+_BSE_SCOPE_PREFERENCE = ("Consolidated", "Standalone")
+
+
+def _fetch_bse_quarters(
+    symbol: str, isin: str | None, diagnostics: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
+    from data.bse_session import bse
+
+    if diagnostics is None:
+        diagnostics = {}
+    scripcode = _resolve_bse_scripcode(symbol, isin)
+    diagnostics["bse_scripcode"] = scripcode
+    if not scripcode:
+        diagnostics["bse_reason"] = "NO_ISIN_MATCH_ON_BSE" if isin else "NO_NSE_ISIN_TO_MATCH"
+        return []
+    response = bse.get(
+        f"https://api.bseindia.com/BseIndiaAPI/api/Integratedfinancedata/w?scripcode={scripcode}"
+    )
+    if response is None or response.status_code != 200:
+        diagnostics["bse_reason"] = "FETCH_FAILED"
+        return []
+    try:
+        rows = response.json().get("Table") or []
+    except ValueError:
+        diagnostics["bse_reason"] = "FETCH_FAILED"
+        return []
+    quarter_rows = [row for row in rows if "-Qtr-" in str(row.get("Quarter_Name") or "")]
+    if not quarter_rows:
+        diagnostics["bse_reason"] = "NO_INTEGRATED_FILINGS"
+        return []
+
+    # Amendments replace, never accumulate: a Quarter_Name may appear more
+    # than once (a correction re-filed same-day, or a superseded revision);
+    # the row with the newest revised_date_time (falling back to
+    # filing_date_time) is the sole authoritative version for that period.
+    latest_by_name: dict[str, dict[str, Any]] = {}
+    for row in quarter_rows:
+        name = str(row.get("Quarter_Name"))
+        stamp = str(row.get("revised_date_time") or row.get("filing_date_time") or "")
+        existing = latest_by_name.get(name)
+        existing_stamp = str(existing.get("revised_date_time") or existing.get("filing_date_time") or "") if existing else ""
+        if existing is None or stamp > existing_stamp:
+            latest_by_name[name] = row
+
+    identity_mismatches = 0
+    concept_extraction_failures = 0
+    for scope in _BSE_SCOPE_PREFERENCE:
+        # Never mix standalone and consolidated quarters into one TTM.
+        scoped = [row for name, row in latest_by_name.items() if name.startswith(scope)]
+        if len(scoped) < _MIN_TTM_QUARTERS:
+            continue
+        scoped.sort(key=lambda row: (row.get("Yr") or 0, row.get("Qtrid") or 0), reverse=True)
+        quarters: list[dict[str, Any]] = []
+        for row in scoped[:_MAX_FILINGS_PER_SCOPE_ATTEMPT]:
+            row_diag: dict[str, Any] = {}
+            quarter = _resolve_one_bse_filing_quarter(symbol, isin, scripcode, row, scope, row_diag)
+            _time.sleep(_VALUATION_REQUEST_INTERVAL_SECONDS)
+            if quarter is not None:
+                quarters.append(quarter)
+                if len(quarters) >= _MIN_TTM_QUARTERS:
+                    break
+            elif row_diag.get("reason") == "IDENTITY_MISMATCH":
+                identity_mismatches += 1
+            elif row_diag.get("reason") == "NO_CANONICAL_CONCEPTS":
+                concept_extraction_failures += 1
+        if len(quarters) >= _MIN_TTM_QUARTERS:
+            diagnostics["bse_reason"] = "OK"
+            return quarters
+    if identity_mismatches:
+        diagnostics["bse_reason"] = "IDENTITY_MISMATCH"
+    elif concept_extraction_failures:
+        diagnostics["bse_reason"] = "NO_CANONICAL_CONCEPTS"
+    else:
+        diagnostics.setdefault("bse_reason", "INSUFFICIENT_QUARTERS")
+    return []
+
+
+_BSE_QUARTER_END_MONTH_BOUNDS = {
+    # Standard Indian-FY quarter, keyed by the calendar month the BSE
+    # `Quarter_Name` label ends in -- e.g. "...-Mar-Qtr-2026" is the
+    # Jan-Mar quarter (Q4) of that same calendar year.
+    "Jun": ((4, 1), (6, 30)),
+    "Sep": ((7, 1), (9, 30)),
+    "Dec": ((10, 1), (12, 31)),
+    "Mar": ((1, 1), (3, 31)),
+}
+
+
+def _bse_quarter_bounds(quarter_name: str) -> tuple[datetime.date, datetime.date] | None:
+    parts = str(quarter_name).split("-")
+    if len(parts) != 4 or parts[2] != "Qtr":
+        return None
+    bounds = _BSE_QUARTER_END_MONTH_BOUNDS.get(parts[1])
+    if bounds is None:
+        return None
+    try:
+        year = int(parts[3])
+    except ValueError:
+        return None
+    (start_month, start_day), (end_month, end_day) = bounds
+    return (datetime.date(year, start_month, start_day), datetime.date(year, end_month, end_day))
+
+
+def _resolve_one_bse_filing_quarter(
+    symbol: str,
+    isin: str | None,
+    scripcode: str,
+    row: dict[str, Any],
+    scope: str,
+    diagnostics: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    from data.bse_session import bse
+    from valuation.bse_ixbrl_facts import resolve_quarter as bse_resolve_quarter
+
+    if diagnostics is None:
+        diagnostics = {}
+    xbrl_path = row.get("XbrlFile") or row.get("xbrlurl")
+    if not xbrl_path:
+        diagnostics["reason"] = "NO_XBRL_LINK"
+        return None
+    xbrl_url = "https://www.bseindia.com" + xbrl_path if xbrl_path.startswith("/") else str(xbrl_path)
+    if not xbrl_url.lower().startswith("https://"):
+        diagnostics["reason"] = "NON_HTTPS_SOURCE"
+        return None
+    response = bse.get(xbrl_url)
+    if response is None or response.status_code != 200:
+        diagnostics["reason"] = "FETCH_FAILED"
+        return None
+    content_type = response.headers.get("Content-Type", "")
+    if "html" not in content_type.lower() and not response.text.lstrip().startswith(("<?xml", "<html")):
+        diagnostics["reason"] = "UNEXPECTED_CONTENT_TYPE"
+        return None
+    bounds = _bse_quarter_bounds(str(row.get("Quarter_Name") or ""))
+    try:
+        resolved = bse_resolve_quarter(
+            response.content,
+            source_url=xbrl_url,
+            expected_isin=isin,
+            expected_period_start=bounds[0] if bounds else None,
+            expected_period_end=bounds[1] if bounds else None,
+            diagnostics=diagnostics,
+        )
+    except Exception as error:
+        logger.warning("BSE XBRL resolve failed for %s %s: %s", symbol, xbrl_url, error)
+        diagnostics["reason"] = "PARSE_EXCEPTION"
+        return None
+    if resolved is None:
+        return None
+    if resolved.get("eps") is None and resolved.get("pat") is None and resolved.get("revenue") is None:
+        diagnostics["reason"] = "NO_CANONICAL_CONCEPTS"
+        return None
+    return {
+        "period": row.get("Quarter_Name"),
+        "revenue": resolved.get("revenue"),
+        "pat": resolved.get("pat"),
+        "eps": resolved.get("eps"),
+        "yoy_growth_pct": None,
+        "report_date": resolved.get("period_end"),
+        "provenance": {
+            "source_exchange": "BSE",
+            "symbol": symbol,
+            "isin": isin,
+            "scripcode": scripcode,
+            "source_url": xbrl_url,
+            "retrieval_timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "period_start": resolved.get("period_start"),
+            "period_end": resolved.get("period_end"),
+            "scope": scope,
+            "filing_status": row.get("status"),
+            "filed_at": row.get("filing_date_time"),
+            "revised_at": row.get("revised_date_time"),
+            "revised_reason": row.get("revised_reson"),
+            "context_id": resolved.get("context_id"),
+            "facts": resolved.get("facts"),
+        },
     }
 
 
