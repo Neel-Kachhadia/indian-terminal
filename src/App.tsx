@@ -202,6 +202,10 @@ export function App() {
 
   const selectNifty = () => {
     setSelectedSymbol("NIFTY");
+    // A stale equity snapshot must never leak into NIFTY's price-dependent
+    // panels (Options/Signals/Risk prefer this snapshot's close over their
+    // own live quote fetch) -- clear it so they fall back to their own feed.
+    setSelectedSnapshot(null);
   };
 
   if (backendGate !== "READY") {

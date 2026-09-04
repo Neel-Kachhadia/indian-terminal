@@ -941,6 +941,11 @@ mod tests {
             fallback: false,
             fallback_reason: None,
             market_state: crate::models::MarketDataState::Live,
+            requested_symbol: String::from("NIFTY"),
+            canonical_symbol: String::from("NIFTY"),
+            age_ms: 0,
+            connection_state: crate::models::MarketDataState::Live,
+            decision_eligible: true,
         }
     }
 

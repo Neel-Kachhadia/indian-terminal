@@ -690,6 +690,15 @@ async fn update_spot_in_redis(
         } else {
             MarketDataState::Stale
         },
+        requested_symbol: String::from("NIFTY"),
+        canonical_symbol: String::from("NIFTY"),
+        age_ms: received_at_ms.saturating_sub(observed_at_ms).max(0),
+        connection_state: if freshness == QuoteFreshness::Fresh {
+            MarketDataState::Degraded
+        } else {
+            MarketDataState::Stale
+        },
+        decision_eligible: false,
     };
 
     if let Ok(payload) = serde_json::to_string(&tick) {

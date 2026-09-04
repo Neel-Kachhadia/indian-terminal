@@ -49,6 +49,8 @@ pub async fn get_quote(symbol: String, state: tauri::State<'_, AppState>) -> Res
                 | FeedPhase::WaitingForData
         ),
     );
+    tick.requested_symbol = symbol;
+    tick.canonical_symbol = tick.symbol.clone();
     Ok(tick)
 }
 
@@ -109,9 +111,18 @@ pub async fn get_quotes(
         let mut tick: Tick = serde_json::from_str(&payload)
             .map_err(|error| format!("tick JSON parse failed for {symbol}: {error}"))?;
         tick.evaluate_market_state(now_ms, feed_live, feed_connecting);
+        tick.requested_symbol = symbol.clone();
+        tick.canonical_symbol = tick.symbol.clone();
         ticks.insert(symbol, tick);
     }
     Ok(ticks)
+}
+
+#[tauri::command]
+pub async fn get_live_quote_coverage(
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    get_python_json("live/coverage", 5, &state).await
 }
 
 fn normalized_redis_symbol(symbol: &str) -> Result<String, String> {
@@ -856,6 +867,42 @@ pub async fn get_equity_summary(
 ) -> Result<serde_json::Value, String> {
     let encoded_symbol = symbol.replace(' ', "%20");
     get_python_json(&format!("equity/summary/{encoded_symbol}"), 20, &state).await
+}
+
+#[tauri::command]
+pub async fn get_equity_valuation(
+    symbol: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let encoded_symbol = symbol.replace(' ', "%20");
+    get_python_json(&format!("valuation/symbol/{encoded_symbol}"), 10, &state).await
+}
+
+#[tauri::command]
+pub async fn get_valuation_universe(
+    classification: String,
+    sort: String,
+    limit: Option<u16>,
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let classification = classification.replace(' ', "%20");
+    let sort = sort.replace(' ', "%20");
+    get_python_json(
+        &format!(
+            "valuation/universe?classification={classification}&sort={sort}&limit={}",
+            limit.unwrap_or(250)
+        ),
+        15,
+        &state,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn get_valuation_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    get_python_json("valuation/status", 5, &state).await
 }
 
 #[tauri::command]

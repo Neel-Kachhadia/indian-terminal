@@ -83,6 +83,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::get_quote,
             commands::get_quotes,
+            commands::get_live_quote_coverage,
             commands::get_chain,
             commands::get_pcr,
             commands::get_ohlcv,
@@ -117,6 +118,9 @@ fn main() {
             commands::get_stock_snapshot,
             commands::get_stock_universe,
             commands::get_equity_summary,
+            commands::get_equity_valuation,
+            commands::get_valuation_universe,
+            commands::get_valuation_status,
             commands::run_screener,
             commands::run_backtest,
             commands::get_backtest_status,
@@ -596,9 +600,18 @@ async fn supervise_ingester(state: AppState) {
     let client = reqwest::Client::new();
     let mut retry_attempt = 0_u32;
 
+    let mut last_logged_blocker: Option<String> = None;
     while !state.is_shutdown_requested() {
         let _ = state.set_feed_phase(FeedPhase::WaitingForHealth, None);
         if let Err(error) = wait_for_backend_ready(&client, &state).await {
+            let blocker = extract_blocking_components(&error);
+            if last_logged_blocker.as_deref() != Some(blocker.as_str()) {
+                indian_terminal::bt_error!(
+                    "ingester",
+                    "backend not ready, feed cannot start yet; blocking: {blocker}"
+                );
+                last_logged_blocker = Some(blocker);
+            }
             let failures = state
                 .record_feed_failure(error.clone())
                 .unwrap_or(RETRY_BUDGET);
@@ -631,6 +644,7 @@ async fn supervise_ingester(state: AppState) {
             .err()
             .unwrap_or_else(|| "Angel stream ended".to_string());
         indian_terminal::bt_error!("ingester", "{error}");
+        state.record_feed_reconnect();
         let _ = state.record_feed_failure(error.clone());
         let _ = state.set_feed_phase(FeedPhase::Reconnecting, Some(error));
         tokio::time::sleep(retry_delay(retry_attempt, std::process::id())).await;
@@ -707,6 +721,22 @@ async fn wait_for_backend_ready_at(
     Err(format!(
         "backend readiness retry budget exhausted: {last_error}"
     ))
+}
+
+/// Pulls `readiness.blocking_components` out of a `wait_for_backend_ready`
+/// error string for a short, greppable log line instead of the multi-KB
+/// health snapshot the error otherwise carries verbatim.
+fn extract_blocking_components(error: &str) -> String {
+    let Some(start) = error.find('{') else {
+        return error.chars().take(200).collect();
+    };
+    match serde_json::from_str::<serde_json::Value>(&error[start..]) {
+        Ok(payload) => payload
+            .pointer("/readiness/blocking_components")
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown (no readiness.blocking_components in payload)".to_string()),
+        Err(_) => error.chars().take(200).collect(),
+    }
 }
 
 fn retry_delay(attempt: u32, salt: u32) -> Duration {

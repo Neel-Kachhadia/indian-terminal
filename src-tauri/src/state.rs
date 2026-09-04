@@ -1,5 +1,6 @@
 use crate::models::Tick;
 use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 use std::process::Child;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -38,6 +39,54 @@ pub struct FeedRuntimeState {
     pub consecutive_failures: u32,
     pub last_error: Option<String>,
     pub updated_at_epoch_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FeedCoverageSnapshot {
+    pub schema_version: u16,
+    pub provider: &'static str,
+    pub connection_owner: &'static str,
+    pub writer_owner: &'static str,
+    pub connection_state: FeedPhase,
+    pub provider_token_limit: usize,
+    pub expected: usize,
+    pub expected_symbols: Vec<String>,
+    pub subscribed: usize,
+    pub subscribed_symbols: Vec<String>,
+    pub receiving: usize,
+    pub fresh: usize,
+    pub fresh_symbols: Vec<String>,
+    pub stale: usize,
+    pub stale_symbols: Vec<String>,
+    pub unavailable: usize,
+    pub unavailable_symbols: Vec<String>,
+    pub unknown_tokens: u64,
+    pub parser_errors: u64,
+    pub duplicate_subscriptions: u64,
+    pub reconnect_count: u64,
+    pub packet_count: u64,
+    pub quote_updates_per_second: f64,
+    pub initialized_at_ms: Option<i64>,
+    pub last_packet_time_ms: Option<i64>,
+    pub coverage_stabilization_ms: Option<i64>,
+    pub freshness_threshold_ms: i64,
+}
+
+#[derive(Debug, Default)]
+struct FeedCoverageRuntime {
+    expected_symbols: HashSet<String>,
+    subscribed_symbols: HashSet<String>,
+    last_received_by_symbol: HashMap<String, i64>,
+    provider_token_limit: usize,
+    unknown_tokens: u64,
+    parser_errors: u64,
+    duplicate_subscriptions: u64,
+    reconnect_count: u64,
+    packet_count: u64,
+    initialized_at_ms: Option<i64>,
+    first_packet_time_ms: Option<i64>,
+    last_packet_time_ms: Option<i64>,
+    coverage_stabilization_ms: Option<i64>,
 }
 
 impl FeedRuntimeState {
@@ -122,6 +171,7 @@ pub struct AppState {
     pub feed_runtime: Arc<StdMutex<FeedRuntimeState>>,
     pub redis: Arc<Mutex<Option<redis::Connection>>>,
     pub tick_tx: Arc<Mutex<broadcast::Sender<Tick>>>,
+    feed_coverage: Arc<StdMutex<FeedCoverageRuntime>>,
 }
 
 impl AppState {
@@ -136,6 +186,7 @@ impl AppState {
             feed_runtime: Arc::new(StdMutex::new(FeedRuntimeState::new())),
             redis: Arc::new(Mutex::new(redis)),
             tick_tx: Arc::new(Mutex::new(tick_tx)),
+            feed_coverage: Arc::new(StdMutex::new(FeedCoverageRuntime::default())),
         }
     }
 
@@ -299,6 +350,151 @@ impl AppState {
             .lock()
             .map_err(|error| format!("feed state lock failed: {error}"))
             .map(|state| state.clone())
+    }
+
+    pub fn configure_feed_coverage(
+        &self,
+        symbols: impl IntoIterator<Item = String>,
+        provider_token_limit: usize,
+        duplicate_subscriptions: u64,
+    ) -> Result<(), String> {
+        let expected_symbols = symbols.into_iter().collect::<HashSet<_>>();
+        let mut coverage = self
+            .feed_coverage
+            .lock()
+            .map_err(|error| format!("feed coverage lock failed: {error}"))?;
+        coverage.expected_symbols = expected_symbols;
+        coverage.subscribed_symbols.clear();
+        coverage.last_received_by_symbol.clear();
+        coverage.provider_token_limit = provider_token_limit;
+        coverage.duplicate_subscriptions = duplicate_subscriptions;
+        coverage.packet_count = 0;
+        coverage.initialized_at_ms = Some(now_epoch_ms() as i64);
+        coverage.first_packet_time_ms = None;
+        coverage.last_packet_time_ms = None;
+        coverage.coverage_stabilization_ms = None;
+        Ok(())
+    }
+
+    pub fn record_subscribed_symbols(
+        &self,
+        symbols: impl IntoIterator<Item = String>,
+    ) -> Result<(), String> {
+        let mut coverage = self
+            .feed_coverage
+            .lock()
+            .map_err(|error| format!("feed coverage lock failed: {error}"))?;
+        coverage.subscribed_symbols.extend(symbols);
+        Ok(())
+    }
+
+    pub fn record_feed_packet(&self, symbol: &str, received_at_ms: i64) -> Result<(), String> {
+        let mut coverage = self
+            .feed_coverage
+            .lock()
+            .map_err(|error| format!("feed coverage lock failed: {error}"))?;
+        coverage.packet_count = coverage.packet_count.saturating_add(1);
+        coverage.first_packet_time_ms.get_or_insert(received_at_ms);
+        coverage.last_packet_time_ms = Some(received_at_ms);
+        coverage
+            .last_received_by_symbol
+            .insert(symbol.to_string(), received_at_ms);
+        if coverage.coverage_stabilization_ms.is_none()
+            && coverage.last_received_by_symbol.len() == coverage.expected_symbols.len()
+        {
+            coverage.coverage_stabilization_ms = coverage
+                .initialized_at_ms
+                .map(|started| received_at_ms.saturating_sub(started));
+        }
+        Ok(())
+    }
+
+    pub fn record_unknown_feed_token(&self) {
+        if let Ok(mut coverage) = self.feed_coverage.lock() {
+            coverage.unknown_tokens = coverage.unknown_tokens.saturating_add(1);
+        }
+    }
+
+    pub fn record_feed_parser_error(&self) {
+        if let Ok(mut coverage) = self.feed_coverage.lock() {
+            coverage.parser_errors = coverage.parser_errors.saturating_add(1);
+        }
+    }
+
+    pub fn record_feed_reconnect(&self) {
+        if let Ok(mut coverage) = self.feed_coverage.lock() {
+            coverage.reconnect_count = coverage.reconnect_count.saturating_add(1);
+        }
+    }
+
+    pub fn feed_coverage(&self) -> Result<FeedCoverageSnapshot, String> {
+        let phase = self.feed_status()?.phase;
+        let coverage = self
+            .feed_coverage
+            .lock()
+            .map_err(|error| format!("feed coverage lock failed: {error}"))?;
+        let now_ms = now_epoch_ms() as i64;
+        let mut expected_symbols = coverage
+            .expected_symbols
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut subscribed_symbols = coverage
+            .subscribed_symbols
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut fresh_symbols = Vec::new();
+        let mut stale_symbols = Vec::new();
+        let mut unavailable_symbols = Vec::new();
+        for symbol in &expected_symbols {
+            match coverage.last_received_by_symbol.get(symbol) {
+                Some(received) if now_ms.saturating_sub(*received) <= Tick::STREAM_FRESH_MS => {
+                    fresh_symbols.push(symbol.clone());
+                }
+                Some(_) => stale_symbols.push(symbol.clone()),
+                None => unavailable_symbols.push(symbol.clone()),
+            }
+        }
+        expected_symbols.sort();
+        subscribed_symbols.sort();
+        fresh_symbols.sort();
+        stale_symbols.sort();
+        unavailable_symbols.sort();
+        let elapsed_seconds = coverage
+            .first_packet_time_ms
+            .map(|started| now_ms.saturating_sub(started).max(1) as f64 / 1_000.0);
+        Ok(FeedCoverageSnapshot {
+            schema_version: 1,
+            provider: "ANGEL_ONE_SMART_STREAM_V2",
+            connection_owner: "PYTHON_SECURE_FEED_BRIDGE",
+            writer_owner: "RUST_TAURI_INGESTER",
+            connection_state: phase,
+            provider_token_limit: coverage.provider_token_limit,
+            expected: expected_symbols.len(),
+            expected_symbols,
+            subscribed: subscribed_symbols.len(),
+            subscribed_symbols,
+            receiving: coverage.last_received_by_symbol.len(),
+            fresh: fresh_symbols.len(),
+            fresh_symbols,
+            stale: stale_symbols.len(),
+            stale_symbols,
+            unavailable: unavailable_symbols.len(),
+            unavailable_symbols,
+            unknown_tokens: coverage.unknown_tokens,
+            parser_errors: coverage.parser_errors,
+            duplicate_subscriptions: coverage.duplicate_subscriptions,
+            reconnect_count: coverage.reconnect_count,
+            packet_count: coverage.packet_count,
+            quote_updates_per_second: elapsed_seconds
+                .map(|elapsed| coverage.packet_count as f64 / elapsed)
+                .unwrap_or(0.0),
+            initialized_at_ms: coverage.initialized_at_ms,
+            last_packet_time_ms: coverage.last_packet_time_ms,
+            coverage_stabilization_ms: coverage.coverage_stabilization_ms,
+            freshness_threshold_ms: Tick::STREAM_FRESH_MS,
+        })
     }
 
     pub fn request_shutdown(&self) {

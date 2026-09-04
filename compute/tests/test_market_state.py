@@ -11,6 +11,7 @@ from live.market_state import (
     evaluate_market_state,
     parse_quote_envelope,
     should_accept_update,
+    STREAM_FRESH_MS,
 )
 
 
@@ -45,7 +46,11 @@ def quote(**overrides: object) -> QuoteEnvelope:
 
 
 def test_stale_stream_cannot_be_live() -> None:
-    result = evaluate_market_state(quote(), now_ms=20_000, expected_feed_live=True)
+    result = evaluate_market_state(
+        quote(),
+        now_ms=10_000 + STREAM_FRESH_MS + 1,
+        expected_feed_live=True,
+    )
     assert result.market_state is MarketDataState.STALE
     assert result.freshness is QuoteFreshness.STALE
 

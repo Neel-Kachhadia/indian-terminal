@@ -213,8 +213,15 @@ def _seed_read_fixtures(database: Path) -> None:
             INSERT INTO instruments
                 (schema_version, token, symbol, name, exchange, instrument_type,
                  expiry, strike, option_type, lot_size, tick_size, isin, updated_at)
-            VALUES (1, '99123456', 'NIFTY', 'NIFTY 50', 'NSE', 'AMXIDX',
-                    NULL, NULL, NULL, 1, 0.05, NULL, CURRENT_TIMESTAMP)
+            VALUES
+                (1, '99123456', 'NIFTY', 'NIFTY 50', 'NSE', 'AMXIDX',
+                 NULL, NULL, NULL, 1, 0.05, NULL, CURRENT_TIMESTAMP),
+                (1, '99123457', 'BANKNIFTY', 'NIFTY BANK', 'NSE', 'AMXIDX',
+                 NULL, NULL, NULL, 1, 0.05, NULL, CURRENT_TIMESTAMP),
+                (1, '99123458', 'FINNIFTY', 'NIFTY FIN SERVICE', 'NSE', 'AMXIDX',
+                 NULL, NULL, NULL, 1, 0.05, NULL, CURRENT_TIMESTAMP),
+                (1, '99123459', 'MIDCPNIFTY', 'NIFTY MID SELECT', 'NSE', 'AMXIDX',
+                 NULL, NULL, NULL, 1, 0.05, NULL, CURRENT_TIMESTAMP)
             """
         )
     finally:

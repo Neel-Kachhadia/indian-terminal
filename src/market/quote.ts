@@ -43,9 +43,16 @@ export type Tick = {
   fallback: boolean;
   fallback_reason: string | null;
   market_state: MarketDataState;
+  requested_symbol?: string;
+  canonical_symbol?: string;
+  age_ms?: number;
+  connection_state?: MarketDataState;
+  decision_eligible?: boolean;
 };
 
-const CLIENT_STALE_MS = 5_000;
+// Quote mode is change-driven. A 30s bound avoids false stale flapping on
+// less-liquid F&O equities while remaining short enough for decisions.
+const CLIENT_STALE_MS = 30_000;
 
 export function currentMarketState(
   quote: Tick | null | undefined,

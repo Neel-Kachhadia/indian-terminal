@@ -27,11 +27,23 @@ pub struct Tick {
     pub fallback: bool,
     pub fallback_reason: Option<String>,
     pub market_state: MarketDataState,
+    #[serde(default)]
+    pub requested_symbol: String,
+    #[serde(default)]
+    pub canonical_symbol: String,
+    #[serde(default)]
+    pub age_ms: i64,
+    #[serde(default)]
+    pub connection_state: MarketDataState,
+    #[serde(default)]
+    pub decision_eligible: bool,
 }
 
 impl Tick {
     pub const SCHEMA_VERSION: u16 = 1;
-    pub const STREAM_FRESH_MS: i64 = 5_000;
+    // Quote mode publishes on market changes; active but less-liquid F&O
+    // equities can legitimately remain unchanged for several seconds.
+    pub const STREAM_FRESH_MS: i64 = 30_000;
 
     pub fn evaluate_market_state(
         &mut self,
@@ -61,6 +73,13 @@ impl Tick {
         } else {
             MarketDataState::Disconnected
         };
+        self.age_ms = age_ms.max(0);
+        self.connection_state = self.market_state;
+        self.decision_eligible = self.market_state == MarketDataState::Live
+            && self.freshness == QuoteFreshness::Fresh
+            && self.source_type == QuoteSource::AngelStream
+            && self.quality == QuoteQuality::ExecutableStream
+            && !self.fallback;
     }
 
     pub fn is_newer_than(&self, existing: &Tick) -> bool {
@@ -101,12 +120,13 @@ pub enum QuoteQuality {
     Invalid,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum MarketDataState {
     Live,
     Degraded,
     Stale,
+    #[default]
     Disconnected,
     Starting,
 }
@@ -357,13 +377,18 @@ mod quote_tests {
             fallback,
             fallback_reason: fallback.then(|| "NSE chain underlying reference".into()),
             market_state: MarketDataState::Starting,
+            requested_symbol: String::from("NIFTY"),
+            canonical_symbol: String::from("NIFTY"),
+            age_ms: 0,
+            connection_state: MarketDataState::Starting,
+            decision_eligible: false,
         }
     }
 
     #[test]
     fn stale_stream_cannot_be_live() {
         let mut quote = tick(1_000, None, false);
-        quote.evaluate_market_state(7_001, true, false);
+        quote.evaluate_market_state(1_000 + Tick::STREAM_FRESH_MS + 1, true, false);
         assert_eq!(quote.freshness, QuoteFreshness::Stale);
         assert_eq!(quote.market_state, MarketDataState::Stale);
     }

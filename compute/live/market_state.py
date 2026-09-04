@@ -8,7 +8,7 @@ from typing import Any, Mapping
 
 
 QUOTE_SCHEMA_VERSION = 1
-STREAM_FRESH_MS = 5_000
+STREAM_FRESH_MS = 30_000
 
 
 class QuoteSource(StrEnum):
@@ -65,6 +65,11 @@ class QuoteEnvelope:
     fallback: bool
     fallback_reason: str | None
     market_state: MarketDataState
+    requested_symbol: str | None = None
+    canonical_symbol: str | None = None
+    age_ms: int = 0
+    connection_state: MarketDataState = MarketDataState.DISCONNECTED
+    decision_eligible: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -153,6 +158,13 @@ def parse_quote_envelope(data: Mapping[str, Any]) -> QuoteEnvelope:
         fallback=fallback,
         fallback_reason=None if fallback_reason is None else str(fallback_reason),
         market_state=MarketDataState(str(data["market_state"])),
+        requested_symbol=str(data.get("requested_symbol") or symbol).strip().upper(),
+        canonical_symbol=str(data.get("canonical_symbol") or symbol).strip().upper(),
+        age_ms=max(0, int(data.get("age_ms") or 0)),
+        connection_state=MarketDataState(
+            str(data.get("connection_state") or data["market_state"])
+        ),
+        decision_eligible=bool(data.get("decision_eligible", False)),
     )
 
 
@@ -198,7 +210,21 @@ def evaluate_market_state(
         state = MarketDataState.LIVE
     else:
         state = MarketDataState.DISCONNECTED
-    return replace(quote, freshness=freshness, market_state=state)
+    decision_eligible = bool(
+        state is MarketDataState.LIVE
+        and freshness is QuoteFreshness.FRESH
+        and quote.source_type is QuoteSource.ANGEL_STREAM
+        and quote.quality is QuoteQuality.EXECUTABLE_STREAM
+        and not quote.fallback
+    )
+    return replace(
+        quote,
+        freshness=freshness,
+        market_state=state,
+        age_ms=age_ms,
+        connection_state=state,
+        decision_eligible=decision_eligible,
+    )
 
 
 def should_accept_update(incoming: QuoteEnvelope, existing: QuoteEnvelope) -> bool:

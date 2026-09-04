@@ -163,6 +163,7 @@ export function ApexHeader({
         aria-label="Select NIFTY"
         onClick={onSelectNifty}
         style={priceButtonStyle}
+        title="Return to NIFTY home"
         type="button"
       >
         <span style={priceStyle}>Rs {priceText}</span>

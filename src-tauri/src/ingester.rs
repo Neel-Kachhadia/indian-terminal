@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::time::Duration;
 
@@ -16,8 +17,10 @@ use crate::{
 };
 
 const LOCAL_FEED_BRIDGE_URL: &str = "ws://127.0.0.1:8765/internal/angel/feed";
-const FEED_INSTRUMENT_URL: &str = "http://127.0.0.1:8765/instruments/feed/NIFTY";
+const FEED_INSTRUMENT_URL: &str = "http://127.0.0.1:8765/instruments/feed-universe";
 const INSTRUMENT_SCHEMA_VERSION: u32 = 1;
+const PROVIDER_TOKEN_LIMIT: usize = 1_000;
+const SUBSCRIPTION_BATCH_SIZE: usize = 250;
 const REDIS_TTL_SECONDS: u64 = 60;
 const INITIAL_DATA_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_EXCHANGE_TIMESTAMP_AGE_MS: i64 = 30_000;
@@ -104,32 +107,41 @@ struct ResolvedFeedInstrument {
     name: String,
     exchange: String,
     instrument_type: String,
+    asset_class: String,
 }
 
 impl ResolvedFeedInstrument {
     fn validate(self) -> Result<Self, String> {
-        let identity = |value: &str| {
-            value
-                .chars()
-                .filter(|character| !character.is_whitespace())
-                .collect::<String>()
-                .to_ascii_uppercase()
+        let valid_identity = |value: &str| {
+            !value.is_empty()
+                && value.len() <= 64
+                && value.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'-' | b'_' | b'&' | b'.')
+                })
+        };
+        let valid_contract = match self.asset_class.as_str() {
+            "EQUITY" => self.instrument_type.is_empty(),
+            "INDEX" => {
+                self.instrument_type == "AMXIDX"
+                    && matches!(
+                        self.symbol.as_str(),
+                        "NIFTY" | "BANKNIFTY" | "FINNIFTY" | "MIDCPNIFTY"
+                    )
+            }
+            _ => false,
         };
         if self.schema_version != INSTRUMENT_SCHEMA_VERSION
             || self.exchange != "NSE"
-            || self.instrument_type != "AMXIDX"
-            || identity(&self.symbol) != "NIFTY"
-            || !matches!(
-                identity(&self.canonical_symbol).as_str(),
-                "NIFTY" | "NIFTY50"
-            )
-            || !matches!(identity(&self.name).as_str(), "NIFTY" | "NIFTY50")
+            || !valid_contract
+            || !valid_identity(&self.symbol)
+            || !valid_identity(&self.canonical_symbol)
+            || self.name.trim().is_empty()
             || self.token.is_empty()
             || self.token.len() > 25
             || !self.token.bytes().all(|byte| byte.is_ascii_digit())
         {
             return Err(String::from(
-                "canonical NIFTY index instrument validation failed",
+                "canonical live-feed instrument validation failed",
             ));
         }
         Ok(self)
@@ -143,8 +155,54 @@ impl ResolvedFeedInstrument {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct ResolvedFeedUniverse {
+    schema_version: u32,
+    provider: String,
+    subscription_mode: String,
+    provider_token_limit: usize,
+    expected_count: usize,
+    instruments: Vec<ResolvedFeedInstrument>,
+}
+
+impl ResolvedFeedUniverse {
+    fn validate(mut self) -> Result<Self, String> {
+        if self.schema_version != 1
+            || self.provider != "ANGEL_ONE_SMART_STREAM_V2"
+            || self.subscription_mode != "QUOTE"
+            || self.provider_token_limit != PROVIDER_TOKEN_LIMIT
+            || self.expected_count != self.instruments.len()
+            || self.instruments.is_empty()
+            || self.instruments.len() > self.provider_token_limit
+        {
+            return Err(String::from(
+                "canonical live-feed universe validation failed",
+            ));
+        }
+        self.instruments = self
+            .instruments
+            .into_iter()
+            .map(ResolvedFeedInstrument::validate)
+            .collect::<Result<Vec<_>, _>>()?;
+        let symbols = self
+            .instruments
+            .iter()
+            .map(|instrument| instrument.symbol.as_str())
+            .collect::<HashSet<_>>();
+        let tokens = self
+            .instruments
+            .iter()
+            .map(|instrument| instrument.token.as_str())
+            .collect::<HashSet<_>>();
+        if symbols.len() != self.instruments.len() || tokens.len() != self.instruments.len() {
+            return Err(String::from("duplicate live-feed symbol or token"));
+        }
+        Ok(self)
+    }
+}
+
 pub async fn run(state: AppState) -> Result<(), String> {
-    let instrument = resolve_feed_instrument(&state).await.map_err(|error| {
+    let universe = resolve_feed_universe(&state).await.map_err(|error| {
         let message = format!("CONFIGURATION / INSTRUMENT RESOLUTION ERROR: {error}");
         let _ = state.set_feed_phase(FeedPhase::Degraded, Some(message.clone()));
         message
@@ -153,7 +211,7 @@ pub async fn run(state: AppState) -> Result<(), String> {
 
     run_websocket_at(
         &state,
-        &instrument,
+        &universe,
         &state.process_token()?,
         LOCAL_FEED_BRIDGE_URL,
         INITIAL_DATA_TIMEOUT,
@@ -163,12 +221,26 @@ pub async fn run(state: AppState) -> Result<(), String> {
 
 async fn run_websocket_at(
     state: &AppState,
-    instrument: &ResolvedFeedInstrument,
+    universe: &ResolvedFeedUniverse,
     process_token: &str,
     websocket_url: &str,
     initial_data_timeout: Duration,
 ) -> Result<(), String> {
-    let exchange_type = instrument.exchange_type()?;
+    let exchange_type = universe.instruments[0].exchange_type()?;
+    let token_map = universe
+        .instruments
+        .iter()
+        .cloned()
+        .map(|instrument| (instrument.token.clone(), instrument))
+        .collect::<HashMap<_, _>>();
+    state.configure_feed_coverage(
+        universe
+            .instruments
+            .iter()
+            .map(|instrument| instrument.symbol.clone()),
+        universe.provider_token_limit,
+        0,
+    )?;
     let request = local_bridge_request_at(websocket_url, process_token)?;
     let (mut websocket, _response) = connect_async(request)
         .await
@@ -178,11 +250,18 @@ async fn run_websocket_at(
     crate::bt_info!("ingester", "connected to secure feed bridge");
 
     state.set_feed_phase(FeedPhase::Subscribing, None)?;
-    let subscription = subscription_request(instrument)?;
-    websocket
-        .send(Message::Text(subscription.to_string()))
-        .await
-        .map_err(|error| format!("Angel subscription failed: {error}"))?;
+    for subscription in subscription_requests(universe)? {
+        websocket
+            .send(Message::Text(subscription.to_string()))
+            .await
+            .map_err(|error| format!("Angel subscription failed: {error}"))?;
+    }
+    state.record_subscribed_symbols(
+        universe
+            .instruments
+            .iter()
+            .map(|instrument| instrument.symbol.clone()),
+    )?;
     state.set_feed_phase(FeedPhase::WaitingForData, None)?;
     crate::bt_info!(
         "ingester",
@@ -213,6 +292,7 @@ async fn run_websocket_at(
                     {
                         Ok(packet) => packet,
                         Err(error) => {
+                            state.record_feed_parser_error();
                             crate::bt_error!(
                                 "ingester",
                                 "rejected malformed market packet: {error}"
@@ -220,9 +300,10 @@ async fn run_websocket_at(
                             continue;
                         }
                     };
-                if packet.token != instrument.token {
+                let Some(instrument) = token_map.get(&packet.token) else {
+                    state.record_unknown_feed_token();
                     continue;
-                }
+                };
                 let tick = packet_to_tick(packet, instrument)?;
                 if !live_proven {
                     state.set_feed_phase(FeedPhase::Live, None)?;
@@ -241,14 +322,14 @@ async fn run_websocket_at(
     }
 }
 
-async fn resolve_feed_instrument(state: &AppState) -> Result<ResolvedFeedInstrument, String> {
-    resolve_feed_instrument_at(FEED_INSTRUMENT_URL, &state.process_token()?).await
+async fn resolve_feed_universe(state: &AppState) -> Result<ResolvedFeedUniverse, String> {
+    resolve_feed_universe_at(FEED_INSTRUMENT_URL, &state.process_token()?).await
 }
 
-async fn resolve_feed_instrument_at(
+async fn resolve_feed_universe_at(
     url: &str,
     process_token: &str,
-) -> Result<ResolvedFeedInstrument, String> {
+) -> Result<ResolvedFeedUniverse, String> {
     let response = reqwest::Client::new()
         .get(url)
         .header("X-Process-Token", process_token)
@@ -263,26 +344,46 @@ async fn resolve_feed_instrument_at(
         ));
     }
     response
-        .json::<ResolvedFeedInstrument>()
+        .json::<ResolvedFeedUniverse>()
         .await
         .map_err(|error| format!("instrument response invalid: {error}"))?
         .validate()
 }
 
-fn subscription_request(instrument: &ResolvedFeedInstrument) -> Result<serde_json::Value, String> {
-    Ok(json!({
-        "correlationID": "niftyquote",
-        "action": 1,
-        "params": {
-            "mode": SubscriptionMode::Quote as u8,
-            "tokenList": [
-                {
-                    "exchangeType": instrument.exchange_type()?,
-                    "tokens": [instrument.token.clone()]
+fn subscription_requests(
+    universe: &ResolvedFeedUniverse,
+) -> Result<Vec<serde_json::Value>, String> {
+    universe
+        .instruments
+        .chunks(SUBSCRIPTION_BATCH_SIZE)
+        .enumerate()
+        .map(|(index, instruments)| {
+            let exchange_type = instruments
+                .first()
+                .ok_or_else(|| String::from("empty Angel subscription batch"))?
+                .exchange_type()?;
+            if instruments
+                .iter()
+                .any(|instrument| instrument.exchange_type() != Ok(exchange_type))
+            {
+                return Err(String::from("mixed exchanges in Angel subscription batch"));
+            }
+            Ok(json!({
+                "correlationID": format!("btq{index:07}"),
+                "action": 1,
+                "params": {
+                    "mode": SubscriptionMode::Quote as u8,
+                    "tokenList": [{
+                        "exchangeType": exchange_type,
+                        "tokens": instruments
+                            .iter()
+                            .map(|instrument| instrument.token.clone())
+                            .collect::<Vec<_>>()
+                    }]
                 }
-            ]
-        }
-    }))
+            }))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -503,7 +604,7 @@ fn packet_to_tick_at(
 ) -> Result<Tick, String> {
     if packet.exchange_type != instrument.exchange_type()? || packet.token != instrument.token {
         return Err(String::from(
-            "unsupported exchange for canonical NIFTY tick",
+            "packet identity does not match canonical instrument",
         ));
     }
     let observed_at_ms = if packet.exchange_timestamp < 1_000_000_000_000 {
@@ -547,6 +648,11 @@ fn packet_to_tick_at(
         fallback: false,
         fallback_reason: None,
         market_state: MarketDataState::Live,
+        requested_symbol: instrument.symbol.clone(),
+        canonical_symbol: instrument.symbol.clone(),
+        age_ms: received_at_ms.saturating_sub(observed_at_ms).max(0),
+        connection_state: MarketDataState::Live,
+        decision_eligible: true,
     })
 }
 
@@ -578,15 +684,26 @@ async fn write_tick_to_redis(state: &AppState, tick: &Tick) {
     let key = format!("tick:{}", tick.symbol);
     match store_tick_monotonic(connection, &key, &payload, tick) {
         Ok(accepted) if accepted > 0 => {
-            let health = json!({
-                "schema_version": 1,
-                "state": "LIVE",
-                "source": "RUST_TAURI_INGESTER",
-                "last_success_ms": Utc::now().timestamp_millis(),
-                "symbol": tick.symbol,
-            });
-            let _: redis::RedisResult<()> =
-                connection.set_ex("health:angel_stream", health.to_string(), 120);
+            if let Err(error) = state.record_feed_packet(&tick.symbol, tick.received_at_ms) {
+                crate::bt_error!("ingester", "coverage update failed: {error}");
+                return;
+            }
+            match state.feed_coverage() {
+                Ok(coverage) => {
+                    let mut health = serde_json::to_value(coverage).unwrap_or_else(|_| json!({}));
+                    if let Some(object) = health.as_object_mut() {
+                        object.insert("state".into(), json!("LIVE"));
+                        object.insert("source".into(), json!("RUST_TAURI_INGESTER"));
+                        object.insert(
+                            "last_success_ms".into(),
+                            json!(Utc::now().timestamp_millis()),
+                        );
+                    }
+                    let _: redis::RedisResult<()> =
+                        connection.set_ex("health:angel_stream", health.to_string(), 120);
+                }
+                Err(error) => crate::bt_error!("ingester", "coverage snapshot failed: {error}"),
+            }
         }
         Ok(_) => {}
         Err(error) => crate::bt_error!("ingester", "redis write failed: {error}"),
@@ -635,8 +752,9 @@ fn store_tick_monotonic(
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_packet, local_bridge_request, packet_to_tick_at, resolve_feed_instrument_at,
-        run_websocket_at, subscription_request, ResolvedFeedInstrument, SubscriptionMode,
+        decode_packet, local_bridge_request, packet_to_tick_at, resolve_feed_universe_at,
+        run_websocket_at, subscription_requests, ResolvedFeedInstrument, ResolvedFeedUniverse,
+        SubscriptionMode,
     };
     use crate::{
         models::Tick,
@@ -665,6 +783,18 @@ mod tests {
             name: String::from("NIFTY 50"),
             exchange: String::from("NSE"),
             instrument_type: String::from("AMXIDX"),
+            asset_class: String::from("INDEX"),
+        }
+    }
+
+    fn universe(token: &str) -> ResolvedFeedUniverse {
+        ResolvedFeedUniverse {
+            schema_version: 1,
+            provider: String::from("ANGEL_ONE_SMART_STREAM_V2"),
+            subscription_mode: String::from("QUOTE"),
+            provider_token_limit: 1_000,
+            expected_count: 1,
+            instruments: vec![instrument(token)],
         }
     }
 
@@ -745,7 +875,7 @@ mod tests {
             );
             stream.write_all(response.as_bytes()).await.unwrap();
         });
-        format!("http://{address}/instruments/feed/NIFTY")
+        format!("http://{address}/instruments/feed-universe")
     }
 
     #[test]
@@ -892,8 +1022,8 @@ mod tests {
 
     #[test]
     fn subscription_uses_only_resolved_validated_instrument() {
-        let resolved = instrument(FIXTURE_TOKEN).validate().unwrap();
-        let request = subscription_request(&resolved).unwrap();
+        let resolved = universe(FIXTURE_TOKEN).validate().unwrap();
+        let request = subscription_requests(&resolved).unwrap().remove(0);
         assert_eq!(
             request["params"]["tokenList"][0]["tokens"][0],
             FIXTURE_TOKEN
@@ -915,28 +1045,29 @@ mod tests {
     #[tokio::test]
     async fn local_instrument_contract_accepts_only_canonical_index_identity() {
         let good = format!(
-            r#"{{"schema_version":1,"token":"{FIXTURE_TOKEN}","symbol":"NIFTY","canonical_symbol":"NIFTY","name":"NIFTY 50","exchange":"NSE","instrument_type":"AMXIDX"}}"#
+            r#"{{"schema_version":1,"provider":"ANGEL_ONE_SMART_STREAM_V2","subscription_mode":"QUOTE","provider_token_limit":1000,"expected_count":1,"instruments":[{{"schema_version":1,"token":"{FIXTURE_TOKEN}","symbol":"NIFTY","canonical_symbol":"NIFTY","name":"NIFTY 50","exchange":"NSE","instrument_type":"AMXIDX","asset_class":"INDEX"}}]}}"#
         );
         let url = instrument_http_fixture(&good).await;
         assert_eq!(
-            resolve_feed_instrument_at(&url, "fixture-process-token")
+            resolve_feed_universe_at(&url, "fixture-process-token")
                 .await
                 .unwrap()
+                .instruments[0]
                 .token,
             FIXTURE_TOKEN
         );
 
         let wrong = format!(
-            r#"{{"schema_version":1,"token":"{FIXTURE_TOKEN}","symbol":"NIFTY","canonical_symbol":"NIFTY","name":"NIFTY 50","exchange":"NSE","instrument_type":"EQ"}}"#
+            r#"{{"schema_version":1,"provider":"ANGEL_ONE_SMART_STREAM_V2","subscription_mode":"QUOTE","provider_token_limit":1000,"expected_count":1,"instruments":[{{"schema_version":1,"token":"{FIXTURE_TOKEN}","symbol":"NIFTY","canonical_symbol":"NIFTY","name":"NIFTY 50","exchange":"NSE","instrument_type":"","asset_class":"INDEX"}}]}}"#
         );
         let url = instrument_http_fixture(&wrong).await;
-        assert!(resolve_feed_instrument_at(&url, "fixture-process-token")
+        assert!(resolve_feed_universe_at(&url, "fixture-process-token")
             .await
             .is_err());
 
-        let missing = r#"{"schema_version":1,"token":"","symbol":"NIFTY","canonical_symbol":"NIFTY","name":"NIFTY 50","exchange":"NSE","instrument_type":"AMXIDX"}"#;
+        let missing = r#"{"schema_version":1,"provider":"ANGEL_ONE_SMART_STREAM_V2","subscription_mode":"QUOTE","provider_token_limit":1000,"expected_count":1,"instruments":[{"schema_version":1,"token":"","symbol":"NIFTY","canonical_symbol":"NIFTY","name":"NIFTY 50","exchange":"NSE","instrument_type":"AMXIDX","asset_class":"INDEX"}]}"#;
         let url = instrument_http_fixture(missing).await;
-        assert!(resolve_feed_instrument_at(&url, "fixture-process-token")
+        assert!(resolve_feed_universe_at(&url, "fixture-process-token")
             .await
             .is_err());
     }
@@ -951,7 +1082,7 @@ mod tests {
         let task = tokio::spawn(async move {
             run_websocket_at(
                 &task_state,
-                &instrument(FIXTURE_TOKEN),
+                &universe(FIXTURE_TOKEN),
                 "fixture-process-token",
                 &url,
                 Duration::from_secs(1),
@@ -980,7 +1111,7 @@ mod tests {
             let (state, _) = feed_state();
             let result = run_websocket_at(
                 &state,
-                &instrument(FIXTURE_TOKEN),
+                &universe(FIXTURE_TOKEN),
                 "fixture-process-token",
                 &url,
                 Duration::from_millis(80),
@@ -1002,7 +1133,7 @@ mod tests {
         let (state, _) = feed_state();
         let result = run_websocket_at(
             &state,
-            &instrument(FIXTURE_TOKEN),
+            &universe(FIXTURE_TOKEN),
             "fixture-process-token",
             &url,
             Duration::from_millis(80),

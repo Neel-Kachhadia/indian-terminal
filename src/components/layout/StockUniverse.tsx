@@ -11,7 +11,19 @@ import {
 import { useMarketSession } from "../../market/session";
 
 type Universe = "FNO" | "NIFTY50" | "ALL";
-type SortKey = "volume_ratio" | "change_pct" | "relative_strength" | "volume";
+type SortKey =
+  | "volume_ratio"
+  | "change_pct"
+  | "relative_strength"
+  | "volume"
+  | "valuation_discount"
+  | "valuation_evidence";
+type ValuationFilter =
+  | "ALL"
+  | "UNDERVALUED"
+  | "FAIRLY_VALUED"
+  | "OVERVALUED"
+  | "INSUFFICIENT_DATA";
 type ScreenerField =
   | "close"
   | "change_pct"
@@ -41,6 +53,20 @@ type TrainedSummary = {
   symbols?: string[];
 };
 
+type ValuationSummary = {
+  classification?: string;
+  discount_premium_pct?: number | null;
+  evidence_quality?: string;
+  evidence_score?: number;
+  status?: string;
+  symbol: string;
+};
+
+type ValuationUniverseResponse = {
+  results?: ValuationSummary[];
+  total?: number;
+};
+
 type StockUniverseProps = {
   onSelectSymbol: (symbol: string, snapshot: StockSnapshot) => void;
   selectedSymbol: string;
@@ -52,6 +78,7 @@ type VirtualRowData = {
   onSelectSymbol: (symbol: string, snapshot: StockSnapshot) => void;
   rows: StockSnapshot[];
   selectedSymbol: string;
+  valuationBySymbol: Record<string, ValuationSummary>;
 };
 
 const fieldOptions: Array<{ label: string; value: ScreenerField }> = [
@@ -68,6 +95,8 @@ const sortOptions: Array<{ label: string; value: SortKey }> = [
   { label: "Change %", value: "change_pct" },
   { label: "Relative Strength", value: "relative_strength" },
   { label: "Volume", value: "volume" },
+  { label: "Valuation Discount", value: "valuation_discount" },
+  { label: "Valuation Evidence", value: "valuation_evidence" },
 ];
 
 const integerFormatter = new Intl.NumberFormat("en-IN", {
@@ -105,6 +134,8 @@ export function StockUniverse({
   const [trainOpen, setTrainOpen] = useState(false);
   const [trainMessage, setTrainMessage] = useState("");
   const [liveQuotes, setLiveQuotes] = useState<Record<string, Tick>>({});
+  const [valuationBySymbol, setValuationBySymbol] = useState<Record<string, ValuationSummary>>({});
+  const [valuationFilter, setValuationFilter] = useState<ValuationFilter>("ALL");
   const [nowMs, setNowMs] = useState(Date.now());
   const marketSession = useMarketSession();
 
@@ -207,12 +238,48 @@ export function StockUniverse({
     };
   }, [marketSession?.current_state, sourceRows]);
 
+  useEffect(() => {
+    let active = true;
+
+    const loadValuations = async () => {
+      try {
+        const response = await invoke<ValuationUniverseResponse>("get_valuation_universe", {
+          classification: "ALL",
+          limit: 500,
+          sort: "evidence",
+        });
+        if (!active) {
+          return;
+        }
+        setValuationBySymbol(
+          Object.fromEntries(
+            (response.results ?? []).map((valuation) => [valuation.symbol, valuation]),
+          ),
+        );
+      } catch {
+        if (active) {
+          setValuationBySymbol({});
+        }
+      }
+    };
+
+    loadValuations();
+    const timer = window.setInterval(loadValuations, 60_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, []);
+
   const displayRows = useMemo(() => {
     const needle = search.trim().toUpperCase();
     return [...sourceRows]
       .filter((row) => !needle || row.symbol.includes(needle))
-      .sort((left, right) => numeric(right, sortKey) - numeric(left, sortKey));
-  }, [search, sortKey, sourceRows]);
+      .filter((row) => valuationMatches(valuationBySymbol[row.symbol], valuationFilter))
+      .sort((left, right) =>
+        sortValue(right, sortKey, valuationBySymbol) - sortValue(left, sortKey, valuationBySymbol),
+      );
+  }, [search, sortKey, sourceRows, valuationBySymbol, valuationFilter]);
 
   const addCondition = () => {
     if (conditions.length >= 5) {
@@ -364,6 +431,18 @@ export function StockUniverse({
             ))}
           </select>
           <select
+            aria-label="Valuation classification"
+            onChange={(event) => setValuationFilter(event.target.value as ValuationFilter)}
+            style={controlStyle}
+            value={valuationFilter}
+          >
+            <option value="ALL">Value: All</option>
+            <option value="UNDERVALUED">Undervalued</option>
+            <option value="FAIRLY_VALUED">Fairly valued</option>
+            <option value="OVERVALUED">Overvalued</option>
+            <option value="INSUFFICIENT_DATA">Insufficient data</option>
+          </select>
+          <select
             aria-label="Show count"
             onChange={(event) => setLimit(Number(event.target.value))}
             style={controlStyle}
@@ -409,6 +488,7 @@ export function StockUniverse({
           <span>52W</span>
           <span>RS</span>
           <span>SIGNAL</span>
+          <span>VALUATION</span>
         </div>
         <div style={bodyStyle}>
           {displayRows.length > 200 ? (
@@ -424,6 +504,7 @@ export function StockUniverse({
                 onSelectSymbol,
                 rows: displayRows,
                 selectedSymbol,
+                valuationBySymbol,
               }}
               style={{ height: "100%", width: "100%" }}
             />
@@ -437,6 +518,7 @@ export function StockUniverse({
                   onSelectSymbol={onSelectSymbol}
                   row={row}
                   selected={row.symbol === selectedSymbol}
+                  valuation={valuationBySymbol[row.symbol]}
                 />
               ))}
             </div>
@@ -456,6 +538,7 @@ function VirtualRow({
   rows,
   selectedSymbol,
   style,
+  valuationBySymbol,
 }: {
   ariaAttributes: {
     "aria-posinset": number;
@@ -475,6 +558,7 @@ function VirtualRow({
       row={row}
       selected={row.symbol === selectedSymbol}
       style={style}
+      valuation={valuationBySymbol[row.symbol]}
     />
   );
 }
@@ -487,6 +571,7 @@ function StockRow({
   row,
   selected,
   style,
+  valuation,
 }: {
   ariaAttributes?: {
     "aria-posinset": number;
@@ -499,6 +584,7 @@ function StockRow({
   row: StockSnapshot;
   selected: boolean;
   style?: CSSProperties;
+  valuation?: ValuationSummary;
 }) {
   const status = quoteDisplayStatus(liveQuote, nowMs);
   const close = displayQuotePrice(row.close, liveQuote, nowMs);
@@ -530,6 +616,7 @@ function StockRow({
         {rsArrow(row.relative_strength)}
       </span>
       <span style={{ color: signalColor(row.signal) }}>{row.signal ?? "NEUTRAL"}</span>
+      <span style={{ color: valuationColor(valuation) }}>{valuationLabel(valuation)}</span>
     </button>
   );
 }
@@ -542,8 +629,63 @@ function conditionLabel(condition: Condition) {
 }
 
 function numeric(row: StockSnapshot, key: SortKey) {
+  if (key === "valuation_discount" || key === "valuation_evidence") {
+    return -Infinity;
+  }
   const value = row[key];
   return typeof value === "number" && Number.isFinite(value) ? value : -Infinity;
+}
+
+function sortValue(
+  row: StockSnapshot,
+  key: SortKey,
+  valuations: Record<string, ValuationSummary>,
+) {
+  const valuation = valuations[row.symbol];
+  if (key === "valuation_discount") {
+    return finiteOrMinimum(valuation?.discount_premium_pct);
+  }
+  if (key === "valuation_evidence") {
+    return finiteOrMinimum(valuation?.evidence_score);
+  }
+  return numeric(row, key);
+}
+
+function finiteOrMinimum(value: number | null | undefined) {
+  return typeof value === "number" && Number.isFinite(value) ? value : -Infinity;
+}
+
+function valuationMatches(valuation: ValuationSummary | undefined, filter: ValuationFilter) {
+  if (filter === "ALL") {
+    return true;
+  }
+  if (filter === "INSUFFICIENT_DATA") {
+    return !valuation || valuation.status === "INSUFFICIENT_DATA";
+  }
+  return valuation?.classification === filter;
+}
+
+function valuationLabel(valuation: ValuationSummary | undefined) {
+  if (!valuation || valuation.status === "INSUFFICIENT_DATA") {
+    return "INSUFFICIENT";
+  }
+  if (valuation.classification === "UNDERVALUED") {
+    return `UNDER ${formatPercent(valuation.discount_premium_pct)}`;
+  }
+  if (valuation.classification === "OVERVALUED") {
+    return `OVER ${formatPercent(valuation.discount_premium_pct)}`;
+  }
+  return valuation.classification === "FAIRLY_VALUED" ? "FAIR" : "INDETERMINATE";
+}
+
+function valuationColor(valuation: ValuationSummary | undefined) {
+  if (valuation?.classification === "UNDERVALUED") {
+    return "#00d4aa";
+  }
+  if (valuation?.classification === "OVERVALUED") {
+    return "#ff4444";
+  }
+  return valuation?.classification === "FAIRLY_VALUED" ? "#ffd700" : "#6666aa";
 }
 
 function formatPrice(value: number | null | undefined) {
@@ -716,7 +858,7 @@ const controlsStyle = {
 const filterStyle = {
   display: "grid",
   gap: 7,
-  gridTemplateColumns: "minmax(150px, 1fr) 112px minmax(160px, 1fr)",
+  gridTemplateColumns: "minmax(145px, 1fr) minmax(145px, 1fr) 112px minmax(150px, 1fr)",
 } satisfies CSSProperties;
 
 const controlStyle = {
@@ -781,7 +923,7 @@ const headerGridStyle = {
   fontFamily: "Inter, system-ui, sans-serif",
   fontSize: 10,
   gap: 8,
-  gridTemplateColumns: "1.15fr 0.9fr 0.72fr 0.86fr 0.62fr 0.42fr 0.92fr",
+  gridTemplateColumns: "1.02fr 0.82fr 0.64fr 0.72fr 0.54fr 0.34fr 0.78fr 1.06fr",
   padding: "0 12px",
 } satisfies CSSProperties;
 
@@ -806,7 +948,7 @@ const rowStyle = {
   fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
   fontSize: 12,
   gap: 8,
-  gridTemplateColumns: "1.15fr 0.9fr 0.72fr 0.86fr 0.62fr 0.42fr 0.92fr",
+  gridTemplateColumns: "1.02fr 0.82fr 0.64fr 0.72fr 0.54fr 0.34fr 0.78fr 1.06fr",
   height: 34,
   minWidth: 0,
   padding: "0 12px",

@@ -90,6 +90,18 @@ CREATE INDEX IF NOT EXISTS idx_instr_type
 
 
 class InstrumentMaster:
+    def resolve_live_feed_universe(self) -> list[dict[str, Any]]:
+        """Return canonical NSE cash equities plus supported indices for one feed."""
+        result = resolve_read(ReadOperation.RESOLVE_LIVE_FEED_UNIVERSE, {})
+        rows = list(result.get("instruments") or [])
+        symbols = [str(row.get("symbol") or "") for row in rows]
+        tokens = [str(row.get("token") or "") for row in rows]
+        if not rows or len(symbols) != len(set(symbols)) or len(tokens) != len(set(tokens)):
+            raise InstrumentSchemaError("live feed universe contains missing or duplicate identities")
+        if any(not token.isascii() or not token.isdigit() for token in tokens):
+            raise InstrumentSchemaError("live feed universe contains malformed token")
+        return rows
+
     def resolve_index_feed(self, symbol: str) -> dict[str, Any]:
         normalized = "".join(symbol.strip().upper().split())
         if normalized not in INDEX_FEED_ALIASES:

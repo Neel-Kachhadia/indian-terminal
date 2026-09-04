@@ -80,16 +80,16 @@ def get_status(redis_client: Any | None = None) -> dict[str, Any]:
     except (redis.RedisError, TypeError, ValueError):
         payload = None
     if not isinstance(payload, dict):
-        return _status(FeedPhase.DEGRADED, now_ms, None, "missing feed health")
+        return _status(FeedPhase.DEGRADED, now_ms, None, "missing feed health", None)
     source = str(payload.get("source") or "")
     last_success_ms = _int_or_zero(payload.get("last_success_ms"))
     if source != FEED_WRITER_OWNER:
-        return _status(FeedPhase.DEGRADED, now_ms, last_success_ms, "untrusted feed writer")
+        return _status(FeedPhase.DEGRADED, now_ms, last_success_ms, "untrusted feed writer", None)
     if last_success_ms <= 0 or now_ms - last_success_ms > HEALTH_MAX_AGE_MS:
-        return _status(FeedPhase.DEGRADED, now_ms, last_success_ms, "stale feed health")
+        return _status(FeedPhase.DEGRADED, now_ms, last_success_ms, "stale feed health", payload)
     if payload.get("state") != FeedPhase.LIVE.value:
-        return _status(FeedPhase.DEGRADED, now_ms, last_success_ms, "feed not live")
-    return _status(FeedPhase.LIVE, now_ms, last_success_ms, None)
+        return _status(FeedPhase.DEGRADED, now_ms, last_success_ms, "feed not live", payload)
+    return _status(FeedPhase.LIVE, now_ms, last_success_ms, None, payload)
 
 
 def _status(
@@ -97,8 +97,11 @@ def _status(
     now_ms: int,
     last_success_ms: int | None,
     error: str | None,
+    coverage: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    return {
+    source = coverage if isinstance(coverage, dict) else {}
+    result = {
+        "schema_version": 1,
         "state": phase.value,
         "connected": phase is FeedPhase.LIVE,
         "connection_owner": FEED_CONNECTION_OWNER,
@@ -107,7 +110,33 @@ def _status(
             max(0, now_ms - last_success_ms) if last_success_ms and last_success_ms > 0 else -1
         ),
         "last_error": error,
+        "expected": _int_or_zero(source.get("expected")),
+        "symbols_subscribed": _int_or_zero(source.get("subscribed")),
+        "symbols_active": _int_or_zero(source.get("receiving")),
+        "fresh": _int_or_zero(source.get("fresh")),
+        "stale": _int_or_zero(source.get("stale")),
+        "unavailable": _int_or_zero(source.get("unavailable")),
+        "unknown_tokens": _int_or_zero(source.get("unknown_tokens")),
+        "parser_errors": _int_or_zero(source.get("parser_errors")),
+        "duplicate_subscriptions": _int_or_zero(source.get("duplicate_subscriptions")),
+        "reconnect_count": _int_or_zero(source.get("reconnect_count")),
+        "packet_count": _int_or_zero(source.get("packet_count")),
+        "quote_updates_per_second": float(source.get("quote_updates_per_second") or 0.0),
+        "provider_token_limit": _int_or_zero(source.get("provider_token_limit")),
+        "freshness_threshold_ms": _int_or_zero(source.get("freshness_threshold_ms")),
+        "coverage_stabilization_ms": source.get("coverage_stabilization_ms"),
+        "last_packet_time_ms": source.get("last_packet_time_ms"),
     }
+    for name in (
+        "expected_symbols",
+        "subscribed_symbols",
+        "fresh_symbols",
+        "stale_symbols",
+        "unavailable_symbols",
+    ):
+        values = source.get(name)
+        result[name] = [str(value) for value in values] if isinstance(values, list) else []
+    return result
 
 
 def build_token_list(path: Path = INSTRUMENTS_PATH) -> tuple[list[str], dict[str, str]]:
