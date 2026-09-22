@@ -55,6 +55,42 @@ def test_artifact_path_change_cannot_change_verified_byte_snapshot(
     assert verified is not None and verified[1] == trusted
 
 
+def test_legacy_validated_record_without_current_provenance_is_excluded(
+    isolated_registry: Path,
+) -> None:
+    registry.ensure_registry()
+    with registry._connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO model_registry (
+                model_version, model_id, symbol, universe, training_data_horizon,
+                feature_schema_version, training_timestamp, artifact_path, artifact_hash,
+                artifact_size, serialization_format, artifact_format_version, code_version,
+                release_version, validation_status, fallback_status, train_start, train_end,
+                validation_start, validation_end, test_start, test_end, train_rows,
+                validation_sample_count, test_sample_count, calibration_sample_count,
+                registered_at
+            ) VALUES (
+                'legacy-v1', 'm02_direction', 'NIFTY', 'NIFTY', '2025..2026',
+                'features-v1:test', '2026-08-01T00:00:00+00:00', 'legacy.skops', ?,
+                10, 'SKOPS', 1, '1', '1', 'VALIDATED', 'PRIMARY', '2025-01-01',
+                '2025-06-01', '2025-06-02', '2025-08-01', '2025-08-02', '2025-09-01',
+                100, 20, 20, 20, '2026-08-01T00:00:00+00:00'
+            )
+            """,
+            ["a" * 64],
+        )
+    assert registry.latest_validated_record("m02_direction", "NIFTY") is None
+
+    with registry._connect() as connection:
+        connection.execute(
+            "UPDATE model_registry SET dataset_fingerprint = ?, runtime_versions = ?, "
+            "expected_feature_count = 1 WHERE model_version = 'legacy-v1'",
+            ["b" * 64, '{"python":"3.12"}'],
+        )
+    assert registry.latest_validated_record("m02_direction", "NIFTY") is not None
+
+
 def _context(rows: int = 220) -> MLContext:
     dates = pd.bdate_range("2026-01-02", periods=rows)
     feature = np.arange(rows, dtype=float)

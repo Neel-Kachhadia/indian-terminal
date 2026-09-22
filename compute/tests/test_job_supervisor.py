@@ -20,6 +20,7 @@ from auto_collector.job_supervisor import (  # noqa: E402
     _install_console_ctrl_handler,
     _new_kill_on_close_job,
     _process_alive,
+    _terminate_stale_writer_owner,
     _watch_parent_liveness,
     handle_console_ctrl_event,
 )
@@ -243,3 +244,56 @@ def test_supervisor_refuses_to_spawn_when_job_object_ownership_fails(monkeypatch
 
     assert job_supervisor.run() == 1
     assert spawned == []
+
+
+# --- Watchdog writer-blind-spot recovery: terminate the exact recorded owner
+# PID (never a swept target) before the collector task can be re-run, so a
+# fresh collector-run claims one clean owner (see run_watchdog_check). -------
+
+
+class _FakeCompletedProcess:
+    def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def test_terminate_stale_writer_owner_succeeds(monkeypatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **_kwargs):
+        calls.append(argv)
+        return _FakeCompletedProcess(0, stdout="SUCCESS: terminated")
+
+    monkeypatch.setattr(job_supervisor.subprocess, "run", fake_run)
+
+    terminated, detail = _terminate_stale_writer_owner(30060)
+
+    assert terminated is True
+    assert "terminated" in detail
+    [argv] = calls
+    assert str(job_supervisor.TASKKILL) in argv
+    assert "/PID" in argv and "30060" in argv
+    assert "/F" in argv
+
+
+def test_terminate_stale_writer_owner_treats_already_gone_pid_as_success(monkeypatch) -> None:
+    """taskkill exit 128 ('PID not found') means there is already no owner
+    left to conflict with a restart -- a successful outcome for this call's
+    purpose, not a failure to report/retry."""
+    monkeypatch.setattr(
+        job_supervisor.subprocess, "run",
+        lambda argv, **_kwargs: _FakeCompletedProcess(128, stderr="not found"),
+    )
+    terminated, _detail = _terminate_stale_writer_owner(999999)
+    assert terminated is True
+
+
+def test_terminate_stale_writer_owner_reports_genuine_failure(monkeypatch) -> None:
+    monkeypatch.setattr(
+        job_supervisor.subprocess, "run",
+        lambda argv, **_kwargs: _FakeCompletedProcess(5, stderr="ERROR: Access is denied."),
+    )
+    terminated, detail = _terminate_stale_writer_owner(30060)
+    assert terminated is False
+    assert "denied" in detail.lower()

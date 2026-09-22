@@ -43,6 +43,7 @@ struct NseRecords {
 
 #[derive(Debug, Deserialize)]
 struct NseProvenance {
+    source: String,
     symbol: String,
     observed_at: String,
     freshness: QuoteFreshness,
@@ -86,6 +87,7 @@ struct ChainSnapshot {
     observed_at_ms: i64,
     freshness: QuoteFreshness,
     decision_eligible: bool,
+    source: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,6 +105,9 @@ struct GreekLeg {
     gamma: Option<f64>,
     theta: Option<f64>,
     vega: Option<f64>,
+    pricing_model: Option<String>,
+    calculation_status: Option<String>,
+    iv_observation: Option<serde_json::Value>,
 }
 
 pub async fn run(state: AppState) -> Result<(), String> {
@@ -172,7 +177,16 @@ pub async fn run(state: AppState) -> Result<(), String> {
                     )
                     .await;
 
-                    match write_chain_to_redis(&state, &expiry, &snapshot.legs, pcr).await {
+                    match write_chain_to_redis(
+                        &state,
+                        &expiry,
+                        &snapshot.legs,
+                        pcr,
+                        snapshot.decision_eligible,
+                        &snapshot.source,
+                    )
+                    .await
+                    {
                         Ok(()) => {
                             let mut computed_greeks = 0;
                             if snapshot.decision_eligible {
@@ -183,6 +197,9 @@ pub async fn run(state: AppState) -> Result<(), String> {
                                     &snapshot.legs,
                                     snapshot.spot,
                                     pcr,
+                                    snapshot.observed_at_ms,
+                                    snapshot.decision_eligible,
+                                    &snapshot.source,
                                 )
                                 .await
                                 {
@@ -248,6 +265,10 @@ pub async fn run(state: AppState) -> Result<(), String> {
     }
 }
 
+// Each parameter is distinct chain-observation provenance the live IV
+// contract requires end-to-end; bundling into a struct is left for a
+// follow-up, not a correctness concern.
+#[allow(clippy::too_many_arguments)]
 async fn enrich_chain_with_greeks(
     client: &Client,
     state: &AppState,
@@ -255,7 +276,13 @@ async fn enrich_chain_with_greeks(
     legs: &[OptionLeg],
     spot: f64,
     pcr: Option<f64>,
+    observed_at_ms: i64,
+    decision_eligible: bool,
+    source: &str,
 ) -> Result<usize, String> {
+    let observed_at = DateTime::<Utc>::from_timestamp_millis(observed_at_ms)
+        .ok_or_else(|| String::from("invalid chain observed_at"))?
+        .to_rfc3339();
     let response = client
         .post(GREEKS_URL)
         .header("X-Process-Token", state.process_token()?)
@@ -265,6 +292,15 @@ async fn enrich_chain_with_greeks(
             "expiry": expiry,
             "spot": spot,
             "legs": legs,
+            "provenance": {
+                "source": source,
+                "observed_at": observed_at,
+                "source_timestamp": observed_at,
+                "spot_timestamp": observed_at,
+                "spot_source": source,
+                "spot_quality": "OBSERVED_VERIFIED",
+                "decision_eligible": decision_eligible,
+            },
         }))
         .send()
         .await
@@ -293,7 +329,7 @@ async fn enrich_chain_with_greeks(
         crate::bt_error!("poller", "greeks partial error: {error}");
     }
 
-    write_chain_to_redis(state, expiry, &enriched, pcr).await?;
+    write_chain_to_redis(state, expiry, &enriched, pcr, decision_eligible, source).await?;
     Ok(computed_count)
 }
 
@@ -438,6 +474,9 @@ fn parse_chain_body(body: &str, expiry: &str) -> Result<ChainSnapshot, PollError
             provenance.symbol
         )));
     }
+    if provenance.source != "NSE_GET_SYMBOL_DERIVATIVES_DATA" {
+        return Err(PollError::Other(String::from("chain source mismatch")));
+    }
     if provenance.decision_eligible && provenance.freshness != QuoteFreshness::Fresh {
         return Err(PollError::Other(String::from(
             "chain provenance marks non-fresh data decision-eligible",
@@ -508,6 +547,7 @@ fn parse_chain_body(body: &str, expiry: &str) -> Result<ChainSnapshot, PollError
         observed_at_ms,
         freshness: provenance.freshness,
         decision_eligible: provenance.decision_eligible,
+        source: provenance.source,
     })
 }
 
@@ -526,6 +566,9 @@ fn merge_greeks(legs: &mut [OptionLeg], greeks: &[GreekLeg]) {
             leg.gamma = greek.gamma;
             leg.theta = greek.theta;
             leg.vega = greek.vega;
+            leg.pricing_model.clone_from(&greek.pricing_model);
+            leg.calculation_status.clone_from(&greek.calculation_status);
+            leg.iv_observation.clone_from(&greek.iv_observation);
             break;
         }
     }
@@ -600,6 +643,9 @@ fn map_nse_leg(
         gamma: None,
         theta: None,
         vega: None,
+        pricing_model: None,
+        calculation_status: None,
+        iv_observation: None,
         source_type: QuoteSource::NseChain,
         observed_at_ms,
         received_at_ms,
@@ -711,9 +757,27 @@ async fn write_chain_to_redis(
     expiry: &str,
     legs: &[OptionLeg],
     pcr: Option<f64>,
+    decision_eligible: bool,
+    source: &str,
 ) -> Result<(), String> {
-    let chain_payload =
-        serde_json::to_string(legs).map_err(|e| format!("chain serialize failed: {e}"))?;
+    let latest_leg = legs.iter().max_by_key(|leg| leg.observed_at_ms);
+    let observed_at_ms = latest_leg.map(|leg| leg.observed_at_ms);
+    let freshness = latest_leg
+        .map(|leg| leg.freshness)
+        .unwrap_or(QuoteFreshness::Unknown);
+    let observed_at = observed_at_ms
+        .and_then(DateTime::<Utc>::from_timestamp_millis)
+        .map(|value| value.to_rfc3339());
+    let chain_payload = serde_json::to_string(&json!({
+        "legs": legs,
+        "provenance": {
+            "source": source,
+            "observed_at": observed_at,
+            "freshness": freshness,
+            "decision_eligible": decision_eligible && freshness == QuoteFreshness::Fresh,
+        }
+    }))
+    .map_err(|e| format!("chain serialize failed: {e}"))?;
 
     let mut redis_guard = state.redis.lock().await;
     let connection = redis_guard
@@ -731,12 +795,6 @@ async fn write_chain_to_redis(
             connection.set_ex(&pcr_key, pcr.to_string(), REDIS_TTL_SECONDS);
         pcr_result.map_err(|e| format!("SET {pcr_key} failed: {e}"))?;
     }
-
-    let latest_leg = legs.iter().max_by_key(|leg| leg.observed_at_ms);
-    let observed_at_ms = latest_leg.map(|leg| leg.observed_at_ms);
-    let freshness = latest_leg
-        .map(|leg| leg.freshness)
-        .unwrap_or(QuoteFreshness::Unknown);
 
     let health = json!({
         "schema_version": 1,
@@ -889,6 +947,7 @@ mod tests {
                 ]
             },
             "provenance": {
+                "source": "NSE_GET_SYMBOL_DERIVATIVES_DATA",
                 "symbol": "NIFTY",
                 "observed_at": "2026-08-27T10:05:00+05:30",
                 "freshness": "FRESH",
@@ -922,6 +981,7 @@ mod tests {
         let inconsistent = r#"{
             "records": {"underlyingValue": 25123.45, "data": []},
             "provenance": {
+                "source": "NSE_GET_SYMBOL_DERIVATIVES_DATA",
                 "symbol": "NIFTY",
                 "observed_at": "2026-08-27T10:05:00+05:30",
                 "freshness": "STALE",

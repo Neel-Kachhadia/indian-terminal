@@ -6,6 +6,7 @@ from collections import defaultdict
 from typing import Any
 
 from data.exchange_calendar import today_ist
+from options.iv_contract import validated_live_observation
 
 
 def compute_iv_surface(chain_legs: list[dict[str, Any]]) -> dict[str, Any]:
@@ -104,10 +105,13 @@ def compute_iv_surface(chain_legs: list[dict[str, Any]]) -> dict[str, Any]:
 def _valid_legs(chain_legs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     valid: list[dict[str, Any]] = []
     for leg in chain_legs:
+        observation = validated_live_observation(leg)
+        if observation is None:
+            continue
         strike = _coerce_float(leg.get("strike"))
         expiry = str(leg.get("expiry") or "").strip()
         option_type = _normalise_option_type(leg.get("option_type"))
-        iv = _normalise_iv(leg.get("iv"))
+        iv = _normalise_iv(observation.get("iv"))
 
         if strike is None or not expiry or option_type is None or iv is None:
             continue
@@ -118,6 +122,7 @@ def _valid_legs(chain_legs: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "option_type": option_type,
             "iv": iv,
             "delta": _coerce_float(leg.get("delta")),
+            "spot_price": _coerce_float(observation.get("spot_price")),
         })
     return valid
 
@@ -135,10 +140,6 @@ def _normalise_iv(value: Any) -> float | None:
     iv = _coerce_float(value)
     if iv is None or iv <= 0:
         return None
-
-    # NSE sometimes exposes IV as 34.5 while py_vollib returns 0.345.
-    if iv > 3.0:
-        iv = iv / 100.0
 
     if iv <= 0 or iv > 5.0:
         return None
@@ -172,6 +173,9 @@ def _build_grid(
 
 
 def _derive_spot(legs: list[dict[str, Any]], strikes: list[float]) -> float:
+    observed_spots = {leg["spot_price"] for leg in legs if leg.get("spot_price") is not None}
+    if len(observed_spots) == 1:
+        return float(next(iter(observed_spots)))
     best_strike: float | None = None
     best_distance: float | None = None
 

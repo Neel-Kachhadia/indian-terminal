@@ -12,9 +12,10 @@ import duckdb
 
 from data.market_data_quality import DECISION_ELIGIBLE_OHLCV_VIEW_SQL
 from db.writer_lease import require_writer_lease
+from options.iv_contract import COLUMN_TYPES
 
 
-TARGET_SCHEMA_VERSION = 5
+TARGET_SCHEMA_VERSION = 9
 MIN_FREE_HEADROOM_BYTES = 64 * 1024 * 1024
 DECISION_ELIGIBLE_OHLCV_REQUIRED_COLUMNS = {
     "symbol": "VARCHAR",
@@ -114,6 +115,213 @@ MIGRATION_4_STATEMENTS = (
 # fresh-install/idempotent no-op path when the view already matches contract.
 MIGRATION_5_STATEMENTS = (DECISION_ELIGIBLE_OHLCV_VIEW_SQL,)
 
+# Adds real provenance to iv_history (previously symbol/expiry/strike/
+# option_type/date/iv only, with zero source/spot/rate/solver/quality
+# columns) and introduces risk_free_rate_history so the hardcoded
+# RISK_FREE_RATE=0.065 constant in options/greeks.py can be replaced with a
+# real, tenor-matched, dated rate. All new iv_history columns are nullable
+# additions -- the existing primary key and every pre-existing row (there
+# are none in production at migration time) are preserved unchanged.
+_IV_V6_COLUMNS_SQL = ",\n        ".join(
+    f"{name} {kind}{' PRIMARY KEY' if name == 'observation_id' else ''}"
+    for name, kind in COLUMN_TYPES.items()
+)
+
+MIGRATION_6_STATEMENTS = (
+    "DROP INDEX IF EXISTS idx_iv_symbol",
+    "ALTER TABLE iv_history RENAME TO iv_history_legacy_v5",
+    f"CREATE TABLE iv_history ({_IV_V6_COLUMNS_SQL})",
+    """
+    INSERT INTO iv_history (
+        observation_id, symbol, underlying, expiry, strike, option_type,
+        date, iv, source, quality, calculation_status, reason,
+        observation_kind, contract_version
+    )
+    SELECT
+        'legacy:' || sha256(
+            symbol || '|' || CAST(expiry AS VARCHAR) || '|' ||
+            CAST(strike AS VARCHAR) || '|' || option_type || '|' || CAST(date AS VARCHAR)
+        ),
+        symbol, symbol, expiry, strike, option_type, date, iv,
+        'UNKNOWN', 'SOURCE_UNVERIFIED', 'SOURCE_UNVERIFIED',
+        'legacy row lacks pricing inputs and provenance', 'LEGACY', 'legacy-v1'
+    FROM iv_history_legacy_v5
+    """,
+    "CREATE UNIQUE INDEX idx_iv_observation_natural ON iv_history(symbol, expiry, strike, option_type, observed_at, observation_kind)",
+    "CREATE INDEX idx_iv_symbol_date ON iv_history(symbol, date, observation_kind)",
+    """
+    CREATE TABLE IF NOT EXISTS risk_free_rate_history (
+        observation_date DATE    NOT NULL,
+        tenor_days       INTEGER NOT NULL,
+        tenor_label      TEXT    NOT NULL,
+        rate_pct         DOUBLE  NOT NULL,
+        rate_decimal     DOUBLE  NOT NULL,
+        source           TEXT    NOT NULL,
+        source_url       TEXT    NOT NULL,
+        published_at     TIMESTAMP,
+        retrieved_at     TIMESTAMP NOT NULL,
+        quote_convention TEXT    NOT NULL,
+        rate_convention  TEXT    NOT NULL,
+        conversion_method TEXT  NOT NULL,
+        PRIMARY KEY (observation_date, tenor_days)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_rfr_date ON risk_free_rate_history(observation_date)",
+)
+
+# risk_free_rate_history's CREATE TABLE above (MIGRATION_6_STATEMENTS) gained
+# quote_convention/rate_convention/conversion_method only after real
+# production databases had already been migrated to schema 6 by an earlier
+# revision of that same CREATE TABLE, which did not yet declare those three
+# columns. Migrations are gated purely by version number (migrate_database's
+# `if current == target_version: return` short-circuit), so editing an
+# already-applied migration's SQL text never reaches an already-migrated
+# database -- proven live: a real production terminal.db at schema 6 was
+# missing exactly these three columns even on current source. `CREATE TABLE
+# IF NOT EXISTS` cannot retrofit columns onto an existing table either. A new
+# versioned step is the only way to actually reach those databases.
+# DEFAULT backfills every pre-existing row, not just new ones (DuckDB ADD
+# COLUMN ... DEFAULT semantics) -- safe here because this table has exactly
+# one writer (data/risk_free_rate.py) and it has used only these three
+# literal convention values since the table was introduced; this is not a
+# fabricated/guessed provenance, it is the one convention this system has
+# ever actually written. Matches the existing ADD COLUMN IF NOT EXISTS ...
+# DEFAULT idiom already used for `instruments.schema_version` above rather
+# than introducing a second column-backfill pattern.
+MIGRATION_7_STATEMENTS = (
+    "ALTER TABLE risk_free_rate_history ADD COLUMN IF NOT EXISTS "
+    "quote_convention TEXT DEFAULT 'SIMPLE_ACT_365_YIELD'",
+    "ALTER TABLE risk_free_rate_history ADD COLUMN IF NOT EXISTS "
+    "rate_convention TEXT DEFAULT 'CONTINUOUS_ACT_365'",
+    "ALTER TABLE risk_free_rate_history ADD COLUMN IF NOT EXISTS "
+    "conversion_method TEXT DEFAULT 'LN_1_PLUS_SIMPLE_TIMES_T_OVER_T'",
+)
+
+# Same root cause as MIGRATION_7_STATEMENTS above, discovered on the same
+# real production database: iv_history's CREATE TABLE (_IV_V6_COLUMNS_SQL,
+# built from options/iv_contract.py's COLUMN_TYPES) has grown from the
+# original ~15-column "iv-backfill-v1" era shape to the full 29-column
+# iv-observation-v3 contract (observation_id identity, forward/dividend/
+# rate provenance, observation_kind, contract_version, ...) entirely inside
+# this uncommitted branch of work. A real production terminal.db already at
+# schema 6 was migrated under an earlier revision of that CREATE TABLE and
+# still physically has only the original ~15 columns with 41k real
+# `iv-backfill-v1` rows in them -- migrate_database's `current == target`
+# short-circuit means the current CREATE TABLE text, however it has since
+# changed, never reaches that database. This mirrors MIGRATION_6_STATEMENTS'
+# own rename -> recreate -> quarantined-legacy-insert shape (proven safe
+# there for the pre-v6 legacy rows) rather than an in-place ALTER, because
+# the target shape's PRIMARY KEY is `observation_id` (identity-based, so a
+# LIVE and a HISTORICAL_RECONSTRUCTION row can coexist for the same
+# contract/date) while the real table's PRIMARY KEY is still the old
+# (symbol, expiry, strike, option_type, date) tuple -- a constraint DuckDB
+# cannot alter in place, only replace via a new table.
+# Old rows are quarantined the same way the v5 legacy rows already are:
+# every identity/provenance column this contract requires (option_price_
+# semantic, spot_source, risk_free_source, pricing_model, solver, ...) is
+# left NULL, `quality`/`calculation_status` forced to SOURCE_UNVERIFIED
+# (never trust-preserving the old table's own IV_VALID label), and
+# `observation_kind='LEGACY'` -- a value validate_observation's `{"LIVE",
+# "HISTORICAL_RECONSTRUCTION"}` check can never accept. These rows can
+# never validate or reach a decision path; the original quality value and
+# calculation_version are preserved only inside `reason` for audit
+# traceability, and `contract_version` is honestly labelled with the real
+# pipeline generation that produced them, never CONTRACT_VERSION.
+MIGRATION_8_STATEMENTS = (
+    "DROP INDEX IF EXISTS idx_iv_symbol",
+    "ALTER TABLE iv_history RENAME TO iv_history_legacy_v1_backfill",
+    f"CREATE TABLE iv_history ({_IV_V6_COLUMNS_SQL})",
+    """
+    INSERT INTO iv_history (
+        observation_id, symbol, underlying, expiry, strike, option_type,
+        date, iv, source, quality, calculation_status, reason,
+        observation_kind, contract_version
+    )
+    SELECT
+        'legacy-iv-backfill-v1:' || sha256(
+            symbol || '|' || CAST(expiry AS VARCHAR) || '|' ||
+            CAST(strike AS VARCHAR) || '|' || option_type || '|' || CAST(date AS VARCHAR)
+        ),
+        symbol, symbol, expiry, strike, option_type, date, iv,
+        'UNKNOWN', 'SOURCE_UNVERIFIED', 'SOURCE_UNVERIFIED',
+        'legacy iv-backfill-v1 row predates current contract/provenance columns '
+        || '(original quality=' || quality || ', calculation_version=' || calculation_version || ')',
+        'LEGACY', 'legacy-iv-backfill-v1'
+    FROM iv_history_legacy_v1_backfill
+    """,
+    "CREATE UNIQUE INDEX idx_iv_observation_natural ON iv_history(symbol, expiry, strike, option_type, observed_at, observation_kind)",
+    "CREATE INDEX idx_iv_symbol_date ON iv_history(symbol, date, observation_kind)",
+)
+
+# Every real risk_free_rate_history row persisted before this fix stored
+# rate_decimal = rate_pct / 100 -- a naive percent-to-decimal conversion --
+# instead of the documented continuously-compounded ACT/365 conversion
+# TenorPoint.rate_decimal actually defines (log1p(simple * T) / T). Proven
+# live: db.write_service._upsert_risk_free_rate_curve's own math.isclose
+# check on write, and options.iv_backfill.load_rate_curve's identical check
+# on read, both already correctly refuse a mismatched rate_decimal -- so
+# every historical rate row was silently unusable regardless of how much
+# genuine FBIL curve history existed, for a completely different reason
+# than "the source lacks history". rate_pct (the actual FBIL-quoted number)
+# is never touched by this migration; only the deterministic derived
+# column is recomputed through the one documented, tested formula, which
+# is a correctness fix, not a fabrication -- the raw ingredient was always
+# genuine, only its transformation was wrong.
+def _apply_risk_free_rate_decimal_correction_migration(
+    path: Path, version: int, name: str, statements: tuple[str, ...]
+) -> None:
+    del statements  # this step is data-driven, not a fixed SQL script
+    from data.risk_free_rate import TenorPoint
+
+    connection = duckdb.connect(str(path))
+    metadata_transaction = False
+    try:
+        _ensure_metadata(connection)
+        rows = connection.execute(
+            "SELECT observation_date, tenor_days, tenor_label, rate_pct, rate_decimal "
+            "FROM risk_free_rate_history"
+        ).fetchall()
+        corrected = 0
+        for observation_date, tenor_days, tenor_label, rate_pct, stored_decimal in rows:
+            expected = TenorPoint(
+                observation_date=observation_date,
+                tenor_days=tenor_days,
+                tenor_label=tenor_label,
+                rate_pct=rate_pct,
+                published_at=None,
+                source="",
+                source_url="",
+            ).rate_decimal
+            if stored_decimal is None or abs(float(stored_decimal) - expected) > 1e-9:
+                connection.execute(
+                    "UPDATE risk_free_rate_history SET rate_decimal = ? "
+                    "WHERE observation_date = ? AND tenor_days = ?",
+                    [expected, observation_date, tenor_days],
+                )
+                corrected += 1
+        checksum = hashlib.sha256(f"rows={len(rows)} corrected={corrected}".encode("utf-8")).hexdigest()
+        connection.execute("BEGIN TRANSACTION")
+        metadata_transaction = True
+        connection.execute(
+            "INSERT INTO schema_migrations VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+            [version, name, checksum],
+        )
+        connection.execute("COMMIT")
+        metadata_transaction = False
+        connection.execute("CHECKPOINT")
+    except Exception:
+        if metadata_transaction:
+            try:
+                connection.execute("ROLLBACK")
+            except Exception:
+                pass
+        raise
+    finally:
+        connection.close()
+
+
+MIGRATION_9_STATEMENTS: tuple[str, ...] = ()
+
 
 def migrate_database(
     database: Path,
@@ -182,6 +390,13 @@ def migrate_database(
         else None
     )
     if backup is not None and backup.exists():
+        # Preserve an earlier upgrade's rollback artifact.  A later migration
+        # can legitimately start from the same schema version after rollback;
+        # never overwrite or delete the older evidence.
+        backup = database.with_suffix(
+            database.suffix + f".pre-v{current}-to-v{target_version}.bak"
+        )
+    if backup is not None and backup.exists():
         raise MigrationError(f"rollback backup already exists; operator review required: {backup}")
     source_fingerprint = _file_fingerprint(database) if database.exists() else None
     _write_journal(journal, "PREPARED", current, target_version, None, backup)
@@ -215,6 +430,34 @@ def migrate_database(
                     5,
                     "decision_eligible_ohlcv_backfill",
                     MIGRATION_5_STATEMENTS,
+                )
+            elif next_version == 6:
+                _apply_sql_migration(
+                    stage,
+                    6,
+                    "iv_history_provenance_and_risk_free_rate",
+                    MIGRATION_6_STATEMENTS,
+                )
+            elif next_version == 7:
+                _apply_sql_migration(
+                    stage,
+                    7,
+                    "risk_free_rate_convention_columns_backfill",
+                    MIGRATION_7_STATEMENTS,
+                )
+            elif next_version == 8:
+                _apply_iv_history_v3_contract_migration(
+                    stage,
+                    8,
+                    "iv_history_v3_contract_backfill",
+                    MIGRATION_8_STATEMENTS,
+                )
+            elif next_version == 9:
+                _apply_risk_free_rate_decimal_correction_migration(
+                    stage,
+                    9,
+                    "risk_free_rate_decimal_correction",
+                    MIGRATION_9_STATEMENTS,
                 )
             else:
                 raise MigrationError(f"no migration path from schema {version} to {next_version}")
@@ -513,6 +756,59 @@ def _apply_sql_migration(path: Path, version: int, name: str, statements: tuple[
         connection.close()
 
 
+def _apply_iv_history_v3_contract_migration(
+    path: Path, version: int, name: str, statements: tuple[str, ...]
+) -> None:
+    """Unlike every other versioned step, this one is conditional: a fresh
+    install (current=0, migrating straight through to the latest target)
+    already creates iv_history via MIGRATION_6_STATEMENTS' `_IV_V6_COLUMNS_
+    SQL`, which is built from the CURRENT options/iv_contract.COLUMN_TYPES
+    and therefore already has every column this step would otherwise add.
+    Running the rename -> recreate -> quarantine-as-legacy statements
+    unconditionally would wrongly relabel that already-correct, already-
+    valid data as LEGACY. Only a real pre-existing table from the older
+    ~15-column "iv-backfill-v1" era (missing any current COLUMN_TYPES
+    column) needs the backfill; anything already complete is a no-op here
+    -- the version bookkeeping below still advances either way."""
+    connection = duckdb.connect(str(path))
+    metadata_transaction = False
+    try:
+        _ensure_metadata(connection)
+        existing_columns = {
+            row[0]
+            for row in connection.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'iv_history'"
+            ).fetchall()
+        }
+        needs_backfill = bool(set(COLUMN_TYPES) - existing_columns)
+        if needs_backfill:
+            for statement in statements:
+                connection.execute(statement)
+            checksum_source = "\n".join(statements)
+        else:
+            checksum_source = "no-op: iv_history already matches current COLUMN_TYPES"
+        checksum = hashlib.sha256(checksum_source.encode("utf-8")).hexdigest()
+        connection.execute("BEGIN TRANSACTION")
+        metadata_transaction = True
+        connection.execute(
+            "INSERT INTO schema_migrations VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+            [version, name, checksum],
+        )
+        connection.execute("COMMIT")
+        metadata_transaction = False
+        connection.execute("CHECKPOINT")
+    except Exception:
+        if metadata_transaction:
+            try:
+                connection.execute("ROLLBACK")
+            except Exception:
+                pass
+        raise
+    finally:
+        connection.close()
+
+
 def _validate_decision_eligible_view(connection: duckdb.DuckDBPyConnection) -> None:
     object_rows = connection.execute(
         "SELECT table_type FROM information_schema.tables WHERE table_name = 'decision_eligible_ohlcv'"
@@ -618,6 +914,8 @@ def _validate_database(path: Path, target_version: int) -> dict[str, Any]:
         }
         if target_version >= 5:
             required_tables = required_tables | {"decision_eligible_ohlcv"}
+        if target_version >= 6:
+            required_tables = required_tables | {"iv_history", "risk_free_rate_history"}
         missing_tables = sorted(required_tables.difference(tables))
         if missing_tables:
             raise MigrationError(f"database validation missing tables: {', '.join(missing_tables)}")
@@ -632,7 +930,8 @@ def _validate_database(path: Path, target_version: int) -> dict[str, Any]:
             FROM information_schema.columns
             WHERE table_name IN (
                 'schema_migrations', 'ohlcv', 'fo_eod', 'instruments',
-                'backtest_runs', 'ingestion_manifests', 'decision_eligible_ohlcv'
+                'backtest_runs', 'ingestion_manifests', 'decision_eligible_ohlcv',
+                'iv_history', 'risk_free_rate_history'
             )
             ORDER BY table_name, ordinal_position
             """
@@ -656,6 +955,17 @@ def _validate_database(path: Path, target_version: int) -> dict[str, Any]:
                 "retention_decision",
             },
         }
+        if target_version >= 6:
+            required_columns["risk_free_rate_history"] = {
+                "observation_date", "tenor_days", "tenor_label", "rate_pct",
+                "rate_decimal", "source", "source_url", "retrieved_at",
+            }
+        if target_version >= 7:
+            required_columns["risk_free_rate_history"] = required_columns["risk_free_rate_history"] | {
+                "quote_convention", "rate_convention", "conversion_method",
+            }
+        if target_version >= 8:
+            required_columns["iv_history"] = set(COLUMN_TYPES)
         for table, expected in required_columns.items():
             actual = {row[1] for row in schema_rows if row[0] == table}
             missing = sorted(expected - actual)

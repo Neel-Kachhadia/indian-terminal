@@ -46,7 +46,12 @@ from data.exchange_calendar import (
 from data.index_aliases import INDEX_CANONICAL_NAME, index_symbol_candidates
 from data.instrument_master import master as instrument_master
 from data.instrument_schema import InstrumentSchemaError, read_instrument_frame
-from data.market_data_quality import DecisionContext, evaluate_market_bar
+from data.market_data_quality import (
+    DecisionContext,
+    VERIFIED_EQUITY_SOURCES,
+    VERIFIED_INDEX_SOURCES,
+    evaluate_market_bar,
+)
 from data.nse_session import nse
 from data.paths import BASE_DIR, DATA_DIR, DUCKDB_PATH, EQUITY_BHAV_DIR, INSTRUMENTS_CACHE, ensure_dirs
 from db.bhav_loader import load_date_range
@@ -100,11 +105,16 @@ class HistoricalDownloadRequest(BaseModel):
 
 
 class GreeksLegRequest(BaseModel):
+    symbol: str
+    expiry: str
     strike: float
     option_type: str
     ltp: float
+    bid: float | None = None
+    ask: float | None = None
     oi: int | None = None
     volume: int | None = None
+    contract_token: str | None = None
 
 
 class GreeksRequest(BaseModel):
@@ -112,6 +122,7 @@ class GreeksRequest(BaseModel):
     expiry: str
     spot: float
     legs: list[GreeksLegRequest]
+    provenance: dict[str, Any]
 
 
 class IndicatorRequest(BaseModel):
@@ -151,6 +162,10 @@ class PayoffRequest(BaseModel):
     legs: list[PayoffLeg]
     spot: float
     spot_range_pct: float = 0.20
+    risk_free_rate: float | None = None
+    risk_free_rate_source: str | None = None
+    dividend_yield: float | None = None
+    dividend_yield_source: str | None = None
 
 
 class MLPredictRequest(BaseModel):
@@ -861,17 +876,27 @@ def compute_greeks(request: GreeksRequest) -> Any:
     start = _time.time()
     legs = [
         {
+            "symbol": leg.symbol,
+            "expiry": leg.expiry,
             "strike": leg.strike,
             "option_type": leg.option_type,
             "ltp": leg.ltp,
+            "bid": leg.bid,
+            "ask": leg.ask,
             "oi": leg.oi,
             "volume": leg.volume,
+            "contract_token": leg.contract_token,
         }
         for leg in request.legs
     ]
 
     try:
-        result = compute_chain_greeks(legs, request.spot, request.expiry)
+        result = compute_chain_greeks(
+            legs,
+            request.spot,
+            request.expiry,
+            provenance=request.provenance,
+        )
         elapsed_ms = int((_time.time() - start) * 1000)
         logger.debug("greeks computed for %s strikes in %sms", len(result), elapsed_ms)
         return {
@@ -1147,7 +1172,15 @@ def compute_payoff_endpoint(request: PayoffRequest) -> Any:
                     f"lot_size mismatch for {leg['symbol']} {leg['expiry']}: "
                     f"expected {canonical_lot_size}, received {leg['lot_size']}"
                 )
-        return compute_payoff(legs, request.spot, request.spot_range_pct)
+        return compute_payoff(
+            legs,
+            request.spot,
+            request.spot_range_pct,
+            risk_free_rate=request.risk_free_rate,
+            risk_free_rate_source=request.risk_free_rate_source,
+            dividend_yield=request.dividend_yield,
+            dividend_yield_source=request.dividend_yield_source,
+        )
     except (InstrumentSchemaError, ValueError) as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
 
@@ -1595,7 +1628,7 @@ def ohlc_forecast(symbol: str) -> Any:
         normalized_symbol,
         frame,
         current_close,
-        atm_iv=atm_iv if atm_iv > 0 else None,
+        atm_iv=atm_iv,
         vix=vix if vix > 0 else None,
         include_accuracy=True,
         log_forecast=False,
@@ -2678,7 +2711,26 @@ def get_ohlcv(
 
 @app.post("/ingest/bhav")
 def ingest_bhav(rows: list[OHLCVRow]) -> dict[str, int]:
+    # decision_eligible_ohlcv (data/market_data_quality.py) trusts the raw
+    # `source` column absolutely: any row whose source matches a verified
+    # bhavcopy sentinel is labelled OBSERVED_VERIFIED unconditionally, with
+    # no re-derivation from the row's own values. That trust is earned
+    # elsewhere (db/bhav_loader.py sets these sentinels itself, only after
+    # actually parsing NSE's own downloaded bhavcopy/index files) -- this
+    # generic HTTP surface hands `source` straight from the request body and
+    # can prove nothing about where a row's numbers actually came from, so it
+    # must never be allowed to self-declare a verified provenance it cannot
+    # back.
+    reserved_sources = VERIFIED_EQUITY_SOURCES | VERIFIED_INDEX_SOURCES
     for row in rows:
+        if row.source.strip().upper() in reserved_sources:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"source '{row.source}' is reserved for genuinely parsed "
+                    "NSE bhavcopy data and cannot be self-declared via this endpoint"
+                ),
+            )
         row.symbol = http_symbol(row.symbol)
         row.date = http_date(row.date) or row.date
     payload = [_model_dump(row) for row in rows]
@@ -4501,14 +4553,19 @@ def _size_kb(record: dict[str, Any]) -> int | None:
     return int(value)
 
 
-def _read_atm_iv_from_redis(symbol: str, spot: float) -> float:
+def _read_atm_iv_from_redis(symbol: str, spot: float) -> float | None:
     if spot <= 0:
-        return 0.0
+        return None
+    from options.iv_contract import validated_live_observation
+
     legs = _read_chain_legs_from_redis(symbol, get_next_expiries(2, symbol))
-    best_iv = 0.0
+    best_iv: float | None = None
     best_distance: float | None = None
     for leg in legs:
-        iv = _to_float(leg.get("iv"))
+        observation = validated_live_observation(leg)
+        if observation is None:
+            continue
+        iv = _to_float(observation.get("iv"))
         strike = _to_float(leg.get("strike"))
         if iv <= 0 or strike <= 0:
             continue
@@ -4563,7 +4620,29 @@ def _fetch_chain_legs_with_greeks(
 
         from options.greeks import compute_chain_greeks
 
-        return compute_chain_greeks(legs, spot, leg_expiry or expiry), spot, leg_expiry or expiry
+        chain_provenance = payload.get("provenance")
+        if not isinstance(chain_provenance, dict):
+            return [], spot, leg_expiry or expiry
+        observed_at = chain_provenance.get("observed_at")
+        provenance = {
+            "source": chain_provenance.get("source"),
+            "observed_at": observed_at,
+            "source_timestamp": observed_at,
+            "spot_timestamp": observed_at,
+            "spot_source": chain_provenance.get("source"),
+            "spot_quality": "OBSERVED_VERIFIED",
+            "decision_eligible": chain_provenance.get("decision_eligible") is True,
+        }
+        return (
+            compute_chain_greeks(
+                legs,
+                spot,
+                leg_expiry or expiry,
+                provenance=provenance,
+            ),
+            spot,
+            leg_expiry or expiry,
+        )
     except Exception as error:
         print(f"signals: fallback chain fetch failed: {error}")
         return [], spot, expiry

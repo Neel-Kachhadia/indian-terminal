@@ -440,14 +440,33 @@ pub async fn get_payoff(
     legs: Vec<StrategyLeg>,
     spot: f64,
     spot_range_pct: Option<f64>,
+    risk_free_rate: Option<f64>,
+    dividend_yield: Option<f64>,
     state: tauri::State<'_, AppState>,
 ) -> Result<PayoffResult, String> {
     let url = "http://127.0.0.1:8765/payoff";
     let client = reqwest::Client::new();
+    // Rate: the backend tries a genuinely observed current FBIL rate first
+    // for every leg; an explicit caller override here is accepted only as a
+    // disclosed CONFIGURED_ASSUMPTION fallback, never silently.
+    // Dividend: this system has no observed dividend-yield source anywhere.
+    // A caller-supplied value is a real CONFIGURED_ASSUMPTION. Absent one
+    // (no UI wiring today), we apply 0% but must not call that "configured"
+    // -- nobody configured anything -- so it is disclosed as the honest
+    // ZERO_DIVIDEND_ASSUMPTION model default instead, surfaced back to the
+    // caller via `dividend_yield_source` in the response.
+    let (dividend, dividend_yield_source) = match dividend_yield {
+        Some(value) => (value, "CONFIGURED_ASSUMPTION"),
+        None => (0.0, "ZERO_DIVIDEND_ASSUMPTION"),
+    };
     let body = serde_json::json!({
         "legs": legs,
         "spot": spot,
         "spot_range_pct": spot_range_pct.unwrap_or(0.20),
+        "risk_free_rate": risk_free_rate,
+        "risk_free_rate_source": risk_free_rate.map(|_| "CONFIGURED_ASSUMPTION"),
+        "dividend_yield": dividend,
+        "dividend_yield_source": dividend_yield_source,
     });
 
     let response = client

@@ -58,6 +58,45 @@ def test_secret_scrubber_redacts_nested_payload_and_text() -> None:
 
 
 @pytest.mark.contract
+def test_ingest_bhav_rejects_self_declared_verified_provenance(monkeypatch: pytest.MonkeyPatch) -> None:
+    """decision_eligible_ohlcv (data/market_data_quality.py) trusts the raw
+    `source` column absolutely and labels any matching row OBSERVED_VERIFIED
+    with no re-derivation. Only db/bhav_loader.py may ever set the two
+    verified-bhavcopy sentinels, and only after actually parsing NSE's own
+    downloaded files. This generic HTTP ingestion surface must refuse to let
+    a caller self-declare that provenance for arbitrary row values it cannot
+    itself prove -- a correctness defect, not merely a hardening nicety."""
+    main = importlib.import_module("main")
+    monkeypatch.setattr(
+        main.credential_manager,
+        "status",
+        lambda: credential_manager.CredentialStatus(has_angel_credentials=False, has_groq_key=False),
+    )
+    submitted: list[dict] = []
+    monkeypatch.setattr(main, "submit_write", lambda operation, payload: submitted.append(payload) or {"inserted": len(payload["rows"])})
+
+    client = TestClient(main.app)
+    headers = {"X-Process-Token": main.PROCESS_TOKEN}
+    base_row = {
+        "symbol": "RELIANCE", "date": "2026-09-01",
+        "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 1000,
+    }
+
+    for reserved_source in ("NSE_EQUITY_BHAVCOPY", "NSE_INDEX_BHAVCOPY", "nse_equity_bhavcopy"):
+        response = client.post(
+            "/ingest/bhav", json=[{**base_row, "source": reserved_source}], headers=headers,
+        )
+        assert response.status_code == 422, reserved_source
+        assert submitted == []
+
+    response = client.post(
+        "/ingest/bhav", json=[{**base_row, "source": "MANUAL_UNVERIFIED"}], headers=headers,
+    )
+    assert response.status_code == 200
+    assert submitted and submitted[0]["rows"][0]["source"] == "MANUAL_UNVERIFIED"
+
+
+@pytest.mark.contract
 def test_local_api_auth_origin_size_and_safe_validation(monkeypatch: pytest.MonkeyPatch) -> None:
     main = importlib.import_module("main")
     monkeypatch.setattr(

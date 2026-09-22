@@ -54,6 +54,20 @@ def test_fresh_install_migrates_to_target(tmp_path: Path) -> None:
 
 
 @pytest.mark.contract
+def test_migration_preserves_existing_prior_backup_name(tmp_path: Path) -> None:
+    database = tmp_path / "terminal.db"
+    migrate_database(database, schema_initializer=_create_schema_objects_at, target_version=5)
+    earlier_backup = database.with_suffix(".db.pre-v5.bak")
+    earlier_backup.write_bytes(b"older rollback evidence")
+
+    migrate_database(database, schema_initializer=_create_schema_objects_at)
+
+    assert earlier_backup.read_bytes() == b"older rollback evidence"
+    assert database.with_suffix(f".db.pre-v5-to-v{TARGET_SCHEMA_VERSION}.bak").is_file()
+    assert version(database) == TARGET_SCHEMA_VERSION
+
+
+@pytest.mark.contract
 def test_migration_noop_does_not_require_writer_lease(tmp_path: Path, monkeypatch) -> None:
     """Reproduces a real live crash: the desktop backend calls
     `init_schema()` -> `migrate_database()` on every startup as a routine
@@ -136,6 +150,207 @@ def test_sparse_legacy_upgrade_preserves_rows_and_adds_columns(tmp_path: Path) -
         assert "schema_version" in columns
     finally:
         connection.close()
+
+
+@pytest.mark.recovery
+def test_migration_7_backfills_missing_rate_convention_columns_on_a_real_v6_database(tmp_path: Path) -> None:
+    """Reproduces a real production defect: risk_free_rate_history's CREATE
+    TABLE (MIGRATION_6_STATEMENTS) gained quote_convention/rate_convention/
+    conversion_method only after real databases had already migrated to
+    schema 6 under an earlier revision of that same statement --
+    migrate_database's `current == target: return` short-circuit means
+    editing an already-applied migration's SQL never reaches an
+    already-migrated database, and `CREATE TABLE IF NOT EXISTS` cannot
+    retrofit columns either. Simulate that exact historical state (a v6
+    database missing the three columns, with a real row already inserted)
+    and prove migration 7 adds them and backfills the one genuine
+    convention this system has ever written, without touching existing
+    row values."""
+    database = tmp_path / "terminal.db"
+    migrate_database(database, schema_initializer=_create_schema_objects_at, target_version=6)
+
+    connection = duckdb.connect(str(database))
+    try:
+        connection.execute("DROP INDEX IF EXISTS idx_rfr_date")
+        connection.execute("ALTER TABLE risk_free_rate_history DROP COLUMN quote_convention")
+        connection.execute("ALTER TABLE risk_free_rate_history DROP COLUMN rate_convention")
+        connection.execute("ALTER TABLE risk_free_rate_history DROP COLUMN conversion_method")
+        connection.execute("CREATE INDEX idx_rfr_date ON risk_free_rate_history(observation_date)")
+        connection.execute(
+            "INSERT INTO risk_free_rate_history VALUES "
+            "(DATE '2026-08-28', 7, '7 Days', 5.13, 0.0513, 'FBIL_TBILL_CURVE', "
+            "'https://www.fbil.org.in/x', TIMESTAMP '2026-08-28 17:30:00', "
+            "TIMESTAMP '2026-09-04 17:19:59')"
+        )
+    finally:
+        connection.close()
+
+    result = migrate_database(database, schema_initializer=_create_schema_objects_at)
+    assert result["migrated"] is True
+    assert version(database) == TARGET_SCHEMA_VERSION == 9
+
+    connection = duckdb.connect(str(database), read_only=True)
+    try:
+        row = connection.execute(
+            "SELECT quote_convention, rate_convention, conversion_method "
+            "FROM risk_free_rate_history "
+            "WHERE observation_date = DATE '2026-08-28' AND tenor_days = 7"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row == ("SIMPLE_ACT_365_YIELD", "CONTINUOUS_ACT_365", "LN_1_PLUS_SIMPLE_TIMES_T_OVER_T")
+
+
+@pytest.mark.recovery
+def test_migration_8_quarantines_real_iv_backfill_v1_rows_and_backfills_new_contract_columns(
+    tmp_path: Path,
+) -> None:
+    """Reproduces a second real production defect found on the same database:
+    iv_history's CREATE TABLE has grown from the original ~15-column
+    "iv-backfill-v1" era shape to the full 29-column iv-observation-v3
+    contract (observation_id, forward/dividend/rate provenance,
+    observation_kind, contract_version, ...) entirely inside this branch of
+    work, after a real production database had already reached schema 6
+    with 41k real rows in the old shape. Simulate that exact old table
+    (recreated minimally here, matching the columns actually observed in
+    production) and prove migration 8 quarantines those rows as LEGACY --
+    they must never validate or reach a decision path -- while the new
+    schema is fully usable for fresh writes afterward."""
+    from options.iv_contract import COLUMN_TYPES, validate_observation
+
+    database = tmp_path / "terminal.db"
+    migrate_database(database, schema_initializer=_create_schema_objects_at, target_version=6)
+
+    connection = duckdb.connect(str(database))
+    try:
+        connection.execute("DROP INDEX IF EXISTS idx_iv_observation_natural")
+        connection.execute("DROP INDEX IF EXISTS idx_iv_symbol_date")
+        connection.execute("ALTER TABLE iv_history RENAME TO iv_history_v3")
+        connection.execute(
+            """
+            CREATE TABLE iv_history (
+                symbol TEXT NOT NULL, expiry DATE NOT NULL, strike DOUBLE NOT NULL,
+                option_type TEXT NOT NULL, date DATE NOT NULL, iv DOUBLE NOT NULL,
+                contract_token TEXT, option_price DOUBLE, option_price_semantic TEXT,
+                option_price_source TEXT, option_price_quality TEXT, spot_price DOUBLE,
+                spot_source TEXT, spot_quality TEXT, risk_free_rate DOUBLE,
+                risk_free_tenor_days INTEGER, risk_free_source TEXT,
+                risk_free_observation_date DATE, time_to_expiry_years DOUBLE,
+                solver TEXT, solver_version TEXT, repriced_price DOUBLE,
+                repricing_abs_error DOUBLE, repricing_rel_error DOUBLE,
+                volume BIGINT, oi BIGINT, quality TEXT, reason TEXT,
+                created_at TIMESTAMP, calculation_version TEXT,
+                PRIMARY KEY (symbol, expiry, strike, option_type, date)
+            )
+            """
+        )
+        connection.execute("CREATE INDEX idx_iv_symbol ON iv_history(symbol, expiry)")
+        connection.execute(
+            "INSERT INTO iv_history "
+            "(symbol, expiry, strike, option_type, date, iv, option_price, quality, "
+            "calculation_version) VALUES "
+            "('NIFTY', DATE '2025-11-25', 22700.0, 'PE', DATE '2025-09-01', 0.139, "
+            "57.55, 'IV_VALID', 'iv-backfill-v1+iv-pricing-v1')"
+        )
+        connection.execute("DROP TABLE iv_history_v3")
+    finally:
+        connection.close()
+
+    result = migrate_database(database, schema_initializer=_create_schema_objects_at)
+    assert result["migrated"] is True
+    assert version(database) == TARGET_SCHEMA_VERSION == 9
+
+    connection = duckdb.connect(str(database), read_only=True)
+    try:
+        columns = {
+            row[0]
+            for row in connection.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = 'iv_history'"
+            ).fetchall()
+        }
+        assert set(COLUMN_TYPES).issubset(columns)
+        row = connection.execute(
+            "SELECT * FROM iv_history WHERE symbol = 'NIFTY' AND date = DATE '2025-09-01'"
+        ).fetchdf().to_dict("records")[0]
+    finally:
+        connection.close()
+
+    assert row["observation_kind"] == "LEGACY"
+    assert row["contract_version"] == "legacy-iv-backfill-v1"
+    assert row["quality"] == "SOURCE_UNVERIFIED"
+    assert "IV_VALID" in row["reason"]
+    with pytest.raises(ValueError):
+        validate_observation(row)
+
+
+@pytest.mark.recovery
+def test_migration_9_corrects_naive_rate_decimal_on_a_real_v8_database(tmp_path: Path) -> None:
+    """Reproduces a third real production defect found on the same
+    database: every risk_free_rate_history row persisted before this fix
+    stored rate_decimal = rate_pct / 100 (naive percent-to-decimal) instead
+    of the documented continuously-compounded ACT/365 conversion
+    TenorPoint.rate_decimal actually defines. db.write_service's own
+    math.isclose validation on write, and options.iv_backfill.
+    load_rate_curve's identical check on read, both already correctly
+    refuse a mismatched rate_decimal -- proven live: every historical rate
+    row was unusable for this reason alone, independent of how much
+    genuine FBIL curve history existed. Simulate that exact real state (a
+    v8 database with a naive rate_decimal, matching the real production
+    values byte for byte) and prove migration 9 recomputes the correct
+    value from the untouched, genuine rate_pct -- and that the corrected
+    value then actually passes the real (pure, I/O-free) tenor-selection
+    function's own provenance validation, used on every read."""
+    from data.risk_free_rate import TenorPoint, select_rate_for_tenor
+
+    database = tmp_path / "terminal.db"
+    migrate_database(database, schema_initializer=_create_schema_objects_at, target_version=8)
+
+    connection = duckdb.connect(str(database))
+    try:
+        connection.execute(
+            "INSERT INTO risk_free_rate_history VALUES "
+            "(DATE '2026-08-27', 7, '7 Days', 5.18, 0.0518, 'FBIL_TBILL_CURVE', "
+            "'https://www.fbil.org.in/wasdm/tbill/fetch?authenticated=false', "
+            "TIMESTAMP '2026-08-27 17:30:00', TIMESTAMP '2026-08-27 18:00:00', "
+            "'SIMPLE_ACT_365_YIELD', 'CONTINUOUS_ACT_365', 'LN_1_PLUS_SIMPLE_TIMES_T_OVER_T')"
+        )
+    finally:
+        connection.close()
+
+    result = migrate_database(database, schema_initializer=_create_schema_objects_at)
+    assert result["migrated"] is True
+    assert version(database) == TARGET_SCHEMA_VERSION == 9
+
+    connection = duckdb.connect(str(database), read_only=True)
+    try:
+        stored = connection.execute(
+            "SELECT rate_decimal FROM risk_free_rate_history "
+            "WHERE observation_date = DATE '2026-08-27' AND tenor_days = 7"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+
+    import datetime as dt
+
+    observation_date = dt.date(2026, 8, 27)
+    expected = TenorPoint(
+        observation_date=observation_date, tenor_days=7, tenor_label="7 Days",
+        rate_pct=5.18, published_at=None, source="", source_url="",
+    ).rate_decimal
+    assert stored != pytest.approx(0.0518)  # the naive value must be gone
+    assert stored == pytest.approx(expected, abs=1e-9)
+
+    from data.risk_free_rate import FBIL_SOURCE_ID, FBIL_TBILL_LATEST_URL
+
+    corrected_point = TenorPoint(
+        observation_date=observation_date, tenor_days=7, tenor_label="7 Days",
+        rate_pct=5.18, published_at=dt.datetime(2026, 8, 27, 12, 0, tzinfo=dt.timezone.utc),
+        source=FBIL_SOURCE_ID, source_url=FBIL_TBILL_LATEST_URL,
+        retrieved_at=dt.datetime(2026, 8, 27, 12, 30, tzinfo=dt.timezone.utc),
+    )
+    selection = select_rate_for_tenor([corrected_point], requested_days=10)
+    assert selection is not None
+    assert selection.rate_decimal == pytest.approx(float(stored), abs=1e-9)
 
 
 @pytest.mark.recovery
@@ -380,7 +595,7 @@ def test_case_a_fresh_database_gets_decision_eligible_view(tmp_path: Path) -> No
     database = tmp_path / "terminal.db"
     result = migrate_database(database, schema_initializer=_create_schema_objects_at)
     assert result["migrated"] is True
-    assert version(database) == TARGET_SCHEMA_VERSION == 5
+    assert version(database) == TARGET_SCHEMA_VERSION == 9
     assert _view_exists(database)
 
 
@@ -414,7 +629,7 @@ def test_case_c_historical_v4_database_missing_view_migrates_to_v5(tmp_path: Pat
     result = migrate_database(database, schema_initializer=_create_schema_objects_at)
 
     assert result["migrated"] is True
-    assert version(database) == TARGET_SCHEMA_VERSION == 5
+    assert version(database) == TARGET_SCHEMA_VERSION == 9
     assert _view_exists(database)
     connection = duckdb.connect(str(database), read_only=True)
     try:
@@ -501,3 +716,41 @@ def test_durable_replace_flushes_source_then_destination(
         ("flush", "destination"),
         ("parent", tmp_path.name),
     ]
+
+
+@pytest.mark.contract
+def test_case_e_v5_database_gains_iv_provenance_and_rate_history_at_v6(tmp_path: Path) -> None:
+    """A database already at schema v5 (before this remediation pass) must
+    gain the full iv_history provenance columns and the new
+    risk_free_rate_history table when migrated to v6, without losing its
+    existing (empty) iv_history table or any other v5 state."""
+    database = tmp_path / "terminal.db"
+    migrate_database(database, schema_initializer=_create_schema_objects_at, target_version=5)
+    assert version(database) == 5
+
+    result = migrate_database(database, schema_initializer=_create_schema_objects_at)
+
+    assert result["migrated"] is True
+    assert version(database) == TARGET_SCHEMA_VERSION == 9
+    connection = duckdb.connect(str(database), read_only=True)
+    try:
+        tables = {row[0] for row in connection.execute("SHOW TABLES").fetchall()}
+        assert "risk_free_rate_history" in tables
+        assert "iv_history" in tables
+        columns = {
+            row[0]
+            for row in connection.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = 'iv_history'"
+            ).fetchall()
+        }
+        for expected in (
+            "option_price", "option_price_semantic", "spot_price", "spot_source",
+            "risk_free_rate", "risk_free_tenor_days", "risk_free_source",
+            "time_to_expiry_years", "solver", "solver_version", "repriced_price",
+            "repricing_abs_error", "repricing_rel_error", "quality", "reason",
+            "created_at", "calculation_version",
+        ):
+            assert expected in columns
+        assert connection.execute("SELECT COUNT(*) FROM iv_history").fetchone()[0] == 0
+    finally:
+        connection.close()

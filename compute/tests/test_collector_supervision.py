@@ -235,3 +235,74 @@ def test_watchdog_attempts_round_trip(tmp_path) -> None:
     state_file = tmp_path / "watchdog_state.json"
     save_watchdog_attempts(state_file, [1.0, 2.0, 3.0])
     assert load_watchdog_attempts(state_file, now=3.0 + 10) == [1.0, 2.0, 3.0]
+
+
+# --- Watchdog writer-blind-spot: collector lease and WriterService heartbeat
+# are two independent threads inside the same collector-run process. A live
+# collector lease alone must never be read as proof the writer is alive. ----
+
+
+def test_watchdog_untouched_when_writer_health_not_checked() -> None:
+    """Byte-for-byte back-compat: omitting writer_responsive (None) must
+    behave exactly like the pre-existing collector-only policy."""
+    should_restart, reason = watchdog_decision(collector_running=True, attempts=[])
+    assert should_restart is False
+    assert "already running" in reason
+
+
+def test_watchdog_does_not_restart_a_healthy_writer() -> None:
+    """A sleeping-but-healthy collector (writer heartbeats continuously
+    regardless of collection activity) must never be mistaken for a dead
+    writer."""
+    should_restart, reason = watchdog_decision(
+        collector_running=True, attempts=[], writer_responsive=True,
+    )
+    assert should_restart is False
+    assert "already running" in reason
+
+
+def test_watchdog_restarts_when_writer_failed_under_a_live_collector_lease() -> None:
+    """The exact production incident: collector lease fresh, but
+    writer_runtime.state == FAILED (or its heartbeat is stale) in the same
+    process. Must escalate to a restart decision even though the collector
+    lease alone says 'running'."""
+    should_restart, reason = watchdog_decision(
+        collector_running=True, attempts=[], writer_responsive=False,
+    )
+    assert should_restart is True
+    assert "WriterService" in reason or "writer" in reason.lower()
+
+
+def test_watchdog_writer_failure_respects_bounded_restart_budget() -> None:
+    should_restart, reason = watchdog_decision(
+        collector_running=True,
+        attempts=[1.0, 2.0, 3.0, 4.0, 5.0],
+        max_restarts=5,
+        writer_responsive=False,
+    )
+    assert should_restart is False
+    assert "refusing to restart" in reason
+
+
+def test_watchdog_writer_failure_restart_window_exhaustion_then_recovery(tmp_path) -> None:
+    """Same bounded-restart mechanism as the collector-down path: exhausted
+    budget fails closed, then recovers once old attempts age out -- a single
+    shared restart accounting for both failure classes, not a second,
+    parallel restart budget."""
+    state_file = tmp_path / "watchdog_state.json"
+    now = 10_000.0
+    save_watchdog_attempts(state_file, [now - 1, now - 2, now - 3, now - 4, now - 5])
+    exhausted = load_watchdog_attempts(state_file, now=now)
+    should_restart, _reason = watchdog_decision(
+        collector_running=True, attempts=exhausted, writer_responsive=False,
+    )
+    assert should_restart is False
+
+    old_attempts = [now - WATCHDOG_RESTART_WINDOW_SECONDS - 1] * 5
+    save_watchdog_attempts(state_file, old_attempts)
+    recovered = load_watchdog_attempts(state_file, now=now)
+    assert recovered == []
+    should_restart, _reason = watchdog_decision(
+        collector_running=True, attempts=recovered, writer_responsive=False,
+    )
+    assert should_restart is True

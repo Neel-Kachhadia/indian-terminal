@@ -157,6 +157,9 @@ pub struct OptionLeg {
     pub gamma: Option<f64>,
     pub theta: Option<f64>,
     pub vega: Option<f64>,
+    pub pricing_model: Option<String>,
+    pub calculation_status: Option<String>,
+    pub iv_observation: Option<serde_json::Value>,
     pub source_type: QuoteSource,
     pub observed_at_ms: i64,
     pub received_at_ms: i64,
@@ -282,11 +285,20 @@ pub enum TradeAction {
 pub struct PayoffResult {
     pub spot_range: Vec<f64>,
     pub pnl_at_expiry: Vec<f64>,
-    pub pnl_today: Vec<f64>,
+    // Today's P&L / Greeks require both a rate and a dividend-yield input
+    // (a genuinely observed current rate, or an explicitly disclosed
+    // configured assumption) for every option leg; absent that, the backend
+    // reports them as None rather than fabricating a value, so these two
+    // must stay optional or deserializing a real "unavailable" response
+    // fails outright.
+    pub pnl_today: Option<Vec<f64>>,
+    pub analytical_status: String,
+    pub risk_free_rate_source: Option<String>,
+    pub dividend_yield_source: Option<String>,
     pub breakevens: Vec<f64>,
     pub max_profit: Option<f64>,
     pub max_loss: Option<f64>,
-    pub net_greeks: NetGreeks,
+    pub net_greeks: Option<NetGreeks>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ml.feature_engineering import MLContext, current_value, iv_reversion_target
+from ml.feature_engineering import MLContext, iv_reversion_target
 from ml.monitor import accuracy_for_model
 
 from .common import predict_classifier_artifact, train_classifier_artifact, untrained_output
@@ -88,20 +88,3 @@ def _estimator() -> Any:
         random_state=42,
         verbosity=-1,
     )
-
-
-def _heuristic_iv_direction(context: MLContext) -> str | None:
-    iv_rank = current_value(context, ["iv_rank", "options.iv_rank"])
-    if iv_rank is None:
-        return None
-    if iv_rank > 75:
-        return "CONTRACTING"
-    if iv_rank < 25:
-        return "EXPANDING"
-    return "STABLE"
-
-
-def _fallback_probabilities(direction: str | None) -> dict[str, float]:
-    if direction is None:
-        return {}
-    return {label: (0.58 if label == direction else 0.21) for label in CLASSES}

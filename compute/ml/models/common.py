@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import io
 import importlib.metadata
+import json
 import logging
 import math
 import platform
@@ -22,6 +23,7 @@ from data.paths import DATA_DIR
 from ml.calibrator import clipped_confidence, fit_calibrated_classifier, normalise_probabilities
 from ml.feature_engineering import MLContext, training_frame_with_target
 from ml.registry import (
+    _validate_metadata,
     feature_schema_version,
     latest_validated_record,
     read_verified_artifact_bytes,
@@ -462,11 +464,24 @@ def load_verified_artifact(
     artifact = sio.loads(serialized, trusted=trusted)
     if not isinstance(artifact, dict) or artifact.get("model_version") != record["model_version"]:
         raise RuntimeError("artifact metadata does not match registry")
+    _validate_metadata(artifact)
     if (
         artifact.get("serialization_format") != SERIALIZATION_FORMAT
         or artifact.get("artifact_format_version") != SERIALIZATION_VERSION
     ):
         raise RuntimeError("artifact serialization metadata is unsupported")
+    feature_columns = artifact.get("feature_columns") or artifact.get("method_names") or []
+    if len(feature_columns) != int(record["expected_feature_count"]):
+        raise RuntimeError("artifact feature count does not match registry")
+    for field in (
+        "model_id", "symbol", "feature_schema_version", "dataset_fingerprint",
+    ):
+        if str(artifact.get(field)) != str(record.get(field)):
+            raise RuntimeError(f"artifact {field} does not match registry")
+    if json.dumps(artifact.get("runtime_versions"), sort_keys=True) != str(
+        record.get("runtime_versions")
+    ):
+        raise RuntimeError("artifact runtime versions do not match registry")
     return path, artifact
 
 

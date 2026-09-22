@@ -502,6 +502,79 @@ def test_slow_dispatch_keeps_heartbeat_fresh_and_submitter_connected(
     assert results == [{"completed": True}]
 
 
+def test_completed_replay_never_takes_queue_write_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "terminal.db"
+    queue = tmp_path / "writer.sqlite"
+    duckdb.connect(database).close()
+    monkeypatch.setattr(write_service, "HEARTBEAT_INTERVAL_SECONDS", 60.0)
+    service = WriterService(database, queue_path=queue)
+    service.start()
+    try:
+        first = submit_write(
+            WriteOperation.UPSERT_FII_DII,
+            _fii_payload(),
+            database=database,
+            queue_path=queue,
+            request_id="completed-replay",
+        )
+        assert first == {"persisted": True, "date": "2026-08-21"}
+
+        original = write_service._queue_connection
+        modes: list[bool] = []
+
+        def recording_connection(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
+            modes.append(read_only)
+            return original(path, read_only=read_only)
+
+        monkeypatch.setattr(write_service, "_queue_connection", recording_connection)
+        replay = submit_write(
+            WriteOperation.UPSERT_FII_DII,
+            _fii_payload(),
+            database=database,
+            queue_path=queue,
+            request_id="completed-replay",
+        )
+        assert replay == first
+        assert modes
+        assert all(modes), "a completed replay must use only read-only queue connections"
+    finally:
+        service.stop()
+
+
+def test_transient_queue_lock_does_not_kill_heartbeat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "terminal.db"
+    queue = tmp_path / "writer.sqlite"
+    duckdb.connect(database).close()
+    monkeypatch.setattr(write_service, "HEARTBEAT_INTERVAL_SECONDS", 0.01)
+    service = WriterService(database, queue_path=queue)
+    original_heartbeat = service._heartbeat
+    recovered = threading.Event()
+    attempts = 0
+
+    def flaky_heartbeat() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise sqlite3.OperationalError("database is locked")
+        original_heartbeat()
+        recovered.set()
+
+    service._heartbeat = flaky_heartbeat  # type: ignore[method-assign]
+    service.start()
+    try:
+        assert recovered.wait(timeout=1)
+        assert service._thread is not None and service._thread.is_alive()
+        assert writer_service_status(queue)["state"] == "RUNNING"
+    finally:
+        service.stop()
+
+
 def test_timed_out_reader_is_cancelled_instead_of_poisoning_queue(tmp_path: Path) -> None:
     """Exact live failure: one long write occupied the writer for hours and
     every 30-second collector/API read remained PENDING forever.  A caller
@@ -743,6 +816,8 @@ def test_raw_duckdb_connect_sites_are_exactly_owned_and_classified() -> None:
         ("db/migrations.py", "_record_migration", False),
         ("db/migrations.py", "_apply_sql_migration", False),
         ("db/migrations.py", "_apply_decision_eligible_view_migration", False),
+        ("db/migrations.py", "_apply_iv_history_v3_contract_migration", False),
+        ("db/migrations.py", "_apply_risk_free_rate_decimal_correction_migration", False),
         ("db/migrations.py", "_current_version", True),
         ("db/migrations.py", "_validate_database", True),
         ("db/write_service.py", "WriterService.start", False),
@@ -890,6 +965,11 @@ def test_live_owner_is_never_bypassed_even_with_stale_heartbeat(tmp_path: Path) 
         process_start_time=own_start,
         heartbeat_at="2020-01-01T00:00:00+00:00",
     )
+
+    status = writer_service_status(queue)
+    assert status["owner_process_live"] is True
+    assert status["live"] is False
+    assert status["responsive"] is False
 
     service = WriterService(database, queue_path=queue)
     with pytest.raises(WriterServiceError, match="already active"):

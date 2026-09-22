@@ -8,7 +8,8 @@ import numpy as np
 import pandas as pd
 
 
-RISK_FREE_RATE = 0.065
+CONFIGURED_ANALYTICAL_RISK_FREE_RATE = 0.065
+RISK_FREE_RATE_SOURCE = "CONFIGURED_ASSUMPTION"
 
 
 def compute_metrics(
@@ -63,6 +64,9 @@ def compute_metrics(
         "total_return_pct": round(total_return_pct, 3),
         "net_return_pct": round(total_return_pct, 3),
         "annualised_return_pct": round(annualised_return_pct, 3),
+        "risk_free_rate_annual": CONFIGURED_ANALYTICAL_RISK_FREE_RATE,
+        "risk_free_rate_source": RISK_FREE_RATE_SOURCE,
+        "risk_free_rate_is_observed_market_data": False,
         "monthly_returns": monthly,
         "weekly_returns": weekly,
         "daily_returns": [round(float(value * 100.0), 5) for value in daily_returns],
@@ -245,7 +249,7 @@ def _benchmark_stats(
 def _sharpe(returns: np.ndarray) -> float:
     if returns.size < 2:
         return 0.0
-    excess = returns - RISK_FREE_RATE / 252.0
+    excess = returns - CONFIGURED_ANALYTICAL_RISK_FREE_RATE / 252.0
     std = float(np.std(returns, ddof=1))
     return float(np.mean(excess) / std * math.sqrt(252.0)) if std > 1e-12 else 0.0
 
@@ -254,7 +258,7 @@ def _sortino(returns: np.ndarray, downside: np.ndarray) -> float:
     if returns.size < 2 or downside.size < 2:
         return 0.0
     downside_std = float(np.std(downside, ddof=1))
-    return float((np.mean(returns) - RISK_FREE_RATE / 252.0) / downside_std * math.sqrt(252.0)) if downside_std > 1e-12 else 0.0
+    return float((np.mean(returns) - CONFIGURED_ANALYTICAL_RISK_FREE_RATE / 252.0) / downside_std * math.sqrt(252.0)) if downside_std > 1e-12 else 0.0
 
 
 def _omega(returns: np.ndarray) -> float:
@@ -285,7 +289,7 @@ def _treynor(returns: np.ndarray, benchmark_returns: Any, annualised_return_pct:
     covariance = float(np.cov(returns[-size:], bench[-size:])[0, 1])
     variance = float(np.var(bench[-size:], ddof=1))
     beta = covariance / variance if variance > 1e-12 else 0.0
-    return (annualised_return_pct / 100.0 - RISK_FREE_RATE) / beta if abs(beta) > 1e-12 else 0.0
+    return (annualised_return_pct / 100.0 - CONFIGURED_ANALYTICAL_RISK_FREE_RATE) / beta if abs(beta) > 1e-12 else 0.0
 
 
 def _kappa_3(returns: np.ndarray) -> float:
@@ -293,7 +297,7 @@ def _kappa_3(returns: np.ndarray) -> float:
         return 0.0
     downside = np.minimum(returns, 0.0)
     lpm3 = float(np.mean(np.abs(downside) ** 3)) ** (1.0 / 3.0)
-    return float((np.mean(returns) - RISK_FREE_RATE / 252.0) / lpm3 * math.sqrt(252.0)) if lpm3 > 1e-12 else 0.0
+    return float((np.mean(returns) - CONFIGURED_ANALYTICAL_RISK_FREE_RATE / 252.0) / lpm3 * math.sqrt(252.0)) if lpm3 > 1e-12 else 0.0
 
 
 def _gain_to_pain(returns: np.ndarray) -> float:

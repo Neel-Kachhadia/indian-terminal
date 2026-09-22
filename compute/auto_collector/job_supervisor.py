@@ -54,6 +54,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 COMPUTE_DIR = Path(__file__).resolve().parents[1]
 
@@ -69,6 +70,7 @@ COLLECTOR_TASK_NAME = "BharatTerminal_SmartCollector"
 # which is unnecessary risk for an unattended production binary when the
 # real system32 location is always known ahead of time.
 SCHTASKS = (Path(os.environ.get("SystemRoot", r"C:\Windows")).resolve() / "System32" / "schtasks.exe").resolve()
+TASKKILL = (Path(os.environ.get("SystemRoot", r"C:\Windows")).resolve() / "System32" / "taskkill.exe").resolve()
 
 MAX_RESTARTS = 5
 RESTART_WINDOW_SECONDS = 60 * 60
@@ -449,6 +451,30 @@ def run() -> int:
         watchdog_stop.set()
 
 
+def _terminate_stale_writer_owner(pid: int) -> tuple[bool, str]:
+    """Terminate exactly the one PID recorded as the writer_runtime owner --
+    never a swept/guessed target -- so a fresh collector-run can claim a
+    clean lease afterward with no split-brain owner. This automates the
+    manual `taskkill /PID <owner> /F` recovery step already proven safe live
+    in production for exactly this failure (writer FAILED/stale while its
+    process still holds the collector lease)."""
+    try:
+        result = subprocess.run(
+            [str(TASKKILL), "/PID", str(pid), "/F"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return False, str(error)
+    # taskkill exit 128 == "PID not found" -- already gone is a successful
+    # outcome here: there is no live owner left to conflict with a restart.
+    if result.returncode in (0, 128):
+        return True, (result.stdout.strip() or result.stderr.strip() or "terminated")
+    return False, (result.stderr.strip() or f"taskkill exited {result.returncode}")
+
+
 def run_watchdog_check() -> int:
     """Entry point for the `collector-watchdog` Task Scheduler task (see
     module docstring's "Watchdog" section in supervision.py for why this
@@ -459,10 +485,27 @@ def run_watchdog_check() -> int:
     MultipleInstancesPolicy=IgnoreNew (set by setup_autostart.py); safe to
     run while a real collector is alive because it only ever *asks* Task
     Scheduler to start the main task, which has its own IgnoreNew guard, and
-    it does not even ask unless status_snapshot() says the collector is down.
+    it does not even ask unless status_snapshot() says the collector is down
+    OR (see below) the collector lease is live but its DuckDB WriterService
+    is provably not.
+
+    Blind-spot fix: `collector_running` (the collector-lease heartbeat) and
+    the WriterService's own `writer_runtime.state`/heartbeat are two
+    independent signals from two independent threads inside the SAME
+    collector-run process (see `smart_collector._start_writer_service_if_
+    needed`). A live production incident proved one can die (writer_runtime
+    left in state FAILED, heartbeat frozen for hours) while the other keeps
+    renewing fine -- this watchdog previously only ever checked the
+    collector-lease side, so it saw `collector_running=True` and did
+    nothing. Extending THIS existing watchdog (not a second, parallel
+    watchdog) to also read `write_service.writer_service_status()` -- the
+    same single-source-of-truth every other caller in this codebase already
+    uses to decide writer liveness -- closes the gap without inventing a new
+    liveness signal.
     """
     from auto_collector import supervision
-    from data.paths import DATA_DIR
+    from data.paths import DATA_DIR, DUCKDB_PATH
+    from db.write_service import queue_path_for, writer_service_status
 
     _configure_lifecycle_logging("collector-watchdog")
     log.info("collector watchdog starting")
@@ -470,18 +513,55 @@ def run_watchdog_check() -> int:
     state_file = DATA_DIR / "collector_watchdog_state.json"
 
     snapshot = supervision.status_snapshot(log_db)
+    collector_running = bool(snapshot.get("collector_running"))
+
+    # Only worth checking the writer once the collector lease itself is
+    # live: a dead collector already fails closed via collector_running
+    # alone (its WriterService necessarily died with the same process), and
+    # this keeps the writer-health read off the hot path of the common
+    # "collector is simply down" case.
+    writer_status: dict[str, Any] | None = None
+    writer_responsive: bool | None = None
+    if collector_running:
+        writer_status = writer_service_status(queue_path_for(DUCKDB_PATH))
+        writer_responsive = bool(writer_status.get("responsive"))
+
     now = time.time()
     attempts = supervision.load_watchdog_attempts(state_file, now=now)
     should_restart, reason = supervision.watchdog_decision(
-        collector_running=bool(snapshot.get("collector_running")),
+        collector_running=collector_running,
         attempts=attempts,
+        writer_responsive=writer_responsive,
     )
-    log.info("watchdog check: collector_running=%s decision=%s (%s)", snapshot.get("collector_running"), should_restart, reason)
+    log.info(
+        "watchdog check: collector_running=%s writer_status=%s decision=%s (%s)",
+        collector_running, writer_status, should_restart, reason,
+    )
     if not should_restart:
         return 0
 
     attempts.append(now)
     supervision.save_watchdog_attempts(state_file, attempts)
+
+    if collector_running and writer_status is not None:
+        # The collector lease is still live, so Task Scheduler's own
+        # MultipleInstancesPolicy=IgnoreNew on COLLECTOR_TASK_NAME would
+        # silently refuse a fresh instance below -- the degraded owner must
+        # be terminated first, same as the manual recovery this automates.
+        owner_pid = writer_status.get("pid")
+        if owner_pid is not None:
+            terminated, detail = _terminate_stale_writer_owner(int(owner_pid))
+            if not terminated:
+                log.error(
+                    "watchdog: failed to terminate unresponsive writer owner pid=%s: %s",
+                    owner_pid, detail,
+                )
+                return 1
+            log.warning(
+                "watchdog: terminated unresponsive writer owner pid=%s (%s)",
+                owner_pid, detail,
+            )
+
     try:
         result = subprocess.run(
             [str(SCHTASKS), "/run", "/tn", COLLECTOR_TASK_NAME],
@@ -498,7 +578,7 @@ def run_watchdog_check() -> int:
             "watchdog: schtasks /run exited %s: %s", result.returncode, result.stderr.strip()
         )
         return result.returncode
-    log.warning("watchdog: collector was down, requested restart via Task Scheduler")
+    log.warning("watchdog: requested collector restart via Task Scheduler (%s)", reason)
     return 0
 
 

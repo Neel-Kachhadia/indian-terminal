@@ -319,23 +319,14 @@ class HistoricalOptionsPricer:
         strike: float,
         dte: int,
         option_type: str,
-        risk_free: float = 0.065,
+        risk_free: float | None = None,
     ) -> float | None:
-        try:
-            from py_vollib.black_scholes.implied_volatility import implied_volatility
-
-            flag = "c" if option_type.strip().upper() == "CE" else "p"
-            iv = implied_volatility(
-                float(option_price),
-                float(spot),
-                float(strike),
-                max(int(dte), 1) / 365.0,
-                risk_free,
-                flag,
-            )
-        except Exception:
+        """Analytical utility only. Explicit rate required; no market provenance."""
+        from options.iv_pricing import option_flag, solve_iv_with_provenance, SolveStatus
+        if risk_free is None or dte <= 0 or option_flag(option_type) is None:
             return None
-        return float(iv) if math.isfinite(iv) and 0.01 <= iv <= 5.0 else None
+        result = solve_iv_with_provenance(option_flag(option_type), option_price, spot, strike, dte / 365.0, risk_free)
+        return result.iv if result.status is SolveStatus.OK else None
 
     def find_nearest_expiry(
         self,

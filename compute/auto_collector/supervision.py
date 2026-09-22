@@ -655,10 +655,28 @@ def watchdog_decision(
     collector_running: bool,
     attempts: list[float],
     max_restarts: int = WATCHDOG_MAX_RESTARTS,
+    writer_responsive: bool | None = None,
 ) -> tuple[bool, str]:
     """Pure policy decision, independent of I/O so it's exhaustively
-    unit-testable. Returns (should_restart, reason)."""
-    if collector_running:
+    unit-testable. Returns (should_restart, reason).
+
+    `writer_responsive` closes the blind spot proven live in production: the
+    collector-lease heartbeat (`collector_running`, above) and the DuckDB
+    WriterService's own `writer_runtime.state`/heartbeat (see
+    `db.write_service.writer_service_status()`) are two independent signals
+    from two independent threads inside the SAME collector-run process. One
+    thread dying does not kill the other, so a live collector lease alone
+    does not prove the writer is alive. Pass `writer_responsive=None` (the
+    default) when the caller has not checked writer health at all -- this
+    preserves the pre-existing collector-only policy exactly, byte for byte.
+    Pass an explicit bool once checked: only `False` (genuinely proven
+    unresponsive/FAILED/stale-heartbeat) escalates a live collector lease
+    into a restart decision; a sleeping-but-healthy collector (writer
+    heartbeats continuously regardless of collection activity) always reads
+    `True` and must never be mistaken for a dead writer.
+    """
+    writer_dead_under_live_collector = collector_running and writer_responsive is False
+    if collector_running and not writer_dead_under_live_collector:
         return False, "collector is already running"
     if len(attempts) >= max_restarts:
         return False, (
@@ -666,5 +684,11 @@ def watchdog_decision(
             f"{WATCHDOG_RESTART_WINDOW_SECONDS}s; refusing to restart again "
             "(failing closed rather than restart-looping a persistently "
             "broken collector)"
+        )
+    if writer_dead_under_live_collector:
+        return True, (
+            "collector lease is live but its DuckDB WriterService is "
+            "unresponsive (FAILED state or stale heartbeat); treating the "
+            "worker as unhealthy and restart budget remains"
         )
     return True, "collector is not running and restart budget remains"

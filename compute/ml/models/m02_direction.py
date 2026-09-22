@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ml.feature_engineering import MLContext, current_value, direction_target
+from ml.feature_engineering import MLContext, direction_target
 from ml.monitor import accuracy_for_model
 
 from .common import predict_classifier_artifact, train_classifier_artifact, untrained_output
@@ -103,25 +103,3 @@ def _estimator() -> Any:
         random_state=42,
         verbosity=-1,
     )
-
-
-def _heuristic_direction(context: MLContext) -> str | None:
-    score = current_value(context, ["overall_score", "composite.overall_score"])
-    flow = current_value(context, ["fii_net_cash", "fii_dii.fii_net_cash"])
-    if score is not None:
-        if score >= 56:
-            return "UP"
-        if score <= 44:
-            return "DOWN"
-    if flow is not None:
-        if flow > 500:
-            return "UP"
-        if flow < -500:
-            return "DOWN"
-    return "FLAT" if context.available_rows else None
-
-
-def _fallback_probabilities(direction: str | None) -> dict[str, float]:
-    if direction is None:
-        return {}
-    return {label: (0.55 if label == direction else 0.225) for label in CLASSES}

@@ -172,18 +172,20 @@ def latest_validated_record(model_id: str, symbol: str) -> dict[str, Any] | None
     with _connect(read_only=True) as connection:
         if not _supports_safe_artifacts(connection):
             return None
-        row = connection.execute(
+        rows = connection.execute(
             """
             SELECT * FROM model_registry
             WHERE model_id = ? AND symbol = ? AND validation_status = 'VALIDATED'
               AND retired_at IS NULL
               AND serialization_format = 'SKOPS' AND artifact_format_version = 1
             ORDER BY training_timestamp DESC, registered_at DESC
-            LIMIT 1
             """,
             [model_id, symbol],
-        ).fetchone()
-    return dict(row) if row else None
+        ).fetchall()
+    return next(
+        (record for row in rows if _record_meets_current_contract(record := dict(row))),
+        None,
+    )
 
 
 def validated_records(model_ids: list[str] | None = None) -> list[dict[str, Any]]:
@@ -202,7 +204,7 @@ def validated_records(model_ids: list[str] | None = None) -> list[dict[str, Any]
             f"SELECT * FROM model_registry WHERE {where} ORDER BY training_timestamp DESC",
             parameters,
         ).fetchall()
-    return [dict(row) for row in rows]
+    return [record for row in rows if _record_meets_current_contract(record := dict(row))]
 
 
 def registry_health() -> dict[str, Any]:
@@ -345,10 +347,60 @@ def _validate_metadata(artifact: dict[str, Any]) -> None:
     if missing:
         raise RuntimeError(f"model metadata missing fields: {', '.join(missing)}")
     if not (
-        str(artifact["train_end"]) < str(artifact["validation_start"])
-        and str(artifact["validation_end"]) < str(artifact["test_start"])
+        str(artifact["train_start"]) <= str(artifact["train_end"])
+        < str(artifact["validation_start"])
+        <= str(artifact["validation_end"])
+        < str(artifact["test_start"])
+        <= str(artifact["test_end"])
     ):
         raise RuntimeError("model temporal split boundaries overlap")
+    if not isinstance(artifact["runtime_versions"], dict) or not artifact["runtime_versions"]:
+        raise RuntimeError("model runtime version provenance missing")
+    if int(artifact["expected_feature_count"]) <= 0:
+        raise RuntimeError("model expected feature count must be positive")
+    if not _valid_fingerprint(artifact["dataset_fingerprint"]):
+        raise RuntimeError("model dataset fingerprint is invalid")
+
+
+def _record_meets_current_contract(record: dict[str, Any]) -> bool:
+    required = (
+        "model_id", "model_version", "symbol", "universe", "training_data_horizon",
+        "feature_schema_version", "training_timestamp", "artifact_path", "artifact_hash",
+        "artifact_size", "code_version", "release_version", "fallback_status",
+        "train_start", "train_end", "validation_start", "validation_end", "test_start",
+        "test_end", "train_rows", "validation_sample_count", "test_sample_count",
+        "calibration_sample_count", "dataset_fingerprint", "runtime_versions",
+        "expected_feature_count", "registered_at",
+    )
+    if any(record.get(field) in (None, "") for field in required):
+        return False
+    try:
+        runtime_versions = json.loads(str(record["runtime_versions"]))
+        chronological = (
+            str(record["train_start"]) <= str(record["train_end"])
+            < str(record["validation_start"])
+            <= str(record["validation_end"])
+            < str(record["test_start"])
+            <= str(record["test_end"])
+        )
+        return bool(
+            chronological
+            and isinstance(runtime_versions, dict)
+            and runtime_versions
+            and int(record["expected_feature_count"]) > 0
+            and int(record["artifact_size"]) > 0
+            and _valid_fingerprint(record["dataset_fingerprint"])
+            and len(str(record["artifact_hash"])) == 64
+            and str(record["fallback_status"]) in FALLBACK_STATUSES
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def _valid_fingerprint(value: Any) -> bool:
+    text = str(value)
+    digest = text.removeprefix("sha256:")
+    return len(digest) == 64 and all(character in "0123456789abcdefABCDEF" for character in digest)
 
 
 def _set_status(model_version: str, status: str) -> None:

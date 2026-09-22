@@ -437,6 +437,10 @@ def _normalise_runtime_status(output: dict[str, Any]) -> None:
         return
     prediction = output.get("prediction")
     if output.get("is_trained") is True and prediction is not None:
+        if output.get("feature_schema_compatible") is False:
+            output["status"] = "UNAVAILABLE"
+            output["reason_code"] = "FEATURE_SCHEMA_INCOMPATIBLE"
+            return
         attribution = output.get("model_attribution")
         # A component served from PROXY_SYMBOL's artifact (see
         # ml/models/common.py::load_latest_artifact's allow_proxy candidate

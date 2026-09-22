@@ -52,7 +52,15 @@ def _database(root: Path) -> Path:
             """
         )
         connection.execute(
-            "INSERT INTO iv_history VALUES ('NIFTY', '2026-08-25', 25000, 'CE', '2026-08-21', 12)"
+            """
+            INSERT INTO iv_history
+                (observation_id, symbol, underlying, expiry, strike, option_type,
+                 date, iv, source, quality, calculation_status,
+                 observation_kind, contract_version)
+            VALUES ('health-fixture-unverified', 'NIFTY', 'NIFTY', '2026-08-25',
+                    25000, 'CE', '2026-08-21', 0.12, 'TEST',
+                    'SOURCE_UNVERIFIED', 'SOURCE_UNVERIFIED', 'LEGACY', 'legacy-test')
+            """
         )
         connection.execute(
             "INSERT INTO signals_history VALUES ('2026-08-21', 'test', 'NIFTY', 1)"

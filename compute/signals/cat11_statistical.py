@@ -5,6 +5,8 @@ from typing import Any
 
 import numpy as np
 
+from data.risk_free_rate import latest_available_rate
+
 from .common import (
     current_price,
     historical_vol,
@@ -111,6 +113,7 @@ def _compute_values(ctx: SignalContext) -> tuple[dict[str, Any], dict[str, Any]]
     if summary.get("atm_strike") is not None and atm_call and atm_put and ctx.spot > 0:
         synthetic = atm_call["ltp"] - atm_put["ltp"] + summary["atm_strike"] - ctx.spot
     vol_risk = atm_iv * 100.0 - hv20_value if atm_iv is not None and hv20_value is not None else None
+    risk_free_rate = _current_risk_free_rate(ctx.computed_at)
 
     values = {
         "price_z_score_20d": z_score(price, close.dropna().tail(20).tolist()),
@@ -118,8 +121,8 @@ def _compute_values(ctx: SignalContext) -> tuple[dict[str, Any], dict[str, Any]]
         "returns_skewness_20d": float(ret.tail(20).skew()) if len(ret) >= 20 else None,
         "returns_kurtosis_20d": float(ret.tail(20).kurt()) if len(ret) >= 20 else None,
         "autocorrelation_lag1": float(ret.tail(60).autocorr(lag=1)) if len(ret) >= 20 else None,
-        "sharpe_60d": _sharpe(ret.tail(60)),
-        "sortino_60d": _sortino(ret.tail(60)),
+        "sharpe_60d": _sharpe(ret.tail(60), risk_free_rate),
+        "sortino_60d": _sortino(ret.tail(60), risk_free_rate),
         "max_drawdown_30d": _max_drawdown(close.tail(30)),
         "max_drawdown_90d": _max_drawdown(close.tail(90)),
         "calmar_ratio": _calmar(close.tail(252)),
@@ -201,20 +204,36 @@ def _vol_regime(hv: float | None) -> str | None:
     return "normal"
 
 
-def _sharpe(ret: Any) -> float | None:
-    if len(ret.dropna()) < 10:
+# Representative short-tenor annualized rate used only for daily-return
+# ratios (Sharpe/Sortino), which have no single option expiry to key off
+# of. FBIL curve fetch, nearest-tenor matched, MAX_RATE_AGE_DAYS-gated --
+# same canonical source and staleness contract as the IV path, never a
+# hardcoded constant. Genuinely unavailable/stale -> None, never a fallback.
+SHARPE_RATE_TENOR_YEARS = 30 / 365.0
+
+
+def _current_risk_free_rate(as_of: Any) -> float | None:
+    try:
+        selection = latest_available_rate(SHARPE_RATE_TENOR_YEARS, as_of=as_of)
+    except Exception:
         return None
-    excess = ret - 0.065 / 252.0
+    return selection.rate_decimal if selection is not None else None
+
+
+def _sharpe(ret: Any, risk_free_rate: float | None = None) -> float | None:
+    if len(ret.dropna()) < 10 or risk_free_rate is None:
+        return None
+    excess = ret - risk_free_rate / 252.0
     std = excess.std(ddof=0)
     return float(excess.mean() / std * math.sqrt(252.0)) if std > 1e-12 else None
 
 
-def _sortino(ret: Any) -> float | None:
-    if len(ret.dropna()) < 10:
+def _sortino(ret: Any, risk_free_rate: float | None = None) -> float | None:
+    if len(ret.dropna()) < 10 or risk_free_rate is None:
         return None
     downside = ret[ret < 0]
     std = downside.std(ddof=0)
-    return float((ret.mean() - 0.065 / 252.0) / std * math.sqrt(252.0)) if std and std > 1e-12 else None
+    return float((ret.mean() - risk_free_rate / 252.0) / std * math.sqrt(252.0)) if std and std > 1e-12 else None
 
 
 def _max_drawdown(close: Any) -> float | None:

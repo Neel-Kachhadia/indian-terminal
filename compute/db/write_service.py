@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import threading
@@ -154,6 +155,8 @@ class WriteOperation(StrEnum):
     REFRESH_INSTRUMENT_MASTER = "REFRESH_INSTRUMENT_MASTER"
     UPSERT_FII_DII = "UPSERT_FII_DII"
     UPSERT_EQUITY_SECTORS = "UPSERT_EQUITY_SECTORS"
+    UPSERT_IV_OBSERVATIONS = "UPSERT_IV_OBSERVATIONS"
+    UPSERT_RISK_FREE_RATE_CURVE = "UPSERT_RISK_FREE_RATE_CURVE"
     BACKFILL_SIGNALS = "BACKFILL_SIGNALS"
     COMPUTE_BIF = "COMPUTE_BIF"
     RUN_OHLC_FORECASTS = "RUN_OHLC_FORECASTS"
@@ -237,6 +240,9 @@ class ReadOperation(StrEnum):
     LOAD_ML_FORECAST_INPUT_FRAME = "LOAD_ML_FORECAST_INPUT_FRAME"
     LOAD_DATA_SUMMARY_STATS = "LOAD_DATA_SUMMARY_STATS"
     LOAD_HEALTH_SNAPSHOT = "LOAD_HEALTH_SNAPSHOT"
+    LOAD_RISK_FREE_RATE_CURVE = "LOAD_RISK_FREE_RATE_CURVE"
+    LOAD_IV_HISTORY_ROWS_FOR_SYMBOL = "LOAD_IV_HISTORY_ROWS_FOR_SYMBOL"
+    COUNT_IV_HISTORY_ROWS = "COUNT_IV_HISTORY_ROWS"
 
 
 # (table, date_column) for each dataset name a READ request may name. Mirrors
@@ -475,12 +481,23 @@ class WriterService:
             self._heartbeat_stop.set()
 
     def _heartbeat_loop(self) -> None:
-        try:
-            while not self._heartbeat_stop.wait(HEARTBEAT_INTERVAL_SECONDS):
+        while not self._heartbeat_stop.wait(HEARTBEAT_INTERVAL_SECONDS):
+            try:
                 self._heartbeat()
-        except BaseException as error:
-            self._stop.set()
-            self._fail_runtime(error, active_request=None)
+            except sqlite3.OperationalError as error:
+                # Queue writers can briefly hold SQLite's single-writer lock.
+                # Missing one heartbeat is not a terminal DuckDB failure; a
+                # genuinely wedged queue will age past HEARTBEAT_STALE_SECONDS
+                # and the watchdog will fail it closed.
+                if "locked" in str(error).lower():
+                    continue
+                self._stop.set()
+                self._fail_runtime(error, active_request=None)
+                return
+            except BaseException as error:
+                self._stop.set()
+                self._fail_runtime(error, active_request=None)
+                return
 
     def _ensure_applied_request_ledger(self, connection: duckdb.DuckDBPyConnection) -> None:
         connection.execute(
@@ -514,6 +531,18 @@ class WriterService:
                 if str(applied[0]) != operation_text or str(applied[1]) != payload_sha256:
                     raise WriterRequestFailed("idempotency key reused with different request")
                 result = json.loads(str(applied[2]))
+                # A durable request replay proves this attempt performed no
+                # new IV inserts. Returning the original cached `upserted`
+                # count made callers report an already-applied batch as new
+                # rows even though row-level persistence was correctly a
+                # no-op. Preserve generic cached-result semantics, but make
+                # this insertion-count API truthful for every submission.
+                if (
+                    operation_text == WriteOperation.UPSERT_IV_OBSERVATIONS.value
+                    and isinstance(result, dict)
+                    and "upserted" in result
+                ):
+                    result = {**result, "upserted": 0}
                 connection.execute("COMMIT")
                 return result
 
@@ -629,38 +658,54 @@ def submit_write(
     if len(encoded.encode("utf-8")) > 16 * 1024 * 1024:
         raise WriterBackpressureError("writer request exceeds 16 MiB payload limit")
     path = Path(queue_path or queue_path_for(database)).resolve()
-    _ensure_queue_schema(path)
     _assert_writer_live(path, accept_new=True)
     stable_request_id = str(request_id or uuid.uuid4()).strip()
     if not stable_request_id or len(stable_request_id) > 200:
         raise ValueError("request_id must contain 1..200 characters")
-    with _queue_connection(path) as connection:
-        connection.execute("BEGIN IMMEDIATE")
+    # Completed idempotency replays are the common backfill-resume path. Read
+    # them without taking SQLite's global write lock so sustained replays
+    # cannot starve the independent writer heartbeat.
+    with _queue_connection(path, read_only=True) as connection:
         existing = connection.execute(
             "SELECT operation, payload_json FROM writer_requests WHERE request_id = ?",
             [stable_request_id],
         ).fetchone()
-        if existing is not None:
-            if str(existing[0]) != operation.value or str(existing[1]) != encoded:
-                connection.rollback()
-                raise WriterRequestFailed("idempotency key reused with different request")
-            connection.commit()
-        else:
-            queued = int(
+
+    replayed_request = existing is not None
+    if existing is not None:
+        if str(existing[0]) != operation.value or str(existing[1]) != encoded:
+            raise WriterRequestFailed("idempotency key reused with different request")
+    else:
+        with _queue_connection(path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            # Recheck under the write lock: another submitter may have inserted
+            # the same stable request id after our read-only fast path.
+            existing = connection.execute(
+                "SELECT operation, payload_json FROM writer_requests WHERE request_id = ?",
+                [stable_request_id],
+            ).fetchone()
+            if existing is not None:
+                replayed_request = True
+                if str(existing[0]) != operation.value or str(existing[1]) != encoded:
+                    connection.rollback()
+                    raise WriterRequestFailed("idempotency key reused with different request")
+                connection.commit()
+            else:
+                queued = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM writer_requests WHERE state IN ('PENDING', 'RUNNING')"
+                    ).fetchone()[0]
+                )
+                if queued >= max(1, int(capacity)):
+                    connection.rollback()
+                    raise WriterBackpressureError("DuckDB writer queue capacity reached")
                 connection.execute(
-                    "SELECT COUNT(*) FROM writer_requests WHERE state IN ('PENDING', 'RUNNING')"
-                ).fetchone()[0]
-            )
-            if queued >= max(1, int(capacity)):
-                connection.rollback()
-                raise WriterBackpressureError("DuckDB writer queue capacity reached")
-            connection.execute(
-                "INSERT INTO writer_requests "
-                "(request_id, operation, payload_json, state, created_at, updated_at) "
-                "VALUES (?, ?, ?, 'PENDING', ?, ?)",
-                [stable_request_id, operation.value, encoded, _utc_text(), _utc_text()],
-            )
-            connection.commit()
+                    "INSERT INTO writer_requests "
+                    "(request_id, operation, payload_json, state, created_at, updated_at) "
+                    "VALUES (?, ?, ?, 'PENDING', ?, ?)",
+                    [stable_request_id, operation.value, encoded, _utc_text(), _utc_text()],
+                )
+                connection.commit()
 
     deadline = time.monotonic() + max(timeout, 0.1)
     while time.monotonic() < deadline:
@@ -673,7 +718,15 @@ def submit_write(
             raise WriterServiceError("writer request disappeared")
         state = str(row[0])
         if state == "SUCCEEDED":
-            return json.loads(str(row[1]))
+            result = json.loads(str(row[1]))
+            if (
+                replayed_request
+                and operation is WriteOperation.UPSERT_IV_OBSERVATIONS
+                and isinstance(result, dict)
+                and "upserted" in result
+            ):
+                return {**result, "upserted": 0}
+            return result
         if state == "FAILED":
             raise WriterRequestFailed(str(row[2] or "writer request failed"))
         _assert_writer_live(path, accept_new=False)
@@ -706,7 +759,6 @@ def submit_read(
     if len(encoded.encode("utf-8")) > 16 * 1024:
         raise WriterBackpressureError("reader request exceeds 16 KiB payload limit")
     path = Path(queue_path or queue_path_for(database)).resolve()
-    _ensure_queue_schema(path)
     _assert_writer_live(path, accept_new=True)
     request_id = str(uuid.uuid4())
     with _queue_connection(path) as connection:
@@ -863,7 +915,10 @@ def writer_service_status(queue_path: Path) -> dict[str, Any]:
         int(row[1]) if row[1] is not None else None,
         int(row[2]) if row[2] is not None else None,
     )
-    owner_responsive = heartbeat_fresh if owner_live is None else owner_live
+    # Process existence prevents unsafe lease takeover, but does not prove the
+    # writer thread is responsive. A stale heartbeat must be unhealthy even
+    # while the owning process remains alive so supervision can recover it.
+    owner_responsive = heartbeat_fresh and owner_live is not False
     live = str(row[3]) == "RUNNING" and owner_responsive
     responsive = str(row[3]) in {"RUNNING", "DRAINING"} and owner_responsive
     return {
@@ -1288,21 +1343,8 @@ def _dispatch_read(
         ).fetchall()
         return {"rows": [list(row) for row in rows]}
     if operation is ReadOperation.LOAD_IV_HISTORY_AVERAGE:
-        symbols = [str(item) for item in payload["symbols"]]
-        from_date = str(payload["from_date"])
-        placeholders = ", ".join("?" for _ in symbols)
-        rows = connection.execute(
-            f"""
-            SELECT CAST(date AS VARCHAR), AVG(iv) AS atm_iv
-            FROM iv_history
-            WHERE symbol IN ({placeholders})
-              AND date >= CAST(? AS DATE)
-            GROUP BY date
-            ORDER BY date ASC
-            """,
-            [*symbols, from_date],
-        ).fetchall()
-        return {"rows": [list(row) for row in rows]}
+        rows = _validated_iv_daily(connection, payload['symbols'], payload)
+        return {"rows": [[row['date'], row['iv']] for row in rows]}
     if operation is ReadOperation.LOAD_SIGNAL_HISTORY_VALUES:
         symbols = [str(item) for item in payload["symbols"]]
         from_date = str(payload["from_date"])
@@ -1325,7 +1367,8 @@ def _dispatch_read(
         placeholders = ", ".join("?" for _ in symbols)
         rows = connection.execute(
             f"""
-            SELECT symbol, CAST(date AS VARCHAR), open, high, low, close, volume
+            SELECT symbol, CAST(date AS VARCHAR), open, high, low, close, volume,
+                   CAST(observed_at AS VARCHAR), source, quality, derivation_type
             FROM decision_eligible_ohlcv
             WHERE symbol IN ({placeholders})
               AND date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
@@ -1333,7 +1376,11 @@ def _dispatch_read(
             """,
             [*symbols, from_date, to_date],
         ).fetchall()
-        return {"rows": [list(row) for row in rows]}
+        return {
+            "columns": ["symbol", "date", "open", "high", "low", "close", "volume",
+                        "observed_at", "source", "quality", "derivation_type"],
+            "rows": [list(row) for row in rows],
+        }
     if operation is ReadOperation.LOAD_SCREENER_UNIVERSE_HISTORY:
         lookup_symbols = [str(item) for item in payload["symbols"]]
         placeholders = ", ".join("?" for _ in lookup_symbols)
@@ -1717,21 +1764,8 @@ def _dispatch_read(
             ]
         }
     if operation is ReadOperation.LOAD_IV_RANK_HISTORY:
-        symbols = [str(item) for item in payload["symbols"]]
-        from_date = str(payload["from_date"])
-        placeholders = ", ".join("?" for _ in symbols)
-        rows = connection.execute(
-            f"""
-            SELECT CAST(date AS VARCHAR), strike, iv
-            FROM iv_history
-            WHERE upper(symbol) IN ({placeholders})
-              AND upper(option_type) = 'CE'
-              AND date >= CAST(? AS DATE)
-            ORDER BY date ASC
-            """,
-            [*symbols, from_date],
-        ).fetchall()
-        return {"rows": [list(row) for row in rows]}
+        rows = _validated_iv_daily(connection, payload['symbols'], payload)
+        return {"rows": [[row['date'], row['strike'], row['iv']] for row in rows]}
     if operation is ReadOperation.LOAD_SYMBOL_OHLCV_FOR_BACKFILL:
         symbol = str(payload["symbol"])
         rows = connection.execute(
@@ -1932,19 +1966,8 @@ def _dispatch_read(
         ).fetchall()
         return {"columns": ["date", "signal_name", "value"], "rows": [list(row) for row in rows]}
     if operation is ReadOperation.LOAD_FEATURE_IV_HISTORY:
-        candidates = [str(item) for item in payload["candidates"]]
-        placeholders = ", ".join(["?"] * len(candidates))
-        rows = connection.execute(
-            f"""
-            SELECT date, AVG(iv) AS atm_iv
-            FROM iv_history
-            WHERE symbol IN ({placeholders})
-            GROUP BY date
-            ORDER BY date
-            """,
-            candidates,
-        ).fetchall()
-        return {"columns": ["date", "atm_iv"], "rows": [list(row) for row in rows]}
+        rows = _validated_iv_daily(connection, payload['candidates'], payload)
+        return {"columns": ["date", "atm_iv"], "rows": [[row['date'], row['iv']] for row in rows]}
     if operation is ReadOperation.COUNT_FO_EOD_ROWS:
         candidates = [str(item) for item in payload["candidates"]]
         placeholders = ", ".join(["?"] * len(candidates))
@@ -2027,14 +2050,21 @@ def _dispatch_read(
         to_date = str(payload["to_date"])
         rows = connection.execute(
             """
-            SELECT * FROM fo_eod
+            SELECT symbol, expiry, strike, option_type, date, open, high, low,
+                   close, volume, oi, oi_change, source, source_format, price_quality
+            FROM fo_eod
             WHERE symbol = ?
               AND date BETWEEN ? AND ?
             ORDER BY date, expiry, strike, option_type
             """,
             [symbol, from_date, to_date],
         ).fetchall()
-        return {"rows": [list(row) for row in rows]}
+        return {
+            "columns": ["symbol", "expiry", "strike", "option_type", "date", "open",
+                        "high", "low", "close", "volume", "oi", "oi_change", "source",
+                        "source_format", "price_quality"],
+            "rows": [list(row) for row in rows],
+        }
     if operation is ReadOperation.LOAD_GIFT_NIFTY_LAST_CLOSE:
         row = connection.execute(
             """
@@ -2254,6 +2284,52 @@ def _dispatch_read(
             "schema_version": int(schema_row[0] or 0) if schema_row else 0,
             "latest": latest,
         }
+    if operation is ReadOperation.LOAD_RISK_FREE_RATE_CURVE:
+        from_date = str(payload["from_date"])
+        to_date = str(payload["to_date"])
+        # published_at/retrieved_at are DuckDB TIMESTAMP (no timezone
+        # concept) but every writer only ever stores a genuinely UTC
+        # instant into them (data/risk_free_rate.py sets both from
+        # dt.datetime.now(timezone.utc) / an already-UTC-converted FBIL
+        # publish time). A bare `CAST(... AS VARCHAR)` therefore produces a
+        # naive-looking string ('2026-09-04 17:19:59.495656', no offset) --
+        # options/iv_contract.timestamp() and iv_backfill._timestamp() both
+        # correctly refuse to guess a timezone for an unmarked string and
+        # return None, which silently made every single rate row
+        # unusable (retrieved_at=None fails `select_rate_for_tenor`'s own
+        # provenance check) regardless of how much genuine FBIL curve
+        # history existed. Appending the UTC marker here is not a policy
+        # change -- it corrects a lossy TIMESTAMP->VARCHAR round trip back
+        # to what was always genuinely true.
+        rows = connection.execute(
+            """
+            SELECT CAST(observation_date AS VARCHAR), tenor_days, tenor_label,
+                   rate_pct, rate_decimal, source, source_url,
+                   CASE WHEN published_at IS NULL THEN NULL
+                        ELSE CAST(published_at AS VARCHAR) || '+00:00' END,
+                   CASE WHEN retrieved_at IS NULL THEN NULL
+                        ELSE CAST(retrieved_at AS VARCHAR) || '+00:00' END,
+                   quote_convention, rate_convention, conversion_method
+            FROM risk_free_rate_history
+            WHERE observation_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
+            ORDER BY observation_date ASC, tenor_days ASC
+            """,
+            [from_date, to_date],
+        ).fetchall()
+        return {"rows": [list(row) for row in rows]}
+    if operation is ReadOperation.LOAD_IV_HISTORY_ROWS_FOR_SYMBOL:
+        symbol = str(payload["symbol"])
+        rows = connection.execute(
+            f"SELECT {', '.join(_IV_OBSERVATION_COLUMNS)} FROM iv_history WHERE symbol = ? "
+            "ORDER BY date, expiry, strike, option_type",
+            [symbol],
+        ).fetchall()
+        return {"columns": list(_IV_OBSERVATION_COLUMNS), "rows": [list(row) for row in rows]}
+    if operation is ReadOperation.COUNT_IV_HISTORY_ROWS:
+        row = connection.execute(
+            "SELECT COUNT(*), COUNT(DISTINCT symbol), MIN(date), MAX(date) FROM iv_history"
+        ).fetchone()
+        return {"rows": int(row[0] or 0), "symbols": int(row[1] or 0), "first_date": str(row[2]) if row[2] else None, "last_date": str(row[3]) if row[3] else None}
     raise ValueError(f"unhandled read operation: {operation_text}")
 
 
@@ -2262,6 +2338,10 @@ def _dispatch_operation(operation: WriteOperation, payload: dict[str, Any], data
         return _upsert_fii_dii(database, payload)
     if operation is WriteOperation.UPSERT_EQUITY_SECTORS:
         return _upsert_equity_sectors(database, payload)
+    if operation is WriteOperation.UPSERT_IV_OBSERVATIONS:
+        return _upsert_iv_observations(database, payload)
+    if operation is WriteOperation.UPSERT_RISK_FREE_RATE_CURVE:
+        return _upsert_risk_free_rate_curve(database, payload)
     if operation is WriteOperation.RECORD_INGESTION_MANIFEST:
         return _record_ingestion_manifest(database, payload)
     if operation is WriteOperation.LOAD_EQUITY_BHAVCOPY:
@@ -2582,6 +2662,207 @@ def _upsert_equity_sectors(database: Path, payload: dict[str, Any]) -> dict[str,
     return {"upserted": len(parsed)}
 
 
+from options.iv_contract import OBSERVATION_COLUMNS as _IV_OBSERVATION_COLUMNS
+
+
+def _validated_iv_daily(connection: Any, symbols: list[str], payload: dict[str, Any]) -> list[dict[str, Any]]:
+    from options.iv_contract import daily_atm_rows, timestamp
+    import datetime as dt
+    columns = {
+        row[0]
+        for row in connection.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'iv_history'"
+        ).fetchall()
+    }
+    if not set(_IV_OBSERVATION_COLUMNS).issubset(columns) or not symbols:
+        return []  # legacy schema is stored, never promoted to validated history
+    as_of = timestamp(payload.get('as_of')) if payload.get('as_of') else dt.datetime.now(dt.timezone.utc)
+    if as_of is None:
+        raise ValueError('as_of must be timezone-aware')
+    normalized_symbols = [str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()]
+    placeholders = ", ".join("?" for _ in normalized_symbols)
+    rows = connection.execute(
+        f"SELECT {', '.join(_IV_OBSERVATION_COLUMNS)} FROM iv_history "
+        f"WHERE upper(symbol) IN ({placeholders}) AND date >= CAST(? AS DATE) AND date < CAST(? AS DATE) "
+        "ORDER BY date, expiry, strike LIMIT 100000",
+        [*normalized_symbols, payload.get('from_date', '1900-01-01'), as_of.date().isoformat()],
+    ).fetchall()
+    observations = []
+    for raw in rows:
+        row = dict(zip(_IV_OBSERVATION_COLUMNS, raw))
+        for key in ('date', 'expiry', 'risk_free_observation_date'):
+            if row[key] is not None:
+                row[key] = row[key].isoformat() if hasattr(row[key], 'isoformat') else str(row[key])
+        observations.append(row)
+    return daily_atm_rows(
+        observations,
+        as_of=as_of,
+        observation_kind=str(payload.get('observation_kind') or 'HISTORICAL_RECONSTRUCTION'),
+    )
+
+
+def _write_iv_rows(connection: Any, rows: Any) -> dict[str, Any]:
+    """Called only inside the WriterService-owned transaction.
+
+    Exact replay is a no-op. Conflicting values/kinds never replace history.
+    Whole batch validation precedes insertion; outer writer ledger guarantees
+    crash recovery and atomicity, including calls from COMPUTE_BIF.
+    """
+    from options.iv_contract import validate_observation
+    if _ACTIVE_WRITER_CONNECTION.get() is None:
+        raise RuntimeError('IV persistence requires an active WriterService transaction')
+    if not isinstance(rows, list) or not rows or len(rows) > 2000:
+        raise ValueError('IV observation batch requires 1..2000 rows')
+    unique = {}
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != set(_IV_OBSERVATION_COLUMNS):
+            raise ValueError('invalid IV observation row schema')
+        validate_observation(row)
+        key = str(row['observation_id'])
+        if key in unique and unique[key] != row:
+            raise ValueError('conflicting duplicate IV key')
+        unique[key] = row
+    inserted = 0
+    for key, row in unique.items():
+        existing = connection.execute(
+            f"SELECT {', '.join(_IV_OBSERVATION_COLUMNS)} FROM iv_history "
+            "WHERE observation_id=?", [key],
+        ).fetchone()
+        values = tuple(row[name] for name in _IV_OBSERVATION_COLUMNS)
+        if existing:
+            # Compare via typed SQL casts, ignoring creation time on a replay.
+            comparison = [name for name in _IV_OBSERVATION_COLUMNS if name != 'created_at']
+            equal = connection.execute(
+                'SELECT ' + ' AND '.join(f'{name} IS NOT DISTINCT FROM ?' for name in comparison)
+                + ' FROM iv_history WHERE observation_id=?',
+                [*[row[name] for name in comparison], key],
+            ).fetchone()[0]
+            if not equal:
+                raise ValueError('IV key already exists with different inputs or provenance')
+            continue
+        connection.execute(
+            f"INSERT INTO iv_history ({', '.join(_IV_OBSERVATION_COLUMNS)}) VALUES ({', '.join('?' for _ in values)})", values,
+        )
+        inserted += 1
+    return {'upserted': inserted}
+
+
+def _upsert_iv_observations(database: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    connection = writer_connection()
+    try:
+        return _write_iv_rows(connection, payload.get('rows'))
+    finally:
+        connection.close()
+
+
+_RATE_CURVE_COLUMNS = (
+    "observation_date", "tenor_days", "tenor_label", "rate_pct",
+    "rate_decimal", "source", "source_url", "published_at", "retrieved_at",
+    "quote_convention", "rate_convention", "conversion_method",
+)
+
+
+def _upsert_risk_free_rate_curve(database: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    """Bulk-upsert risk_free_rate_history rows fetched from a real external
+    provider (see data/risk_free_rate.py). Never invents a rate: the caller
+    must already have a real fetched (observation_date, tenor_days, rate)
+    triple for every row."""
+    rows = payload.get("rows")
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("risk-free rate payload requires a non-empty rows list")
+    if len(rows) > 2000:
+        raise ValueError("risk-free rate batch exceeds bounded size (max 2000 rows)")
+    parsed: list[tuple[Any, ...]] = []
+    from data.risk_free_rate import (
+        FBIL_QUOTE_CONVENTION,
+        FBIL_SOURCE_ID,
+        FBIL_TBILL_3M_HISTORY_URL,
+        FBIL_TBILL_LATEST_URL,
+        OPTION_RATE_CONVENTION,
+        RATE_CONVERSION_METHOD,
+        TenorPoint,
+    )
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != set(_RATE_CURVE_COLUMNS):
+            raise ValueError("invalid risk-free rate row schema")
+        rate_pct = row.get("rate_pct")
+        if not isinstance(rate_pct, (int, float)) or not (0.0 < float(rate_pct) < 50.0):
+            raise ValueError(f"implausible risk-free rate rejected: {row!r}")
+        tenor_days = row.get("tenor_days")
+        if not isinstance(tenor_days, int) or tenor_days <= 0:
+            raise ValueError(f"invalid risk-free rate tenor_days: {row!r}")
+        if (
+            row.get("source") != FBIL_SOURCE_ID
+            or row.get("source_url") not in {FBIL_TBILL_LATEST_URL, FBIL_TBILL_3M_HISTORY_URL}
+            or row.get("quote_convention") != FBIL_QUOTE_CONVENTION
+            or row.get("rate_convention") != OPTION_RATE_CONVENTION
+            or row.get("conversion_method") != RATE_CONVERSION_METHOD
+        ):
+            raise ValueError("unverified risk-free rate convention")
+        expected_rate = TenorPoint(
+            observation_date=_required_date(row, "observation_date"),
+            tenor_days=tenor_days,
+            tenor_label=str(row["tenor_label"]),
+            rate_pct=float(rate_pct),
+            published_at=None,
+            source=str(row["source"]),
+            source_url=str(row["source_url"]),
+        ).rate_decimal
+        if not isinstance(row.get("rate_decimal"), (int, float)) or not math.isclose(
+            float(row["rate_decimal"]), expected_rate, rel_tol=1e-12, abs_tol=1e-12
+        ):
+            raise ValueError("risk-free continuous-rate conversion mismatch")
+        retrieved_at = _aware_datetime(row.get("retrieved_at"))
+        published_at = _aware_datetime(row.get("published_at")) if row.get("published_at") is not None else None
+        if retrieved_at is None:
+            raise ValueError("risk-free retrieval timestamp must be timezone-aware")
+        if row.get("published_at") is not None and published_at is None:
+            raise ValueError("risk-free publication timestamp must be timezone-aware")
+        observation_start = dt.datetime.combine(
+            _required_date(row, "observation_date"), dt.time.min,
+            dt.timezone(dt.timedelta(hours=5, minutes=30)),
+        ).astimezone(dt.timezone.utc)
+        if retrieved_at < observation_start or (published_at is not None and retrieved_at < published_at):
+            raise ValueError("risk-free retrieval precedes its source observation")
+        parsed.append(tuple(row[name] for name in _RATE_CURVE_COLUMNS))
+
+    connection = writer_connection()
+    try:
+        connection.execute("BEGIN TRANSACTION")
+        inserted = 0
+        for values in parsed:
+            existing = connection.execute(
+                "SELECT tenor_label, rate_pct, rate_decimal, source, quote_convention, "
+                "rate_convention, conversion_method FROM risk_free_rate_history "
+                "WHERE observation_date=CAST(? AS DATE) AND tenor_days=?",
+                [values[0], values[1]],
+            ).fetchone()
+            semantic = (values[2], values[3], values[4], values[5], values[9], values[10], values[11])
+            if existing is not None:
+                if tuple(existing) != semantic:
+                    raise ValueError("risk-free observation conflicts with immutable stored rate")
+                continue
+            connection.execute(
+                """
+                INSERT INTO risk_free_rate_history
+                    (observation_date, tenor_days, tenor_label, rate_pct,
+                     rate_decimal, source, source_url, published_at, retrieved_at,
+                     quote_convention, rate_convention, conversion_method)
+                VALUES (CAST(? AS DATE), ?, ?, ?, ?, ?, ?, CAST(? AS TIMESTAMP), CAST(? AS TIMESTAMP), ?, ?, ?)
+                """,
+                values,
+            )
+            inserted += 1
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.close()
+    return {"upserted": inserted}
+
+
 def _upsert_fii_dii(database: Path, payload: dict[str, Any]) -> dict[str, Any]:
     columns = (
         "date",
@@ -2692,6 +2973,14 @@ def _required_date(payload: dict[str, Any], key: str) -> dt.date:
         return dt.date.fromisoformat(str(value))
     except ValueError as error:
         raise ValueError(f"invalid {key}") from error
+
+
+def _aware_datetime(value: Any) -> dt.datetime | None:
+    try:
+        parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo is not None and parsed.utcoffset() is not None else None
 
 
 def _required_symbol(payload: dict[str, Any]) -> str:

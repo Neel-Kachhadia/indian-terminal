@@ -21,6 +21,7 @@ __pycache__/
 .test-tmp*/
 .mypy_cache/
 .ruff_cache/
+catboost_info/
 
 # Rust and Tauri generated artifacts
 src-tauri/gen/schemas/
@@ -33,6 +34,7 @@ src-tauri/gen/schemas/
 
 # Logs and local process output
 *.log
+*.log.err
 *.tmp
 .codex-*.log
 compute/*.out.log
@@ -65,6 +67,9 @@ Thumbs.db
 desktop.ini
 .vscode/
 .idea/
+.playwright-cli/
+/output/
+/f0_snapshot.json
 
 # Archives and temporary files
 *.zip

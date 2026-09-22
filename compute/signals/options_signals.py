@@ -7,6 +7,7 @@ from typing import Any
 
 from data.exchange_calendar import today_ist
 from db.write_service import ReadOperation, resolve_read
+from options.iv_contract import validated_live_observation
 
 
 TRADING_DAYS = 252
@@ -90,14 +91,15 @@ def _normalise_leg(leg: dict[str, Any]) -> dict[str, Any] | None:
     if strike is None or option_type is None:
         return None
 
+    observation = validated_live_observation(leg)
     return {
         "symbol": str(leg.get("symbol") or "NIFTY").strip().upper(),
         "strike": strike,
         "option_type": option_type,
         "oi": _coerce_nonnegative_int(leg.get("oi")),
-        "iv": _normalise_iv(leg.get("iv")),
-        "gamma": _coerce_float(leg.get("gamma")),
-        "delta": _coerce_float(leg.get("delta")),
+        "iv": _normalise_iv(observation.get("iv")) if observation else None,
+        "gamma": _coerce_float(leg.get("gamma")) if observation else None,
+        "delta": _coerce_float(leg.get("delta")) if observation else None,
     }
 
 
@@ -342,8 +344,6 @@ def _normalise_iv(value: Any) -> float | None:
     iv = _coerce_float(value)
     if iv is None or iv <= 0:
         return None
-    if iv > 3.0:
-        iv /= 100.0
     if iv <= 0 or iv > 5.0:
         return None
     return iv

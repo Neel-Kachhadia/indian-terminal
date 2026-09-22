@@ -33,8 +33,10 @@ type StrategyLeg = {
 type PayoffResult = {
   spot_range: number[];
   pnl_at_expiry: number[];
-  pnl_today: number[];
-  pnl_today_degraded: boolean;
+  pnl_today: number[] | null;
+  analytical_status: string;
+  risk_free_rate_source: string | null;
+  dividend_yield_source: string | null;
   breakevens: number[];
   max_profit: number | null;
   max_loss: number | null;
@@ -43,7 +45,7 @@ type PayoffResult = {
     gamma: number;
     theta: number;
     vega: number;
-  };
+  } | null;
 };
 
 type FuturesBasisData = {
@@ -313,14 +315,14 @@ export function StrategyLab() {
         x: payoff.spot_range,
         y: payoff.pnl_at_expiry,
       } as Data,
-      {
+      ...(payoff.pnl_today ? [{
         line: { color: "#546e7a", dash: "dash", width: 2 },
         mode: "lines",
-        name: payoff.pnl_today_degraded ? "P&L Today (approx, IV unsolved)" : "P&L Today",
+        name: "P&L Today",
         type: "scatter",
         x: payoff.spot_range,
         y: payoff.pnl_today,
-      } as Data,
+      } as Data] : []),
     ];
   }, [payoff]);
 
@@ -744,15 +746,21 @@ export function StrategyLab() {
                 padding: "0 4px 8px",
               }}
             >
-              <span>Delta: {payoff.net_greeks.delta.toFixed(3)}</span>
-              <span>Gamma: {payoff.net_greeks.gamma.toFixed(4)}</span>
-              <span>Theta: {payoff.net_greeks.theta.toFixed(2)}</span>
-              <span>Vega: {payoff.net_greeks.vega.toFixed(2)}</span>
-              {payoff.pnl_today_degraded ? (
+              {payoff.net_greeks ? (
+                <>
+                  <span>Delta: {payoff.net_greeks.delta.toFixed(3)}</span>
+                  <span>Gamma: {payoff.net_greeks.gamma.toFixed(4)}</span>
+                  <span>Theta: {payoff.net_greeks.theta.toFixed(2)}</span>
+                  <span>Vega: {payoff.net_greeks.vega.toFixed(2)}</span>
+                  <span style={{ color: "#7d8590" }} title="Never observed market data for dividend yield">
+                    rate: {payoff.risk_free_rate_source ?? "n/a"} · dividend: {payoff.dividend_yield_source ?? "n/a"}
+                  </span>
+                </>
+              ) : (
                 <span style={{ color: "#facc15" }}>
-                  Greeks/P&amp;L Today: approximate (entry price implied vol unsolved)
+                  Greeks/P&amp;L Today: unavailable ({payoff.analytical_status})
                 </span>
-              ) : null}
+              )}
               <span>Max Profit: {formatLimit(payoff.max_profit)}</span>
               <span>Max Loss: {formatLimit(payoff.max_loss)}</span>
               <span>

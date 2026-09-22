@@ -105,12 +105,8 @@ class BIFEngine:
         iv_observations = _current_iv_observations(
             normalized,
             context["chain_legs"],
-            context["spot"],
             context["expiry"],
-            context["ohlcv_rows"][-1]["date"] if context["ohlcv_rows"] else None,
             context["chain_provenance"],
-            context["spot_observation"].decision_eligible
-            and context["market_data_eligibility"].decision_eligible,
         )
         payload = {
             "symbol": normalized,
@@ -805,56 +801,31 @@ def _parse_timestamp(value: Any) -> _dt.datetime | None:
 def _current_iv_observations(
     symbol: str,
     legs: list[dict[str, Any]],
-    spot: float,
     expiry: str,
-    as_of_date: Any,
     provenance: dict[str, Any],
-    market_inputs_eligible: bool,
 ) -> list[dict[str, Any]]:
     if (
-        not market_inputs_eligible
-        or provenance.get("decision_eligible") is not True
+        provenance.get("decision_eligible") is not True
         or not legs
-        or _finite_or_none(spot) is None
-        or float(spot) <= 0
-        or as_of_date is None
     ):
         return []
     expiry_date = _parse_expiry_date(expiry)
     if expiry_date is None:
         return []
-    candidates: list[dict[str, Any]] = []
+    from options.iv_contract import validated_live_observation
+    candidates = []
     for leg in legs:
-        strike = _finite_or_none(leg.get("strike"))
-        iv = _normalise_iv(leg.get("iv"))
-        option_type = str(leg.get("option_type") or "").strip().upper()
-        if option_type in {"CALL", "C"}:
-            option_type = "CE"
-        elif option_type in {"PUT", "P"}:
-            option_type = "PE"
-        if strike is None or strike <= 0 or iv is None or option_type not in {"CE", "PE"}:
+        row = validated_live_observation(leg)
+        if row is None:
             continue
-        candidates.append(
-            {
-                "symbol": symbol,
-                "expiry": expiry_date.isoformat(),
-                "strike": strike,
-                "option_type": option_type,
-                "date": str(as_of_date),
-                "iv": iv,
-                "source": provenance.get("source"),
-                "observed_at": provenance.get("observed_at"),
-                "quality": "CURRENT_DECISION_ELIGIBLE",
-            }
-        )
-    if not candidates:
-        return []
-    nearest_distance = min(abs(float(row["strike"]) - float(spot)) for row in candidates)
-    return [
-        row
-        for row in candidates
-        if abs(abs(float(row["strike"]) - float(spot)) - nearest_distance) < 1e-9
-    ]
+        if (
+            row['symbol'] == symbol
+            and row['expiry'] == expiry_date.isoformat()
+            and row['iv'] == leg.get('iv')
+            and row['observation_kind'] == 'LIVE'
+        ):
+            candidates.append(row)
+    return candidates
 
 
 def _parse_expiry_date(value: Any) -> _dt.date | None:
@@ -867,45 +838,10 @@ def _parse_expiry_date(value: Any) -> _dt.date | None:
     return None
 
 
-def _normalise_iv(value: Any) -> float | None:
-    number = _finite_or_none(value)
-    if number is None or number <= 0:
-        return None
-    if number > 3.0:
-        number /= 100.0
-    return number if 0 < number <= 5.0 else None
-
-
 def _persist_iv_observations(con: Any, observations: Any) -> None:
-    if not isinstance(observations, list) or not observations:
-        return
-    con.execute(
-        """
-        CREATE TABLE IF NOT EXISTS iv_history (
-            symbol TEXT NOT NULL, expiry DATE NOT NULL, strike DOUBLE NOT NULL,
-            option_type TEXT NOT NULL, date DATE NOT NULL, iv DOUBLE NOT NULL,
-            PRIMARY KEY (symbol, expiry, strike, option_type, date)
-        )
-        """
-    )
-    for row in observations:
-        if not isinstance(row, dict):
-            continue
-        con.execute(
-            """
-            INSERT OR REPLACE INTO iv_history
-                (symbol, expiry, strike, option_type, date, iv)
-            VALUES (?, CAST(? AS DATE), ?, ?, CAST(? AS DATE), ?)
-            """,
-            [
-                row.get("symbol"),
-                row.get("expiry"),
-                row.get("strike"),
-                row.get("option_type"),
-                row.get("date"),
-                row.get("iv"),
-            ],
-        )
+    if observations:
+        from db.write_service import _write_iv_rows
+        _write_iv_rows(con, observations)
 
 
 def _next_expiries(symbol: str, n: int) -> list[str]:

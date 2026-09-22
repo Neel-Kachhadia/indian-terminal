@@ -5,22 +5,28 @@ import math
 from typing import Any
 
 import numpy as np
-from py_vollib.black_scholes import black_scholes
-from py_vollib.black_scholes.greeks.analytical import delta, gamma, theta, vega
-from py_vollib.black_scholes.implied_volatility import implied_volatility
+from py_vollib.black_scholes_merton import black_scholes_merton
+from py_vollib.black_scholes_merton.greeks.analytical import delta, gamma, theta, vega
 
-from data.exchange_calendar import today_ist
+from data.risk_free_rate import latest_available_rate
+from options.iv_pricing import PricingModel, SolveStatus, solve_iv_with_provenance
 
 
-RISK_FREE_RATE = 0.065
-FALLBACK_IV = 0.15
 POINT_COUNT = 200
+CONFIGURED_ASSUMPTION = "CONFIGURED_ASSUMPTION"
+OBSERVED_MARKET_RATE = "OBSERVED_MARKET_RATE"
+ZERO_DIVIDEND_ASSUMPTION = "ZERO_DIVIDEND_ASSUMPTION"
 
 
 def compute_payoff(
     legs: list[dict[str, Any]],
     spot: float,
     spot_range_pct: float = 0.20,
+    *,
+    risk_free_rate: float | None = None,
+    risk_free_rate_source: str | None = None,
+    dividend_yield: float | None = None,
+    dividend_yield_source: str | None = None,
 ) -> dict[str, Any]:
     """
     Compute multi-leg options/futures payoff.
@@ -28,6 +34,22 @@ def compute_payoff(
     Reference sanity check:
     long 23400 CE at 221 premium and lot size 75 has breakeven 23621
     and max loss -16575, matching textbook expiry payoff.
+
+    Today's P&L / Greeks require, per leg, both a rate and a dividend yield.
+    Rate: a genuinely observed current FBIL curve point for that leg's own
+    time-to-expiry is tried first (`OBSERVED_MARKET_RATE`); an explicit
+    caller-supplied `risk_free_rate` is used only as a disclosed fallback,
+    and only when the caller also passes `risk_free_rate_source ==
+    CONFIGURED_ASSUMPTION`. Dividend: no observed dividend-yield source
+    exists anywhere in this system, so a nonzero value is accepted ONLY as
+    an explicit, disclosed `dividend_yield_source == CONFIGURED_ASSUMPTION`
+    value -- never silently defaulted. A value of exactly 0.0 may instead be
+    disclosed as `dividend_yield_source == ZERO_DIVIDEND_ASSUMPTION`: an
+    honest label for "nobody configured a dividend, so the model assumes
+    zero", distinct from `CONFIGURED_ASSUMPTION`, which claims somebody
+    actually supplied a value. Either family missing/mislabelled degrades
+    pnl_today/net_greeks to None with an explicit analytical_status, never a
+    fabricated substitute.
     """
     spot = _positive_float(spot, "spot")
     spot_range_pct = max(0.01, min(float(spot_range_pct), 1.0))
@@ -38,21 +60,58 @@ def compute_payoff(
     spot_range = np.linspace(low, high, POINT_COUNT, dtype=np.float64)
 
     pnl_at_expiry = np.zeros_like(spot_range)
-    pnl_today = np.zeros_like(spot_range)
-    net_greeks = {
+    pnl_today: np.ndarray | None = np.zeros_like(spot_range)
+    net_greeks: dict[str, float] | None = {
         "delta": 0.0,
         "gamma": 0.0,
         "theta": 0.0,
         "vega": 0.0,
     }
-    iv_degraded = False
+    analytics_status = "VALID"
+    rate_sources_used: set[str] = set()
+    dividend_sources_used: set[str] = set()
 
     for leg in normalised_legs:
         pnl_at_expiry += _expiry_leg_pnl(leg, spot_range)
-        leg_pnl_today, leg_degraded = _today_leg_pnl(leg, spot_range, spot)
+
+        if leg["option_type"] == "FUT":
+            if pnl_today is not None:
+                pnl_today += _expiry_leg_pnl(leg, spot_range)
+                if net_greeks is not None:
+                    net_greeks["delta"] += _signed_multiplier(leg)
+            continue
+
+        if pnl_today is None:
+            # Already degraded by an earlier leg; pnl_at_expiry above still
+            # needs every leg summed, but analytics stay None.
+            continue
+
+        t = _time_to_expiry(leg["expiry"])
+        rate, rate_source = _resolve_rate(t, risk_free_rate, risk_free_rate_source)
+        dividend, dividend_source = _resolve_dividend(dividend_yield, dividend_yield_source)
+        if t is None or rate is None or dividend is None:
+            pnl_today = None
+            net_greeks = None
+            analytics_status = (
+                "EXPIRED_OR_INVALID_EXPIRY" if t is None
+                else "MISSING_RATE" if rate is None
+                else "MISSING_DIVIDEND_ASSUMPTION"
+            )
+            continue
+        rate_sources_used.add(rate_source)
+        dividend_sources_used.add(dividend_source)
+
+        leg_pnl_today = _today_leg_pnl(leg, spot_range, spot, rate, dividend)
+        if leg_pnl_today is None:
+            pnl_today = None
+            net_greeks = None
+            analytics_status = "NO_CONVERGENCE"
+            continue
         pnl_today += leg_pnl_today
-        iv_degraded = iv_degraded or leg_degraded
-        iv_degraded = _add_leg_greeks(net_greeks, leg, spot) or iv_degraded
+        if net_greeks is not None and not _add_leg_greeks(net_greeks, leg, spot, rate, dividend):
+            net_greeks = None
+            pnl_today = None
+            analytics_status = "NO_CONVERGENCE"
 
     breakevens = _breakevens(spot_range, pnl_at_expiry)
     max_profit, max_loss = _max_profit_loss(normalised_legs, pnl_at_expiry)
@@ -60,22 +119,71 @@ def compute_payoff(
     return {
         "spot_range": _round_list(spot_range, 2),
         "pnl_at_expiry": _round_list(pnl_at_expiry, 2),
-        "pnl_today": _round_list(pnl_today, 2),
-        # True when any leg's implied volatility could not be solved from its
-        # own entry_price and a generic FALLBACK_IV was substituted instead --
-        # pnl_at_expiry/breakevens/max_profit/max_loss are unaffected (they
-        # are pure intrinsic-value math, no IV involved), but pnl_today and
-        # net_greeks are approximations when this is true, not values solved
-        # from the position the caller described.
-        "pnl_today_degraded": iv_degraded,
+        "pnl_today": _round_list(pnl_today, 2) if pnl_today is not None else None,
+        "analytical_status": analytics_status,
+        "risk_free_rate_source": _describe_sources(rate_sources_used),
+        "dividend_yield_source": _describe_sources(dividend_sources_used),
         "breakevens": breakevens,
         "max_profit": None if max_profit is None else round(max_profit, 2),
         "max_loss": None if max_loss is None else round(max_loss, 2),
-        "net_greeks": {
-            key: round(value, 6)
-            for key, value in net_greeks.items()
-        },
+        "net_greeks": (
+            {key: round(value, 6) for key, value in net_greeks.items()}
+            if net_greeks is not None else None
+        ),
     }
+
+
+def _resolve_rate(
+    t: float | None,
+    configured_rate: float | None,
+    configured_rate_source: str | None,
+) -> tuple[float | None, str | None]:
+    """Prefer a genuinely observed current FBIL rate; otherwise accept only
+    an explicitly disclosed configured assumption. Never a silent default."""
+    if t is not None:
+        try:
+            selection = latest_available_rate(t)
+        except Exception:
+            selection = None
+        if selection is not None:
+            return selection.rate_decimal, OBSERVED_MARKET_RATE
+    if (
+        configured_rate is not None
+        and math.isfinite(configured_rate)
+        and configured_rate_source == CONFIGURED_ASSUMPTION
+    ):
+        return configured_rate, CONFIGURED_ASSUMPTION
+    return None, None
+
+
+def _resolve_dividend(
+    configured_dividend: float | None,
+    configured_dividend_source: str | None,
+) -> tuple[float | None, str | None]:
+    """No observed dividend-yield source exists in this system: only an
+    explicitly disclosed configured assumption -- or an explicitly disclosed
+    zero-dividend model assumption, which must genuinely be zero -- is ever
+    accepted. Any other label (including no label at all) fails closed."""
+    if (
+        configured_dividend is not None
+        and math.isfinite(configured_dividend)
+        and configured_dividend_source == CONFIGURED_ASSUMPTION
+    ):
+        return configured_dividend, CONFIGURED_ASSUMPTION
+    if (
+        configured_dividend == 0.0
+        and configured_dividend_source == ZERO_DIVIDEND_ASSUMPTION
+    ):
+        return configured_dividend, ZERO_DIVIDEND_ASSUMPTION
+    return None, None
+
+
+def _describe_sources(sources: set[str]) -> str | None:
+    if not sources:
+        return None
+    if len(sources) == 1:
+        return next(iter(sources))
+    return "MIXED"
 
 
 def _normalise_leg(raw_leg: dict[str, Any]) -> dict[str, Any]:
@@ -130,96 +238,101 @@ def _today_leg_pnl(
     leg: dict[str, Any],
     spot_range: np.ndarray,
     current_spot: float,
-) -> tuple[np.ndarray, bool]:
+    risk_free_rate: float | None,
+    dividend_yield: float | None,
+) -> np.ndarray | None:
     if leg["option_type"] == "FUT":
-        return _expiry_leg_pnl(leg, spot_range), False
+        return _expiry_leg_pnl(leg, spot_range)
 
     multiplier = _signed_multiplier(leg)
-    sigma, degraded = _leg_iv(leg, current_spot)
+    sigma = _leg_iv(leg, current_spot, risk_free_rate, dividend_yield)
     t = _time_to_expiry(leg["expiry"])
+    if sigma is None or t is None or risk_free_rate is None or dividend_yield is None:
+        return None
     flag = _flag(leg["option_type"])
 
     values = np.array(
         [
-            _bs_price(flag, float(next_spot), leg["strike"], t, sigma)
+            _bs_price(flag, float(next_spot), leg["strike"], t, risk_free_rate, sigma, dividend_yield)
             for next_spot in spot_range
         ],
         dtype=np.float64,
     )
-    return (values - leg["entry_price"]) * multiplier, degraded
+    if not np.isfinite(values).all():
+        return None
+    return (values - leg["entry_price"]) * multiplier
 
 
 def _add_leg_greeks(
     net_greeks: dict[str, float],
     leg: dict[str, Any],
     spot: float,
+    risk_free_rate: float | None,
+    dividend_yield: float | None,
 ) -> bool:
     multiplier = _signed_multiplier(leg)
     option_type = leg["option_type"]
 
     if option_type == "FUT":
         net_greeks["delta"] += multiplier
-        return False
+        return True
 
-    sigma, degraded = _leg_iv(leg, spot)
+    sigma = _leg_iv(leg, spot, risk_free_rate, dividend_yield)
     t = _time_to_expiry(leg["expiry"])
+    if sigma is None or t is None or risk_free_rate is None or dividend_yield is None:
+        return False
     flag = _flag(option_type)
     strike = leg["strike"]
 
     try:
-        net_greeks["delta"] += delta(flag, spot, strike, t, RISK_FREE_RATE, sigma) * multiplier
-        net_greeks["gamma"] += gamma(flag, spot, strike, t, RISK_FREE_RATE, sigma) * multiplier
-        net_greeks["theta"] += theta(flag, spot, strike, t, RISK_FREE_RATE, sigma) * multiplier
-        net_greeks["vega"] += vega(flag, spot, strike, t, RISK_FREE_RATE, sigma) * multiplier
+        net_greeks["delta"] += delta(flag, spot, strike, t, risk_free_rate, sigma, dividend_yield) * multiplier
+        net_greeks["gamma"] += gamma(flag, spot, strike, t, risk_free_rate, sigma, dividend_yield) * multiplier
+        net_greeks["theta"] += theta(flag, spot, strike, t, risk_free_rate, sigma, dividend_yield) * multiplier
+        net_greeks["vega"] += vega(flag, spot, strike, t, risk_free_rate, sigma, dividend_yield) * multiplier
     except Exception:
-        return degraded
-    return degraded
+        return False
+    return True
 
 
-def _leg_iv(leg: dict[str, Any], spot: float) -> tuple[float, bool]:
-    """Returns (sigma, degraded). `degraded=True` means the implied-vol
-    solver could not invert the leg's own entry_price (numerical failure or
-    an out-of-sane-bounds result), so a generic FALLBACK_IV was substituted
-    -- the resulting "today" P&L curve and Greeks are an approximation, not
-    derived from the position the caller actually described. Callers must
-    propagate this so it isn't silently presented as a solved value."""
+def _leg_iv(
+    leg: dict[str, Any],
+    spot: float,
+    risk_free_rate: float | None,
+    dividend_yield: float | None,
+) -> float | None:
+    """Invert only with explicit configured analytical parameters."""
     if leg["option_type"] == "FUT":
-        return 0.0, False
+        return 0.0
 
     flag = _flag(leg["option_type"])
     t = _time_to_expiry(leg["expiry"])
+    if t is None or risk_free_rate is None or dividend_yield is None:
+        return None
+    solved = solve_iv_with_provenance(
+        flag, leg["entry_price"], spot, leg["strike"], t, risk_free_rate,
+        pricing_model=PricingModel.BLACK_SCHOLES_MERTON,
+        dividend_yield=dividend_yield,
+    )
+    return float(solved.iv) if solved.status is SolveStatus.OK else None
+
+
+def _bs_price(
+    flag: str,
+    spot: float,
+    strike: float,
+    t: float,
+    rate: float,
+    sigma: float,
+    dividend_yield: float,
+) -> float:
     try:
-        iv = implied_volatility(
-            leg["entry_price"],
-            spot,
-            leg["strike"],
-            t,
-            RISK_FREE_RATE,
-            flag,
-        )
-        if math.isfinite(iv) and 0.01 <= iv <= 5.0:
-            return float(iv), False
+        value = black_scholes_merton(flag, spot, strike, t, rate, sigma, dividend_yield)
     except Exception:
-        pass
-
-    return FALLBACK_IV, True
-
-
-def _bs_price(flag: str, spot: float, strike: float, t: float, sigma: float) -> float:
-    try:
-        value = black_scholes(flag, spot, strike, t, RISK_FREE_RATE, sigma)
-    except Exception:
-        return _intrinsic(flag, spot, strike)
+        return float("nan")
 
     if not math.isfinite(value):
-        return _intrinsic(flag, spot, strike)
+        return float("nan")
     return float(value)
-
-
-def _intrinsic(flag: str, spot: float, strike: float) -> float:
-    if flag == "c":
-        return max(spot - strike, 0.0)
-    return max(strike - spot, 0.0)
 
 
 def _breakevens(spot_range: np.ndarray, pnl: np.ndarray) -> list[float]:
@@ -275,12 +388,15 @@ def _signed_multiplier(leg: dict[str, Any]) -> float:
     return sign * float(leg["quantity"]) * float(leg["lot_size"])
 
 
-def _time_to_expiry(expiry: str) -> float:
+def _time_to_expiry(expiry: str) -> float | None:
     parsed = _parse_expiry(expiry)
     if parsed is None:
-        return 1.0 / 365.0
-    dte = max((parsed - today_ist()).days, 1)
-    return dte / 365.0
+        return None
+    now = _dt.datetime.now(_dt.timezone.utc)
+    ist = _dt.timezone(_dt.timedelta(hours=5, minutes=30))
+    expiry_at = _dt.datetime.combine(parsed, _dt.time(15, 30), ist).astimezone(_dt.timezone.utc)
+    value = (expiry_at - now).total_seconds() / (365 * 86400)
+    return value if value > 0 else None
 
 
 def _parse_expiry(expiry: str) -> _dt.date | None:

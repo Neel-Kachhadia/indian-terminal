@@ -28,8 +28,6 @@ def compute_vrc(
     )
     history = [_normalise_iv(row.get("atm_iv") or row.get("iv")) for row in iv_history]
     history = [value for value in history if value is not None and value > 0]
-    if current_iv is not None and (not history or abs(history[-1] - current_iv) > 1e-9):
-        history.append(current_iv)
 
     if current_iv is None or current_iv <= 0:
         return _unavailable_result("NO_CURRENT_IV", len(history))
@@ -183,8 +181,6 @@ def _normalise_iv(value: Any) -> float | None:
     number = _finite(value)
     if number is None or number <= 0:
         return None
-    if number > 3.0:
-        number /= 100.0
     if number <= 0 or number > 5.0:
         return None
     return number

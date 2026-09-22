@@ -5,6 +5,8 @@ from typing import Any
 
 import pandas as pd
 
+from options.iv_contract import validated_live_observation
+
 
 def compute_options_flow(
     symbol: str,
@@ -32,7 +34,18 @@ def compute_options_flow(
             "market_maker_inventory": {"signal": "unavailable"},
             "computed_at": pd.Timestamp.utcnow().isoformat(),
         }
-    frame = pd.DataFrame(legs)
+    sanitized: list[dict[str, Any]] = []
+    for leg in legs:
+        item = dict(leg)
+        observation = validated_live_observation(leg)
+        if observation is None:
+            item["iv"] = None
+            item["gamma"] = None
+            item["delta"] = None
+        else:
+            item["iv"] = observation["iv"]
+        sanitized.append(item)
+    frame = pd.DataFrame(sanitized)
     for col in ("strike", "oi", "oi_change", "iv", "gamma", "bid", "ask", "ltp"):
         if col in frame.columns:
             frame[col] = pd.to_numeric(frame[col], errors="coerce")

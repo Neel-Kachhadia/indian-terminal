@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from data.exchange_calendar import exchange_calendar, today_ist
+from options.iv_contract import validated_live_observation
 
 
 TRADING_DAYS = 252
@@ -317,6 +318,7 @@ def normalise_leg(leg: dict[str, Any]) -> dict[str, Any] | None:
         option_type = "PE"
     if option_type not in {"CE", "PE"}:
         return None
+    observation = validated_live_observation(leg)
     return {
         "symbol": str(leg.get("symbol") or "NIFTY").strip().upper(),
         "expiry": str(leg.get("expiry") or ""),
@@ -328,11 +330,11 @@ def normalise_leg(leg: dict[str, Any]) -> dict[str, Any] | None:
         "volume": as_int(leg.get("volume")),
         "oi": as_int(leg.get("oi")),
         "oi_change": as_int(leg.get("oi_change")),
-        "iv": normalise_iv(leg.get("iv")),
-        "delta": as_float(leg.get("delta")),
-        "gamma": as_float(leg.get("gamma")),
-        "theta": as_float(leg.get("theta")),
-        "vega": as_float(leg.get("vega")),
+        "iv": normalise_iv(observation.get("iv")) if observation else None,
+        "delta": as_float(leg.get("delta")) if observation else None,
+        "gamma": as_float(leg.get("gamma")) if observation else None,
+        "theta": as_float(leg.get("theta")) if observation else None,
+        "vega": as_float(leg.get("vega")) if observation else None,
     }
 
 
@@ -344,8 +346,6 @@ def normalise_iv(value: Any) -> float | None:
     iv = as_float(value)
     if iv is None or iv <= 0:
         return None
-    if iv > 3.0:
-        iv /= 100.0
     if iv <= 0 or iv > 5.0:
         return None
     return iv

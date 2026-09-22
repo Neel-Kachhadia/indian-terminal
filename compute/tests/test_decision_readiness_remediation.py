@@ -307,17 +307,8 @@ def test_chain_requires_fresh_provenance_and_future_iv_rows_are_real_only() -> N
         },
         now,
     )
-    observations = _current_iv_observations(
-        "NIFTY",
-        validated_legs,
-        100.0,
-        expiry,
-        "2026-09-02",
-        provenance,
-        True,
-    )
-    assert [row["iv"] for row in observations] == [0.2, 0.22]
-    assert all(row["quality"] == "CURRENT_DECISION_ELIGIBLE" for row in observations)
+    observations = _current_iv_observations("NIFTY", validated_legs, expiry, provenance)
+    assert observations == []
 
 
 def test_unavailable_prediction_is_rejected_before_oos_log_write() -> None:

@@ -68,7 +68,7 @@ class BaseStrategy:
             "options.iv_rank": _iv_rank_proxy(chain, float(spot or 0.0)),
             "options.iv_percentile": _iv_rank_proxy(chain, float(spot or 0.0)),
             "options.atm_iv": _atm_iv_proxy(chain, float(spot or 0.0)),
-            "options.vol_risk_premium": 0.0,
+            "options.vol_risk_premium": None,
             "options.gex": _gex_proxy(chain, float(spot or 0.0)),
             "options.max_pain": _max_pain(chain),
             "bif.cds": guard.get_bif_value("cds", self.symbol, signal_date),
@@ -331,31 +331,19 @@ def _pcr(chain: list[dict[str, Any]]) -> float:
     return put_oi / call_oi if call_oi > 0 else 1.0
 
 
-def _atm_iv_proxy(chain: list[dict[str, Any]], spot: float) -> float:
-    if not chain or spot <= 0:
-        return 0.15
-    best = min(chain, key=lambda row: abs(float(row.get("strike") or 0.0) - spot))
-    premium = float(best.get("close") or 0.0)
-    return min(max(premium / spot * 8.0, 0.05), 0.8) if spot > 0 else 0.15
+def _atm_iv_proxy(chain: list[dict[str, Any]], spot: float) -> None:
+    # Daily premiums cannot establish timestamp-aligned IV inputs.
+    return None
 
 
-def _iv_rank_proxy(chain: list[dict[str, Any]], spot: float) -> float:
-    iv = _atm_iv_proxy(chain, spot)
-    return max(0.0, min(100.0, (iv - 0.08) / 0.35 * 100.0))
+def _iv_rank_proxy(chain: list[dict[str, Any]], spot: float) -> None:
+    # Rank requires genuine point-in-time IV history, not premium scaling.
+    return None
 
 
-def _gex_proxy(chain: list[dict[str, Any]], spot: float) -> float:
-    if spot <= 0:
-        return 0.0
-    total = 0.0
-    for row in chain:
-        strike = float(row.get("strike") or 0.0)
-        oi = float(row.get("oi") or 0.0)
-        option_type = str(row.get("option_type") or "").upper()
-        distance = max(abs(strike - spot), 50.0)
-        sign = 1.0 if option_type == "CE" and strike >= spot else -1.0 if option_type == "PE" and strike <= spot else 0.3
-        total += sign * oi / (distance * distance)
-    return math.tanh(total / 1000.0) * 100.0
+def _gex_proxy(chain: list[dict[str, Any]], spot: float) -> None:
+    # Open interest / strike distance is not gamma exposure.
+    return None
 
 
 def _max_pain(chain: list[dict[str, Any]]) -> float:

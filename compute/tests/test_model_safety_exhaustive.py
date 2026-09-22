@@ -145,3 +145,16 @@ def test_recommendation_gate_rejects_actionability_on_schema_incompatibility() -
     eligibility = recommendation_eligibility(ensemble, components, evidence=evidence)
     assert eligibility.eligible is False
     assert any("feature schema incompatible" in reason for reason in eligibility.reasons)
+
+
+def test_runtime_status_never_calls_schema_incompatible_prediction_ready() -> None:
+    from ml.service import _normalise_runtime_status
+
+    output = {
+        "prediction": "UP",
+        "is_trained": True,
+        "feature_schema_compatible": False,
+    }
+    _normalise_runtime_status(output)
+    assert output["status"] == "UNAVAILABLE"
+    assert output["reason_code"] == "FEATURE_SCHEMA_INCOMPATIBLE"

@@ -1,7 +1,7 @@
 {
   "release_version": "0.1.0",
   "python_api_version": "0.1.0",
-  "database_schema_version": 5,
+  "database_schema_version": 9,
   "bootstrap_data_version": "1",
   "model_manifest_version": "1",
   "integrity_manifest_version": "1"

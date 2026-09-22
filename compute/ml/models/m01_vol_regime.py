@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ml.feature_engineering import MLContext, current_value, vol_regime_target
+from ml.feature_engineering import MLContext, vol_regime_target
 from ml.monitor import accuracy_for_model
 
 from .common import (
@@ -110,25 +110,6 @@ def _estimator() -> Any:
         eval_metric="mlogloss",
         random_state=42,
     )
-
-
-def _heuristic_regime(context: MLContext) -> str | None:
-    hv = current_value(context, ["hv_20", "price_action.hv_20", "hv_30"])
-    vix = current_value(context, ["india_vix", "vix.india_vix"])
-    value = hv if hv is not None else vix
-    if value is None:
-        return None
-    if value < 10.0:
-        return "LOW"
-    if value > 18.0:
-        return "HIGH"
-    return "MEDIUM"
-
-
-def _fallback_probabilities(regime: str | None) -> dict[str, float]:
-    if regime is None:
-        return {}
-    return {label: (0.7 if label == regime else 0.15) for label in CLASSES}
 
 
 def _out_of_regime_warning(context: MLContext) -> bool:

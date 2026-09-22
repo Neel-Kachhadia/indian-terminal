@@ -118,6 +118,7 @@ class OHLCForecaster:
                 "current_close": close,
                 "mae_pct": mae_pct,
             },
+            "iv_status": "VALID" if iv_method is not None else "UNAVAILABLE",
             "method_outputs": methods,
             "method_weights": weights,
             "key_levels": key_levels,
@@ -324,10 +325,11 @@ class OHLCForecaster:
         }
 
     def _iv_method(self, close: float, atm_iv: float | None, vix: float | None = None) -> dict[str, float] | None:
-        iv = atm_iv if atm_iv and atm_iv > 0 else vix
-        if not iv or iv <= 0:
+        # ATM IV is decimal annualized volatility. VIX is a separate index,
+        # not a substitute for a missing underlying-specific observation.
+        if atm_iv is None or not math.isfinite(atm_iv) or not 0 < atm_iv <= 5:
             return None
-        iv_decimal = iv if iv <= 1.5 else iv / 100.0
+        iv_decimal = atm_iv
         daily_move = iv_decimal / math.sqrt(252.0) * close
         return {
             "open": round(close, 2),

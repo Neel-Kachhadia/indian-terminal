@@ -41,10 +41,9 @@ def predict(
         "iv_surface_gp": {
             "mean": [],
             "std": [],
-            "quality": (
-                round(max(0.0, min(1.0, quality / 100.0)), 6)
-                if available else None
-            ),
+            "quality": None,
+            "status": "UNAVAILABLE",
+            "reason_code": "IV_SURFACE_NOT_FITTED",
         },
         "regime_uncertainty": round(uncertainty, 6),
         "data_quality_score": round(quality, 3) if available else None,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from signals.options_signals import compute_options_signals
+from signals.options_signals import _compute_gex, compute_options_signals
 
 
 def test_gex_scales_from_validated_lot_size_not_hardcoded_contract_size() -> None:
@@ -18,11 +18,10 @@ def test_gex_scales_from_validated_lot_size_not_hardcoded_contract_size() -> Non
         }
     ]
 
-    result_65 = compute_options_signals(legs, 25_000, "03-Sep-2026", 65)
-    result_75 = compute_options_signals(legs, 25_000, "03-Sep-2026", 75)
+    result_65, _ = _compute_gex(legs, 25_000, 65, True)
+    result_75, _ = _compute_gex(legs, 25_000, 75, True)
 
-    assert result_65["lot_size"] == 65
-    assert result_65["gex"] == pytest.approx(result_75["gex"] * 65 / 75)
+    assert result_65 == pytest.approx(result_75 * 65 / 75)
 
 
 def test_options_signals_reject_missing_or_invalid_lot_size() -> None:
